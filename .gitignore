@@ -9,3 +9,28 @@ __pycache__/
 
 # Logs
 *.log
+
+# ==========================================
+# SIMULATOR PROJECT .GITIGNORE
+# ==========================================
+
+# ------------------------------------------
+# 1. Python Environment & Cache
+# ------------------------------------------
+# This will globally ignore all __pycache__ folders regardless 
+# of which directory (contracts, gui, services, etc.) they are in.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ------------------------------------------
+# 2. Generated Map & Tile Data
+# ------------------------------------------
+# Ignores the entire tiles directory and all subfolders/images
+data/tiles/
+
+# ------------------------------------------
+# 3. IDE & Workspace Settings
+# ------------------------------------------
+# Keeps your personal VS Code editor settings local
+.vscode/
