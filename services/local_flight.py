@@ -28,6 +28,7 @@ from contracts.gui_orchestration import (
     DroneStatus,
     DroneTelemetry,
     FaultType,
+    InjectFault,
     LatLon,
     SwarmTelemetryBatch,
 )
@@ -116,6 +117,13 @@ class _Flight:
     status: DroneStatus = field(init=False, default=DroneStatus.TAKING_OFF)
     low_battery_flagged: bool = field(init=False, default=False)
     emergency: bool = field(init=False, default=False)
+
+    # GPS loss: `gps_hold` means holding position awaiting either a decision
+    # from the controller or the return of GPS.
+    gps_lost: bool = field(init=False, default=False)
+    gps_hold: bool = field(init=False, default=False)
+    gps_prompted: bool = field(init=False, default=False)
+    gps_clear_at_s: Optional[float] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.cruise_speed_mps = max(0.1, self.config.max_velocity_mps)
@@ -210,6 +218,7 @@ class _Flight:
 
     def divert_to(self, destination: LatLon) -> None:
         """Emergency landing: make for `destination` and put down there."""
+        self.gps_hold = False  # committing to land means it stops holding
         self.retarget(destination)
         self.emergency = True
 
@@ -217,9 +226,37 @@ class _Flight:
         """Nothing is within reach: put down directly below, right now."""
         if self.is_lost or self.status is DroneStatus.LANDED:
             return
+        self.gps_hold = False
         self.dest = self.position
         self.status = DroneStatus.LANDING
         self.emergency = True
+
+    # ---- GPS ----
+
+    def begin_gps_hold(self, clear_at_s: Optional[float]) -> None:
+        """GPS is gone: stop navigating and hold station where we are."""
+        if self.is_done:
+            return
+        self.gps_lost = True
+        self.gps_clear_at_s = clear_at_s
+        if not self.emergency:
+            self.gps_hold = True
+            self.gps_prompted = False
+            # A hold is a new situation: let the 20% warning speak up again.
+            self.low_battery_flagged = False
+            if self.status is DroneStatus.TAKING_OFF:
+                self.status = DroneStatus.IN_FLIGHT
+
+    def restore_gps(self) -> None:
+        """GPS is back: pick the mission up again from where we hovered."""
+        self.gps_lost = False
+        self.gps_clear_at_s = None
+        self.gps_prompted = False
+        if self.gps_hold:
+            self.gps_hold = False
+            if not self.is_done and not self.emergency:
+                self.status = DroneStatus.IN_FLIGHT
+                self.bearing_deg = initial_bearing_deg(self.position, self.dest)
 
     def advance(self, dt: float) -> None:
         """Integrate `dt` simulated seconds of flight."""
@@ -236,6 +273,11 @@ class _Flight:
 
         if self.battery_pct <= 0.0:
             self.status = DroneStatus.FAILSAFE
+            return
+
+        if self.gps_hold:
+            # Holding station: no navigation without GPS, but the rotors are
+            # still turning, so the battery keeps draining.
             return
 
         if self.status is DroneStatus.TAKING_OFF:
@@ -277,12 +319,17 @@ class _Flight:
 
     def telemetry(self, tick: int) -> DroneTelemetry:
         lat, lon = self._display_position()
-        speed = self.cruise_speed_mps if self.status is DroneStatus.IN_FLIGHT else 0.0
-        pitch = {
+        holding = self.gps_hold
+        speed = 0.0 if holding else (self.cruise_speed_mps if self.status is DroneStatus.IN_FLIGHT else 0.0)
+        pitch = 0.0 if holding else {
             DroneStatus.TAKING_OFF: 10.0,
             DroneStatus.IN_FLIGHT: -5.0,
         }.get(self.status, 0.0)
-        faults = [FaultType.BATTERY_FAIL] if self.is_lost else []
+        faults = []
+        if self.gps_lost:
+            faults.append(FaultType.GPS_LOSS)
+        if self.is_lost:
+            faults.append(FaultType.BATTERY_FAIL)
 
         raw = None
         if tick % 5 == 0:
@@ -349,6 +396,8 @@ class LocalFlightSimulator(QObject):
     low_battery = Signal(int, float)    # sysid, battery_pct - mission is paused
     drone_lost = Signal(int)            # sysid - battery flat, drone sacrificed
     retargeted = Signal(int)            # count of drones diverted
+    gps_lost = Signal(int)              # sysid - holding, mission is paused
+    gps_restored = Signal(int)          # sysid - GPS back, mission resumed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -451,6 +500,45 @@ class LocalFlightSimulator(QObject):
         flight.land_in_place()
         return EmergencyLanding(target=flight.position, distance_m=0.0, in_place=True)
 
+    def fall_back(self, sysid: int) -> Optional[EmergencyLanding]:
+        """Abandon the mission and return to the point the drone launched from.
+
+        Same reachability rule as an emergency landing: flying to a start point
+        the battery cannot reach would only crash it further away.
+        """
+        flight = self._flight_for(sysid)
+        if flight is None or flight.is_done:
+            return None
+        return self.emergency_land(sysid, [flight.start])
+
+    def inject_fault(self, command: InjectFault) -> list[int]:
+        """Apply an injected fault locally. Only GPS loss is modelled here -
+        the rest stay Module 2's business."""
+        if command.fault_type is not FaultType.GPS_LOSS:
+            return []
+        affected = [
+            f for f in self._flights
+            if f.config.sysid in command.sysids and not f.is_done and not f.gps_lost
+        ]
+        clear_at = self._elapsed_s + command.duration_s if command.duration_s else None
+        for flight in affected:
+            flight.begin_gps_hold(clear_at)
+        if affected:
+            self._check_prompts()
+        return [f.config.sysid for f in affected]
+
+    def clear_faults(self, sysids: Optional[list[int]] = None) -> list[int]:
+        """Hand GPS back, so anything holding resumes its mission."""
+        restored = []
+        for flight in self._flights:
+            if flight.gps_lost and (sysids is None or flight.config.sysid in sysids):
+                flight.restore_gps()
+                restored.append(flight.config.sysid)
+                self.gps_restored.emit(flight.config.sysid)
+        if restored:
+            self.resume()
+        return restored
+
     def _flight_for(self, sysid: int) -> Optional[_Flight]:
         return next((f for f in self._flights if f.config.sysid == sysid), None)
 
@@ -468,10 +556,41 @@ class LocalFlightSimulator(QObject):
             return TICK_S * self._descent_scale
         return TICK_S * self._cruise_scale
 
+    def _check_prompts(self) -> bool:
+        """Hold the mission on the first drone needing a decision. One at a
+        time: the next is picked up on the tick after the controller answers."""
+        for flight in self._flights:
+            if flight.gps_lost and flight.gps_hold and not flight.gps_prompted and not flight.is_done:
+                flight.gps_prompted = True
+                self.pause()
+                self.gps_lost.emit(flight.config.sysid)
+                return True
+        for flight in self._flights:
+            if (
+                not flight.low_battery_flagged
+                and not flight.emergency
+                and flight.is_airborne
+                and flight.battery_pct <= LOW_BATTERY_PCT
+            ):
+                flight.low_battery_flagged = True
+                self.pause()
+                self.low_battery.emit(flight.config.sysid, flight.battery_pct)
+                return True
+        return False
+
     def _tick(self) -> None:
         dt = self._dt_for_phase()
         self._elapsed_s += dt
         self._tick_index += 1
+
+        for flight in self._flights:
+            if (
+                flight.gps_lost
+                and flight.gps_clear_at_s is not None
+                and self._elapsed_s >= flight.gps_clear_at_s
+            ):
+                flight.restore_gps()
+                self.gps_restored.emit(flight.config.sysid)
 
         newly_lost: list[int] = []
         for flight in self._flights:
@@ -499,15 +618,4 @@ class LocalFlightSimulator(QObject):
             self.finished.emit(self._elapsed_s)
             return
 
-        # Ask the controller once per drone, and hold the mission while it decides.
-        for flight in self._flights:
-            if (
-                not flight.low_battery_flagged
-                and not flight.emergency
-                and flight.is_airborne
-                and flight.battery_pct <= LOW_BATTERY_PCT
-            ):
-                flight.low_battery_flagged = True
-                self.pause()
-                self.low_battery.emit(flight.config.sysid, flight.battery_pct)
-                return
+        self._check_prompts()

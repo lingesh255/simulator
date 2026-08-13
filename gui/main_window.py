@@ -146,7 +146,7 @@ class MainWindow(QMainWindow):
         self.map_viewer.status_message.connect(self.statusBar().showMessage)
         self.map_viewer.point_picked.connect(self._on_point_picked)
 
-        self.fault_injection.fault_requested.connect(self.client.inject_fault)
+        self.fault_injection.fault_requested.connect(self._on_fault_requested)
         self.fault_injection.status_message.connect(self.statusBar().showMessage)
 
         self.client.telemetry_received.connect(self._on_telemetry)
@@ -159,6 +159,8 @@ class MainWindow(QMainWindow):
         self.flight_sim.finished.connect(self._on_flight_finished)
         self.flight_sim.low_battery.connect(self._on_low_battery)
         self.flight_sim.drone_lost.connect(self._on_drone_lost)
+        self.flight_sim.gps_lost.connect(self._on_gps_lost)
+        self.flight_sim.gps_restored.connect(self._on_gps_restored)
 
     # ---- Connection ----
 
@@ -254,6 +256,63 @@ class MainWindow(QMainWindow):
             f"  (ETA {format_duration(total_s - elapsed_s)})"
         )
 
+    def _on_fault_requested(self, command) -> None:
+        """Faults go to Module 2, and to the local preview when it is flying."""
+        self.client.inject_fault(command)
+        if self.flight_sim.is_active():
+            affected = self.flight_sim.inject_fault(command)
+            if not affected:
+                self.flight_sim.resume()
+
+    def _on_gps_lost(self, sysid: int) -> None:
+        """The drone reports GPS loss and is holding station pending orders."""
+        flight = next((f for f in self.flight_sim.flights if f.config.sysid == sysid), None)
+        home_note = ""
+        if flight is not None:
+            distance_km = haversine_m(flight.position, flight.start) / 1000.0
+            reach = (
+                "within reach on the remaining charge"
+                if flight.can_reach(flight.start)
+                else "TOO FAR on the remaining charge - it would land where it stands instead"
+            )
+            home_note = (
+                f"\n\nStart point is {distance_km:.2f} km back - {reach}."
+                f"\nBattery is at {flight.battery_pct:.0f}%."
+            )
+
+        granted = QMessageBox.question(
+            self,
+            "GPS lost - fall back?",
+            f"SYSID {sysid} reports GPS LOSS and is holding position.{home_note}\n\n"
+            "Grant permission to fall back to the start point and land?\n\n"
+            "Yes - abandon the mission and return to the start point.\n"
+            "No  - hold position until GPS returns (the battery keeps draining).",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+
+        if granted == QMessageBox.Yes:
+            landing = self.flight_sim.fall_back(sysid)
+            if landing is None:
+                self.statusBar().showMessage(f"SYSID {sysid}: unable to fall back.")
+            elif landing.in_place:
+                self.statusBar().showMessage(
+                    f"SYSID {sysid}: start point out of range - landing immediately at "
+                    f"({landing.target.lat:.5f}, {landing.target.lon:.5f})."
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"SYSID {sysid} falling back {landing.distance_m / 1000:.2f} km to the start point."
+                )
+        else:
+            self.statusBar().showMessage(
+                f"SYSID {sysid}: fall-back denied - holding position until GPS returns."
+            )
+        self.flight_sim.resume()
+
+    def _on_gps_restored(self, sysid: int) -> None:
+        self.statusBar().showMessage(f"SYSID {sysid}: GPS reacquired - resuming the mission.", 8000)
+
     def _on_low_battery(self, sysid: int, battery_pct: float) -> None:
         """Battery hit the threshold: hold the mission and ask the controller.
 
@@ -278,14 +337,29 @@ class MainWindow(QMainWindow):
                     f"{distance_km:.2f} km away - {reach}."
                 )
 
+        holding = flight is not None and flight.gps_hold
+        if holding:
+            title = "Low battery while holding - fall back?"
+            headline = (
+                f"SYSID {sysid} has been holding without GPS and is down to "
+                f"{battery_pct:.0f}% battery (threshold {LOW_BATTERY_PCT:.0f}%)."
+            )
+            deny_line = "No  - keep holding for GPS; the drone will be lost when the battery runs flat."
+        else:
+            title = "Low battery - emergency landing?"
+            headline = (
+                f"SYSID {sysid} is down to {battery_pct:.0f}% battery "
+                f"(threshold {LOW_BATTERY_PCT:.0f}%)."
+            )
+            deny_line = "No  - press on to the destination; the drone will be lost when the battery runs flat."
+
         granted = QMessageBox.question(
             self,
-            "Low battery - emergency landing?",
-            f"SYSID {sysid} is down to {battery_pct:.0f}% battery "
-            f"(threshold {LOW_BATTERY_PCT:.0f}%).{nearest_note}\n\n"
+            title,
+            f"{headline}{nearest_note}\n\n"
             "Grant permission to break off and land at the nearest point?\n\n"
             "Yes - divert and land now.\n"
-            "No  - press on to the destination; the drone will be lost when the battery runs flat.",
+            f"{deny_line}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )

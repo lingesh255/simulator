@@ -125,6 +125,9 @@ class FaultInjectionPanel(QWidget):
             severity=self.severity_combo.currentData(),
             duration_s=self.duration_spin.value() or None,
         )
-        self.fault_requested.emit(command)
+        # Announce the injection first: handling the fault may itself post a
+        # status message (a fall-back decision, say), and that outcome is the
+        # more useful thing to leave on screen.
         label = FAULT_LABELS[command.fault_type]
         self.status_message.emit(f"Injected '{label}' on SYSID(s): {', '.join(map(str, sysids))}.")
+        self.fault_requested.emit(command)
