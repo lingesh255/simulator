@@ -23,11 +23,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+
+
 # ------------------------------------------
 # 2. Generated Map & Tile Data
 # ------------------------------------------
 # Ignores the entire tiles directory and all subfolders/images
 data/tiles/
+data/profiles/*.json
+data/presets/*.json
 
 # ------------------------------------------
 # 3. IDE & Workspace Settings
