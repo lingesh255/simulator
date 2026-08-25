@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from contracts.gui_orchestration import DroneStatus, DroneTelemetry
 from gui.artificial_horizon import ArtificialHorizon
 
-COLUMNS = ["SYSID", "Status", "Altitude (m)", "Battery %", "Link Quality %", "Active Faults"]
+COLUMNS = ["SYSID", "Status", "Lat", "Lon", "Altitude (m)", "Battery %", "Link Quality %", "Active Faults"]
 FAULT_ROW_COLOR = QColor("#5c1e1e")
 NORMAL_ROW_COLOR = QColor(Qt.transparent)
 MAX_LOG_LINES = 500
@@ -57,6 +57,8 @@ class GlobalStateMatrix(QTableWidget):
             values = [
                 str(drone.sysid),
                 drone.status.value,
+                f"{drone.lat:.5f}",
+                f"{drone.lon:.5f}",
                 f"{drone.altitude_m:.1f}",
                 f"{drone.battery_pct:.0f}",
                 f"{drone.link_quality_pct:.0f}",

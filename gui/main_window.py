@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QToolBar,
     QWidget,
+    QComboBox,
 )
 
 from contracts.gui_orchestration import FlockCommand, LatLon
@@ -24,7 +25,7 @@ from gui.drone_management import DroneManagementPanel
 from gui.fault_injection import FaultInjectionPanel
 from gui.map_viewer import MapViewer
 from gui.telemetry_dashboard import TelemetryDashboard
-from services.api_client import DEFAULT_BASE_URL, DEFAULT_WS_URL, OrchestrationClient
+from services.api_client import OrchestrationClient
 from services.local_flight import (
     LOW_BATTERY_PCT,
     LocalFlightSimulator,
@@ -43,7 +44,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
 
         self.store = ProfileStore()
-        self.client = OrchestrationClient(DEFAULT_BASE_URL, DEFAULT_WS_URL, parent=self)
+        self.client = OrchestrationClient(parent=self)
 
         # Start/destination picked on the map, and the local preview that flies
         # between them when Module 2 is not supplying telemetry.
@@ -108,25 +109,34 @@ class MainWindow(QMainWindow):
     # ---- Setup ----
 
     def _build_connection_toolbar(self) -> None:
-        toolbar = QToolBar("Orchestrator Connection", self)
+        toolbar = QToolBar("Renode UDP Connection", self)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        self.base_url_edit = QLineEdit(DEFAULT_BASE_URL)
-        self.base_url_edit.setMinimumWidth(220)
-        self.ws_url_edit = QLineEdit(DEFAULT_WS_URL)
-        self.ws_url_edit.setMinimumWidth(220)
-        self.connect_btn = QPushButton("Connect")
+        self.connect_btn = QPushButton("Connect to Telemetry")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
+
+        self.sysid_combo = QComboBox()
+        self.sysid_combo.addItems(["1", "2", "3"])
+        
+        self.inject_isr_btn = QPushButton("Inject Hardware ISR")
+        self.inject_isr_btn.setStyleSheet("background-color: #e74c3c; color: white;")
+        self.inject_isr_btn.clicked.connect(self._on_inject_isr_clicked)
+        
+        self.restore_isr_btn = QPushButton("Restore State")
+        self.restore_isr_btn.setStyleSheet("background-color: #2ecc71; color: white;")
+        self.restore_isr_btn.clicked.connect(self._on_restore_isr_clicked)
 
         container = QWidget()
         row = QHBoxLayout(container)
         row.setContentsMargins(4, 0, 4, 0)
-        row.addWidget(QLabel("Module 2 REST:"))
-        row.addWidget(self.base_url_edit)
-        row.addWidget(QLabel("WS:"))
-        row.addWidget(self.ws_url_edit)
         row.addWidget(self.connect_btn)
+        row.addSpacing(20)
+        row.addWidget(QLabel("Target SysID:"))
+        row.addWidget(self.sysid_combo)
+        row.addWidget(self.inject_isr_btn)
+        row.addWidget(self.restore_isr_btn)
+        row.addStretch()
         toolbar.addWidget(container)
 
     def _build_status_bar(self) -> None:
@@ -165,9 +175,22 @@ class MainWindow(QMainWindow):
     # ---- Connection ----
 
     def _on_connect_clicked(self) -> None:
-        self.client.set_endpoints(self.base_url_edit.text().strip(), self.ws_url_edit.text().strip())
-        self.client.connect_telemetry()
-        self.statusBar().showMessage("Connecting to Module 2 telemetry stream...")
+        sysids = self.drone_management.checked_sysids()
+        if not sysids:
+            sysids = [1, 2] # Default if nothing selected
+        self.client.connect_telemetry(sysids)
+        self.statusBar().showMessage(f"Connecting to Renode UDP telemetry for sysids: {sysids}...")
+
+    def _on_inject_isr_clicked(self) -> None:
+        sysid = int(self.sysid_combo.currentText())
+        from contracts.gui_orchestration import FaultType
+        self.client.inject_isr(sysid, FaultType.GPS_LOSS)
+        self.statusBar().showMessage(f"Injected Hardware ISR for sysid {sysid}")
+        
+    def _on_restore_isr_clicked(self) -> None:
+        sysid = int(self.sysid_combo.currentText())
+        self.client.restore_isr_state(sysid)
+        self.statusBar().showMessage(f"Restored State for sysid {sysid}")
 
     def _on_connection_state_changed(self, connected: bool) -> None:
         self._connected = connected
@@ -186,10 +209,9 @@ class MainWindow(QMainWindow):
     # ---- Drone management wiring ----
 
     def _on_emulate(self, drones: list) -> None:
-        self.client.set_endpoints(self.base_url_edit.text().strip(), self.ws_url_edit.text().strip())
         for drone in drones:
             self.client.register_drone(drone)
-        self.client.connect_telemetry()
+        self.client.connect_telemetry([d.sysid for d in drones])
         self.fault_injection.update_active_sysids([d.sysid for d in drones])
 
         if self._connected:

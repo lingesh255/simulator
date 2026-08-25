@@ -130,7 +130,7 @@ Item {
                 if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
                     mapMouseArea.isDragging = true
                     mapMouseArea.suppressClick = true
-                    map.pan(dx, dy)
+                    map.pan(-dx, -dy)
                     mapMouseArea.lastDragPos = Qt.point(mouse.x, mouse.y)
                 }
             }
@@ -167,7 +167,7 @@ Item {
                 var currentPixel = map.fromCoordinate(coordUnderMouse, false)
                 map.zoomLevel = targetZoom
                 var updatedPixel = map.fromCoordinate(coordUnderMouse, false)
-                map.pan(wheel.x - updatedPixel.x + (currentPixel.x - updatedPixel.x), wheel.y - updatedPixel.y + (currentPixel.y - updatedPixel.y))
+                map.pan(updatedPixel.x - currentPixel.x, updatedPixel.y - currentPixel.y)
                 wheel.accepted = true
             }
         }

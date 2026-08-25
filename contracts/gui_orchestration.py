@@ -1,9 +1,7 @@
 """Module 1 <-> Module 2 contract (SRS §6.1).
 
-Shared Pydantic schemas for the REST commands and WebSocket telemetry stream
-exchanged between the GUI (Module 1) and the Orchestration & Swarm Router
-(Module 2). Module 1 depends only on this contract (§3.3) - it has no direct
-knowledge of Module 3 or of MAVLink encoding internals.
+Shared Pydantic schemas for UDP telemetry and commands exchanged between the GUI (Module 1)
+and the Renode Emulation Backend (Module 2).
 """
 from __future__ import annotations
 
@@ -35,43 +33,25 @@ class DroneConfig(BaseModel):
     mass_kg: float = Field(..., gt=0)
     max_velocity_mps: float = Field(..., gt=0)
     battery_capacity_mah: float = Field(..., gt=0)
-    # Cruise altitude flown between waypoints. Defaulted so profiles saved
-    # before this field existed still load.
     cruise_altitude_m: float = Field(default=50.0, gt=0)
     sensors: list[SensorType] = Field(default_factory=list)
 
 
 class SwarmPreset(BaseModel):
-    """A named, saved group of drone profiles (SRS §3.2.1 - swarm selector)."""
+    """A named, saved group of drone profiles."""
 
     name: str
     drones: list[DroneConfig] = Field(default_factory=list)
 
 
-# --------------------------------------------------------------------------
-# Commands: Module 1 -> Module 2 (SRS §6.1, §4.2)
-# --------------------------------------------------------------------------
-
-
-class RegisterDrone(BaseModel):
-    drone: DroneConfig
-
-
-class Takeoff(BaseModel):
-    sysid: int
-    target_altitude_m: float = Field(..., gt=0)
-
-
-class Goto(BaseModel):
-    sysid: int
-    destination: LatLon
-    altitude_m: Optional[float] = None
-
-
-class FlockCommand(BaseModel):
-    sysids: list[int]
-    destination: LatLon
-    altitude_m: Optional[float] = None
+class DroneStatus(str, Enum):
+    STANDBY = "STANDBY"
+    ARMED = "ARMED"
+    TAKING_OFF = "TAKING_OFF"
+    IN_FLIGHT = "IN_FLIGHT"
+    LANDING = "LANDING"
+    LANDED = "LANDED"
+    FAILSAFE = "FAILSAFE"
 
 
 class FaultType(str, Enum):
@@ -92,26 +72,11 @@ class InjectFault(BaseModel):
     duration_s: Optional[float] = None
 
 
-class StopSwarm(BaseModel):
-    reason: Optional[str] = None
-
-
 # --------------------------------------------------------------------------
-# Telemetry: Module 2 -> Module 1 (SRS §6.1)
+# UDP Telemetry: Drone -> GUI
 # --------------------------------------------------------------------------
 
-
-class DroneStatus(str, Enum):
-    STANDBY = "STANDBY"
-    ARMED = "ARMED"
-    TAKING_OFF = "TAKING_OFF"
-    IN_FLIGHT = "IN_FLIGHT"
-    LANDING = "LANDING"
-    LANDED = "LANDED"
-    FAILSAFE = "FAILSAFE"
-
-
-class DroneTelemetry(BaseModel):
+class UdpTelemetryPayload(BaseModel):
     sysid: int
     status: DroneStatus
     lat: float
@@ -127,7 +92,34 @@ class DroneTelemetry(BaseModel):
     raw_mavlink: Optional[str] = None
 
 
+# Alias for backward compatibility with GUI components
+DroneTelemetry = UdpTelemetryPayload
+
+
 class SwarmTelemetryBatch(BaseModel):
+    """Batch of telemetry (used internally by GUI after gathering UDP packets)"""
     tick: int
     timestamp: float
-    drones: list[DroneTelemetry] = Field(default_factory=list)
+    drones: list[UdpTelemetryPayload] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# UDP Commands: GUI -> Backend (Orchestrator/Drone)
+# --------------------------------------------------------------------------
+
+class IsrCommandType(str, Enum):
+    INJECT_FAULT = "INJECT_FAULT"
+    RESTORE_STATE = "RESTORE_STATE"
+
+
+class IsrCommandPayload(BaseModel):
+    sysid: int
+    command_type: IsrCommandType
+    fault_type: Optional[FaultType] = None
+    severity: Optional[FaultSeverity] = None
+
+
+class FlockCommand(BaseModel):
+    sysids: list[int]
+    destination: LatLon
+    altitude_m: Optional[float] = None

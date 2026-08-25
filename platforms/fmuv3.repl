@@ -1,0 +1,35 @@
+// -----------------------------------------------------------
+// Renode Platform Definition (REPL)
+// Target: fmuv3 / STM32F427 (Pixhawk 1/2 Architecture)
+// -----------------------------------------------------------
+
+// 1. Core Processor & Interrupts
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    systickFrequency: 168000000  // 168 MHz
+    IRQ -> cpu@0
+
+// 2. Memory Map
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x00200000  // 2MB Flash for fmuv3
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x00040000  // 256KB SRAM
+
+// 3. Telemetry / Serial Ports
+// ArduPilot typically routes TELEM1 and TELEM2 to USART2 and USART3.
+usart2: UART.STM32_UART @ sysbus 0x40004400
+    -> nvic@38
+
+usart3: UART.STM32_UART @ sysbus 0x40004800
+    -> nvic@39
+
+// 4. Basic Virtual Sensors (Placeholders for Sensor Feeder)
+// MPU6000 IMU on SPI1
+spi1: SPI.STM32SPI @ sysbus 0x40013000
+    -> nvic@35
+
+mpu6000: Sensors.MPU6000 @ spi1
