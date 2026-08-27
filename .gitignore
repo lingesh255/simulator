@@ -38,3 +38,12 @@ data/presets/*.json
 # ------------------------------------------
 # Keeps your personal VS Code editor settings local
 .vscode/
+
+# ------------------------------------------
+# 4. PDDL / ENHSP mission planner
+# ------------------------------------------
+# ENHSP planner: cloned + built locally by scripts/setup_enhsp.ps1
+tools/enhsp/
+
+# Per-run generated PDDL problems and ENHSP output
+plans/*/runs/

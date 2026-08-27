@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSizeF, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QEvent, QSizeF, QTimer, QUrl, Signal
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -17,12 +17,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
 
 from contracts.gui_orchestration import DroneTelemetry
-from gui.map_models import DroneMarkerModel, PathModel, PointMarkerModel
+from gui.map_models import DroneMarkerModel, PathModel, PointMarkerModel, RestrictedAreaModel
 
 QML_PATH = Path(__file__).resolve().parent.parent / "qml" / "Map.qml"
 TILE_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "tiles"
@@ -42,6 +43,7 @@ class MapViewer(QWidget):
         self.drone_model = DroneMarkerModel(self)
         self.marker_model = PointMarkerModel(self)
         self.path_model = PathModel(self)
+        self.restricted_area_model = RestrictedAreaModel(self)
 
         self.quick_widget = QQuickWidget()
         self.quick_widget.setResizeMode(QQuickWidget.SizeRootObjectToView)
@@ -55,6 +57,7 @@ class MapViewer(QWidget):
         context.setContextProperty("droneModel", self.drone_model)
         context.setContextProperty("markerModel", self.marker_model)
         context.setContextProperty("pathModel", self.path_model)
+        context.setContextProperty("restrictedAreaModel", self.restricted_area_model)
         context.setContextProperty("tileCacheDir", str(TILE_CACHE_DIR))
         context.setContextProperty("offlineMode", False)
         self.quick_widget.setSource(QUrl.fromLocalFile(str(QML_PATH)))
@@ -65,7 +68,9 @@ class MapViewer(QWidget):
 
         # ---- Toolbar: interaction mode ----
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["View", "Set Start Point", "Set Destination Point"])
+        self.mode_combo.addItems(
+            ["View", "Set Start Point", "Set Destination Point", "Set Restricted Area"]
+        )
 
         self.offline_check = QCheckBox("Offline mode (use cached tiles only)")
         self.offline_check.toggled.connect(self._on_offline_toggled)
@@ -75,10 +80,29 @@ class MapViewer(QWidget):
         self.zoom_in_btn.clicked.connect(self._on_zoom_in)
         self.zoom_out_btn.clicked.connect(self._on_zoom_out)
 
+        # Visualization only: how fast a drone icon glides to each new
+        # telemetry fix. Purely a QML animation duration (`glideSpeed`
+        # context property, consumed in Map.qml) - it has no effect on the
+        # mission's actual simulated timing in engine/services.
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(25, 400)  # 0.25x - 4.00x
+        self.speed_slider.setValue(100)
+        self.speed_slider.setFixedWidth(120)
+        self.speed_slider.setToolTip(
+            "Visualization only: how fast the drone icon glides between "
+            "telemetry updates on the map. Does not change the mission's "
+            "actual flight speed/timing."
+        )
+        self.speed_label = QLabel("Speed: 1.00x")
+        self.speed_label.setMinimumWidth(80)
+        self.speed_slider.valueChanged.connect(self._on_glide_speed_changed)
+
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Click mode:"))
         mode_row.addWidget(self.mode_combo)
         mode_row.addStretch(1)
+        mode_row.addWidget(self.speed_label)
+        mode_row.addWidget(self.speed_slider)
         mode_row.addWidget(self.zoom_out_btn)
         mode_row.addWidget(self.zoom_in_btn)
         mode_row.addWidget(self.offline_check)
@@ -157,6 +181,11 @@ class MapViewer(QWidget):
         elif mode == "Set Destination Point":
             self.marker_model.set_point("destination", lat, lon)
             self.point_picked.emit("destination", lat, lon)
+        elif mode == "Set Restricted Area":
+            # No pin here: the restricted-area polygon (built corner by
+            # corner in `MainWindow`) is its own overlay via
+            # `restricted_area_model`/`set_restricted_area`.
+            self.point_picked.emit("no_fly_zone", lat, lon)
 
     def current_mode(self) -> str:
         return self.mode_combo.currentText()
@@ -176,6 +205,13 @@ class MapViewer(QWidget):
             if checked
             else "Offline mode disabled - live tile fetch allowed."
         )
+
+    def _on_glide_speed_changed(self, value: int) -> None:
+        """Visualization only: rescales how fast the drone icon glides
+        between telemetry fixes. No effect on the mission's real timing."""
+        speed = value / 100.0
+        self.speed_label.setText(f"Speed: {speed:.2f}x")
+        self.drone_model.set_glide_speed(speed)
 
     # ---- Region ----
 
@@ -228,3 +264,11 @@ class MapViewer(QWidget):
 
     def clear_paths(self) -> None:
         self.path_model.clear()
+
+    def set_restricted_area(self, points: list) -> None:
+        """`points` is a list of objects with `.lat`/`.lon` (a `LatLon`),
+        in click order."""
+        self.restricted_area_model.set_polygon([(p.lat, p.lon) for p in points])
+
+    def clear_restricted_area(self) -> None:
+        self.restricted_area_model.clear()

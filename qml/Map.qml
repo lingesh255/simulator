@@ -66,12 +66,39 @@ Item {
             }
         }
 
+        // Restricted-area polygon being marked for the mission planner
+        MapItemView {
+            model: restrictedAreaModel
+            delegate: MapPolygon {
+                color: "#f39c12"
+                opacity: 0.25
+                border.color: "#f39c12"
+                border.width: 2
+                path: model.points
+            }
+        }
+
         // Live drone positions (§3.2.2) - color reflects fault/flight state
         MapItemView {
             model: droneModel
             delegate: MapQuickItem {
                 coordinate: QtPositioning.coordinate(model.lat, model.lon)
                 anchorPoint: Qt.point(droneDot.width / 2, droneDot.height / 2)
+
+                // `model.lat/lon` here are already a smoothed, gradually
+                // advancing position - see `DroneMarkerModel` in
+                // map_models.py, which eases towards each real telemetry fix
+                // at a speed controlled by the map's Speed slider. This small
+                // fixed Behavior only blends the ~30Hz steps that model
+                // produces into a continuous glide instead of a flicker of
+                // tiny snaps; it has no bearing on the actual glide speed.
+                Behavior on coordinate {
+                    CoordinateAnimation {
+                        duration: 40
+                        easing.type: Easing.Linear
+                    }
+                }
+
                 sourceItem: Rectangle {
                     id: droneDot
                     width: 20; height: 20; radius: 10
@@ -88,7 +115,8 @@ Item {
             }
         }
 
-        // Click-to-set start (green) / destination (red) markers (§3.2.2)
+        // Click-to-set start (green) / destination (red) / restricted-area
+        // centre (amber) markers (§3.2.2)
         MapItemView {
             model: markerModel
             delegate: MapQuickItem {
@@ -97,7 +125,8 @@ Item {
                 sourceItem: Rectangle {
                     id: pin
                     width: 16; height: 16; radius: 8
-                    color: model.role === "start" ? "#2ecc71" : "#e74c3c"
+                    color: model.role === "start" ? "#2ecc71"
+                           : (model.role === "no_fly_zone" ? "#f39c12" : "#e74c3c")
                     border.color: "black"
                     border.width: 1
                 }
