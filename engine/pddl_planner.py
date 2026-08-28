@@ -166,3 +166,33 @@ def extract_route(steps: list[PlanStep], drone: str) -> list[str]:
     route = [legs[0][0]]
     route.extend(to for _from, to in legs)
     return route
+
+
+def extract_multi_route(steps: list[PlanStep], drones: list[str]) -> dict[str, list[str]]:
+    """Like `extract_route`, but for a plan where each drone flies its own
+    distinct path rather than everyone sharing one route (the forest-search
+    domain's per-lane coverage - see `engine.search_problem`).
+
+    Its movement actions are `(move-search <drone> <from> <to>)` and
+    `(return-to-base <drone> <from> <to>)` rather than a single `travel`
+    action; both count as a hop for whichever drone is in `args[0]`, chained
+    the same way `extract_route` does (first leg's `from` followed by every
+    leg's `to`, in plan order). Drones with no movement actions at all are
+    simply absent from the result.
+    """
+    routes: dict[str, list[str]] = {}
+    ordered = sorted(steps, key=lambda s: s.index)
+    for drone in drones:
+        legs = [
+            step.args[1:3]
+            for step in ordered
+            if step.action in ("move-search", "return-to-base")
+            and step.args
+            and step.args[0] == drone
+        ]
+        if not legs:
+            continue
+        route = [legs[0][0]]
+        route.extend(to for _from, to in legs)
+        routes[drone] = route
+    return routes
