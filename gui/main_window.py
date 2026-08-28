@@ -28,7 +28,7 @@ from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
 from gui.telemetry_dashboard import TelemetryDashboard
 from services.api_client import OrchestrationClient
-from services.plan_service import PlanRunResult, PlanService
+from services.plan_service import PlanRunResult, PlanService, plan_kind
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -38,10 +38,12 @@ from services.local_flight import (
     nearest_point,
     plan_flights,
     plan_route_flights,
+    plan_route_flights_by_drone,
 )
 from services.storage import ProfileStore
 
 NFZ_CORNER_COUNT = 4  # a restricted area is a quadrilateral, click order = winding order
+FOREST_CORNER_COUNT = 4  # a search area is a quadrilateral too - "dynamic dimensions"
 
 
 class MainWindow(QMainWindow):
@@ -67,13 +69,21 @@ class MainWindow(QMainWindow):
         # for one) the restricted area's corners - in that order, regardless
         # of the map's own "Click mode" dropdown, which this drives itself
         # so the user never has to operate it by hand mid-sequence.
+        #
+        # An area-coverage plan (see services.plan_service.plan_kind) uses
+        # the same "Start" click for its base point, then collects
+        # `FOREST_CORNER_COUNT` search-area corners instead of a destination
+        # - `_plan_kind` (set once per `_on_plan_requested`) is what tells
+        # `_handle_plan_click`/`_run_planned_mission` which sequence is live.
         self.plan_service = PlanService(self)
         self._planning_mode = False
         self._plan_mark_nfz = False
         self._pending_plan_name: str | None = None
+        self._plan_kind = "point_to_point"
         self._plan_source: LatLon | None = None
         self._plan_destination: LatLon | None = None
         self._plan_no_fly_zone: list[LatLon] = []
+        self._plan_forest_corners: list[LatLon] = []
 
         # Two interchangeable flight sources with the same surface: the local
         # kinematic preview, and independent drone threads commanded over UDP
@@ -532,9 +542,11 @@ class MainWindow(QMainWindow):
         self._destination_point = None
         self._planning_mode = False
         self._pending_plan_name = None
+        self._plan_kind = "point_to_point"
         self._plan_source = None
         self._plan_destination = None
         self._plan_no_fly_zone = []
+        self._plan_forest_corners = []
         self.client.stop_swarm()
         self.client.disconnect_telemetry()
         self.map_viewer.clear_markers()
@@ -589,25 +601,37 @@ class MainWindow(QMainWindow):
 
     def _on_plan_requested(self, plan_name: str) -> None:
         """Arm the map: the next clicks belong to this plan, not to the
-        ordinary flock-command flow - Start and Destination always, plus
-        `NFZ_CORNER_COUNT` restricted-area corners if the panel's checkbox
-        asks for one."""
+        ordinary flock-command flow. A point-to-point plan collects Start
+        and Destination, then (if the panel's checkbox asks for one)
+        `NFZ_CORNER_COUNT` restricted-area corners; an area-coverage plan
+        (see `services.plan_service.plan_kind`) collects a base point
+        instead, then `FOREST_CORNER_COUNT` search-area corners."""
         self._pending_plan_name = plan_name
+        self._plan_kind = plan_kind(plan_name)
         self._plan_source = None
         self._plan_destination = None
         self._plan_no_fly_zone = []
+        self._plan_forest_corners = []
         self._plan_mark_nfz = self.mission_planner.mark_restricted_area()
         self._planning_mode = True
         self.map_viewer.clear_markers()
         self.map_viewer.clear_restricted_area()
         self.map_viewer.mode_combo.setCurrentText("Set Start Point")
-        self.statusBar().showMessage(f"Plan '{plan_name}' armed - click the Start point on the map.")
+        if self._plan_kind == "area_coverage":
+            self.statusBar().showMessage(
+                f"Plan '{plan_name}' armed - click the drones' base point on the map."
+            )
+        else:
+            self.statusBar().showMessage(f"Plan '{plan_name}' armed - click the Start point on the map.")
 
     def _handle_plan_click(self, point: LatLon) -> None:
-        """Consume one click of the armed plan's sequence: Start, then
-        Destination, then (if requested) `NFZ_CORNER_COUNT` restricted-area
-        corners - driving the map's Click mode as it goes, so the dropdown
-        never has to be touched by hand."""
+        """Consume one click of the armed plan's sequence, driving the map's
+        Click mode as it goes so the dropdown never has to be touched by
+        hand - see `_on_plan_requested` for what that sequence is."""
+        if self._plan_kind == "area_coverage":
+            self._handle_area_plan_click(point)
+            return
+
         name = self._pending_plan_name
 
         if self._plan_source is None:
@@ -646,12 +670,42 @@ class MainWindow(QMainWindow):
         self._planning_mode = False
         self._run_planned_mission()
 
+    def _handle_area_plan_click(self, point: LatLon) -> None:
+        """Consume one click of an armed area-coverage plan's sequence: the
+        drones' shared base point, then `FOREST_CORNER_COUNT` corners of the
+        area to search - reusing the same corner-by-corner overlay the
+        restricted-area flow uses (see `map_viewer.set_restricted_area`)."""
+        name = self._pending_plan_name
+
+        if self._plan_source is None:
+            self._plan_source = point  # the base drones launch from and return to
+            self.map_viewer.mode_combo.setCurrentText("Set Forest Area")
+            self.statusBar().showMessage(
+                f"Plan '{name}': base set at ({point.lat:.5f}, {point.lon:.5f}) - "
+                f"now click the search area's corner 1 of {FOREST_CORNER_COUNT}."
+            )
+            return
+
+        self._plan_forest_corners.append(point)
+        self.map_viewer.set_restricted_area(self._plan_forest_corners)
+        collected = len(self._plan_forest_corners)
+        if collected < FOREST_CORNER_COUNT:
+            self.statusBar().showMessage(
+                f"Plan '{name}': search-area corner {collected} of {FOREST_CORNER_COUNT} set - "
+                f"click the next corner."
+            )
+            return
+
+        self._planning_mode = False
+        self._run_planned_mission()
+
     def _run_planned_mission(self) -> None:
-        if (
-            self._plan_source is None
-            or self._plan_destination is None
-            or self._pending_plan_name is None
-        ):
+        if self._plan_source is None or self._pending_plan_name is None:
+            return
+        if self._plan_kind == "area_coverage":
+            if len(self._plan_forest_corners) < FOREST_CORNER_COUNT:
+                return
+        elif self._plan_destination is None:
             return
         if not self.drone_management.checked_drones():
             QMessageBox.information(
@@ -661,9 +715,14 @@ class MainWindow(QMainWindow):
             return
         self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         self.statusBar().showMessage(f"Running ENHSP for plan '{self._pending_plan_name}'...")
-        self.plan_service.run_async(
-            self._pending_plan_name, self._plan_source, self._plan_destination, self._plan_no_fly_zone
-        )
+        if self._plan_kind == "area_coverage":
+            self.plan_service.run_area_async(
+                self._pending_plan_name, self._plan_source, self._plan_forest_corners
+            )
+        else:
+            self.plan_service.run_async(
+                self._pending_plan_name, self._plan_source, self._plan_destination, self._plan_no_fly_zone
+            )
 
     def _on_plan_ready(self, result: PlanRunResult) -> None:
         self.mission_planner.set_plan_steps(result.plan_name, result.steps)
@@ -672,6 +731,10 @@ class MainWindow(QMainWindow):
         if not drones:
             self.mission_planner.set_status(f"Plan '{result.plan_name}' ready, but no drones are checked.")
             self.statusBar().showMessage("Plan ready, but no drones are checked to fly it.")
+            return
+
+        if result.per_drone_waypoints is not None:
+            self._start_area_coverage_mission(result, drones)
             return
 
         flights = plan_route_flights(drones, result.waypoints)
@@ -714,6 +777,66 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Flying {len(cleared)} drone(s) on plan '{result.plan_name}': "
             f"{distance_km:.1f} km via {max(0, len(result.waypoints) - 2)} waypoint(s)."
+        )
+        self._pending_plan_name = None
+        self._plan_source = None
+
+    def _start_area_coverage_mission(self, result: PlanRunResult, drones: list) -> None:
+        """Assign each checked drone to one of the plan's per-drone routes,
+        in order (the first checked drone flies `drone1`'s lane, the second
+        `drone2`'s, ...), and fly them concurrently - every lane needs its
+        own drone, so extra checked drones beyond the number of lanes simply
+        sit this mission out, and fewer checked drones than lanes means it
+        can't run at all yet."""
+        routes = list(result.per_drone_waypoints.values())
+        if len(drones) < len(routes):
+            self.mission_planner.set_status(
+                f"Plan '{result.plan_name}' needs {len(routes)} drone(s), "
+                f"but only {len(drones)} are checked."
+            )
+            self.statusBar().showMessage(
+                f"Check at least {len(routes)} drones before running plan '{result.plan_name}'."
+            )
+            return
+
+        assignments = list(zip(drones, routes))
+        flights = plan_route_flights_by_drone(assignments)
+        cleared_sysids = {f.config.sysid for f in flights if f.feasible}
+        grounded = [f for f in flights if not f.feasible]
+        cleared_assignments = [(d, r) for d, r in assignments if d.sysid in cleared_sysids]
+        total_distance_km = sum(f.distance_m for f in flights) / 1000.0
+
+        self._warn_grounded(grounded, len(flights), total_distance_km, label="combined route")
+
+        if len(cleared_assignments) < len(routes):
+            self.mission_planner.set_status(
+                f"Plan '{result.plan_name}': not every drone has the battery for its lane."
+            )
+            self.statusBar().showMessage(
+                f"Plan '{result.plan_name}' ready, but not every drone has the battery for its lane."
+            )
+            return
+
+        threads_index = self.backend_combo.findData("threads")
+        if threads_index >= 0 and self.backend_combo.currentIndex() != threads_index:
+            self.backend_combo.setCurrentIndex(threads_index)
+
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([d.sysid for d, _ in cleared_assignments])
+        self.map_viewer.clear_paths()
+
+        if not self.thread_sim.start_mission_paths(cleared_assignments):
+            self.drone_management.set_running(False)
+            self.statusBar().showMessage("Could not start drone nodes for the planned mission - see the log.")
+            return
+
+        self.mission_planner.set_status(
+            f"Flying plan '{result.plan_name}' - {len(cleared_assignments)} drone(s), "
+            f"{len(routes)} lane(s), {total_distance_km:.1f} km combined."
+        )
+        self.statusBar().showMessage(
+            f"Flying {len(cleared_assignments)} drone(s) on plan '{result.plan_name}' "
+            f"({len(routes)} lane(s))."
         )
         self._pending_plan_name = None
         self._plan_source = None

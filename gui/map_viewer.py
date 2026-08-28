@@ -69,7 +69,7 @@ class MapViewer(QWidget):
         # ---- Toolbar: interaction mode ----
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(
-            ["View", "Set Start Point", "Set Destination Point", "Set Restricted Area"]
+            ["View", "Set Start Point", "Set Destination Point", "Set Restricted Area", "Set Forest Area"]
         )
 
         self.offline_check = QCheckBox("Offline mode (use cached tiles only)")
@@ -186,6 +186,10 @@ class MapViewer(QWidget):
             # corner in `MainWindow`) is its own overlay via
             # `restricted_area_model`/`set_restricted_area`.
             self.point_picked.emit("no_fly_zone", lat, lon)
+        elif mode == "Set Forest Area":
+            # Same corner-by-corner overlay as "Set Restricted Area" above,
+            # reused for the area-coverage mission's search-area polygon.
+            self.point_picked.emit("forest_corner", lat, lon)
 
     def current_mode(self) -> str:
         return self.mode_combo.currentText()

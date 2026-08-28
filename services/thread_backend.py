@@ -213,35 +213,10 @@ class ThreadSwarmBackend(QObject):
         # inserting a lateral bypass instead of any leg that would need
         # climbing past the ceiling ("turn around the hill").
         waypoints, altitudes = plan_terrain_profile(waypoints)
-        home = Position(lat=waypoints[0].lat, lon=waypoints[0].lon)
+        home = waypoints[0]
 
         for drone in drones:
-            try:
-                link = DroneLink(sysid=drone.sysid, gcs_address=self._gcs.address, verbose=False)
-            except OSError as exc:
-                self.link_failed.emit(f"{drone.name}: cannot bind SYSID {drone.sysid} ({exc})")
-                continue
-            controller = None
-            if self.use_firmware:
-                controller = SimulatedFlightController(
-                    sysid=drone.sysid,
-                    home_lat=waypoints[0].lat,
-                    home_lon=waypoints[0].lon,
-                    cruise_speed_mps=drone.max_velocity_mps,
-                    battery_capacity_mah=drone.battery_capacity_mah,
-                )
-            thread = self._fleet.spawn(
-                drone_id=drone.sysid,
-                name=drone.name,
-                cruise_speed_mps=drone.max_velocity_mps,
-                cruise_altitude_m=drone.cruise_altitude_m,
-                battery_capacity_mah=drone.battery_capacity_mah,
-                start=home,
-                time_scale=self._time_scale,
-                link=link,
-                flight_controller=controller,
-            )
-            self._views[drone.sysid] = _FlightView(drone, thread, link, waypoints[0])
+            self._spawn_drone(drone, home)
 
         if not self._views:
             self.stop()
@@ -265,6 +240,101 @@ class ThreadSwarmBackend(QObject):
         for flags in (self._flagged_low, self._flagged_gps, self._flagged_lost, self._emergency):
             flags.clear()
         self._timer.start()
+        return True
+
+    def start_mission_paths(self, assignments: list[tuple[DroneConfig, list[LatLon]]]) -> bool:
+        """Like `start_mission_path`, but each drone flies its own distinct
+        route rather than everyone sharing one - the forest-search mission's
+        per-drone lane, where drone1 and drone2 are planned completely
+        separate routes that just happen to both start/end at the same base
+        point.
+
+        `_advance_legs`/`_poll` already key every piece of chained-route
+        state (`_paths`, `_altitudes`, `_leg_index`) by sysid, so nothing
+        below this needs to know or care that the routes differ per drone -
+        only the setup here (each drone gets its own terrain profile, home
+        point and first NAVIGATE) is genuinely different from
+        `start_mission_path`.
+        """
+        self.stop()
+        if not assignments:
+            return False
+
+        self._gcs = GroundControlStation(verbose=False)
+        self._gcs.start()
+        self._fleet = DroneFleet()
+        # Progress/finished reporting still tracks a single "how much
+        # further to go" figure - the shared base every lane ends at, since
+        # that's what remains once a drone reaches the end of its own route.
+        self._destination = assignments[0][1][-1]
+
+        per_drone: dict[int, tuple[list[LatLon], list[float]]] = {}
+        for drone, waypoints in assignments:
+            if len(waypoints) < 2:
+                continue
+            points, altitudes = plan_terrain_profile(waypoints)
+            if not self._spawn_drone(drone, points[0]):
+                continue
+            per_drone[drone.sysid] = (points, altitudes)
+
+        if not self._views:
+            self.stop()
+            return False
+
+        self._gcs.register_many(self._views)
+        self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
+
+        for sysid in self._views:
+            points, altitudes = per_drone[sysid]
+            source = [points[0].lat, points[0].lon, 0.0]
+            target = [points[1].lat, points[1].lon, altitudes[1]]
+            is_final = 1 >= len(points) - 1
+            self._paths[sysid] = list(points)
+            self._altitudes[sysid] = list(altitudes)
+            self._leg_index[sysid] = 1
+            self._gcs.navigate(sysid, source, target, final=is_final)
+
+        self._elapsed_s = 0.0
+        self._tick = 0
+        self._paused = False
+        for flags in (self._flagged_low, self._flagged_gps, self._flagged_lost, self._emergency):
+            flags.clear()
+        self._timer.start()
+        return True
+
+    def _spawn_drone(self, drone: DroneConfig, home: LatLon) -> bool:
+        """Bind a UDP link and spawn one drone-thread node starting at
+        `home`, registering it in `self._views`. Shared by
+        `start_mission_path` (every drone starts at the same point) and
+        `start_mission_paths` (each drone's own route may start somewhere
+        slightly different, though in practice a forest-search mission's
+        lanes all launch from the same shared base)."""
+        try:
+            link = DroneLink(sysid=drone.sysid, gcs_address=self._gcs.address, verbose=False)
+        except OSError as exc:
+            self.link_failed.emit(f"{drone.name}: cannot bind SYSID {drone.sysid} ({exc})")
+            return False
+        controller = None
+        if self.use_firmware:
+            controller = SimulatedFlightController(
+                sysid=drone.sysid,
+                home_lat=home.lat,
+                home_lon=home.lon,
+                cruise_speed_mps=drone.max_velocity_mps,
+                battery_capacity_mah=drone.battery_capacity_mah,
+            )
+        thread = self._fleet.spawn(
+            drone_id=drone.sysid,
+            name=drone.name,
+            cruise_speed_mps=drone.max_velocity_mps,
+            cruise_altitude_m=drone.cruise_altitude_m,
+            battery_capacity_mah=drone.battery_capacity_mah,
+            start=Position(lat=home.lat, lon=home.lon),
+            time_scale=self._time_scale,
+            link=link,
+            flight_controller=controller,
+        )
+        self._views[drone.sysid] = _FlightView(drone, thread, link, home)
         return True
 
     def stop(self) -> None:

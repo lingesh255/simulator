@@ -375,6 +375,32 @@ def plan_route_flights(drones: list[DroneConfig], waypoints: list[LatLon]) -> li
     ]
 
 
+def plan_route_flights_by_drone(
+    assignments: list[tuple[DroneConfig, list[LatLon]]]
+) -> list[_Flight]:
+    """Like `plan_route_flights`, but each drone is checked against its own
+    distinct route rather than everyone sharing one - the forest-search
+    mission's per-drone lane (see `services.thread_backend.
+    ThreadSwarmBackend.start_mission_paths`), where drone1 and drone2 fly
+    completely separate paths that just happen to both start/end at the
+    same base point."""
+    flights = []
+    for drone, waypoints in assignments:
+        if len(waypoints) < 2:
+            continue
+        total_distance = sum(haversine_m(a, b) for a, b in zip(waypoints, waypoints[1:]))
+        flights.append(
+            _Flight(
+                config=drone,
+                start=waypoints[0],
+                dest=waypoints[-1],
+                distance_m=total_distance,
+                bearing_deg=initial_bearing_deg(waypoints[0], waypoints[1]),
+            )
+        )
+    return flights
+
+
 @dataclass
 class EmergencyLanding:
     """Where a drone was sent when the controller granted an emergency landing."""
