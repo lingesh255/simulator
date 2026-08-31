@@ -3,8 +3,12 @@ import QtLocation
 import QtPositioning
 
 // Map Viewer (SRS §3.2.2). Context properties `droneModel`, `markerModel`,
-// `pathModel`, `tileCacheDir` and `offlineMode` are injected from Python
-// (gui/map_viewer.py) before this file is loaded.
+// `pathModel`, `theme`, `tileCacheDir` and `offlineMode` are injected from
+// Python (gui/map_viewer.py) before this file is loaded. `theme` (a
+// gui.theme.ThemeBridge) exposes the active light/dark palette's colors -
+// bind to it instead of hardcoding colors, so a theme toggle updates the
+// map's chrome/markers/overlays live. Raw OSM map tiles themselves are not
+// themeable and are left as-is.
 Item {
     id: root
 
@@ -50,9 +54,9 @@ Item {
         MapRectangle {
             id: regionRect
             visible: false
-            color: "#2ecc71"
+            color: theme.accent
             opacity: 0.12
-            border.color: "#2ecc71"
+            border.color: theme.accent
             border.width: 2
         }
 
@@ -61,7 +65,7 @@ Item {
             model: pathModel
             delegate: MapPolyline {
                 line.width: 2
-                line.color: "#3498db"
+                line.color: theme.accent
                 path: model.points
             }
         }
@@ -70,9 +74,9 @@ Item {
         MapItemView {
             model: restrictedAreaModel
             delegate: MapPolygon {
-                color: "#f39c12"
+                color: theme.warning
                 opacity: 0.25
-                border.color: "#f39c12"
+                border.color: theme.warning
                 border.width: 2
                 path: model.points
             }
@@ -102,7 +106,10 @@ Item {
                 sourceItem: Rectangle {
                     id: droneDot
                     width: 20; height: 20; radius: 10
-                    color: model.hasFault ? "#e74c3c" : (model.status === "IN_FLIGHT" ? "#2ecc71" : "#3498db")
+                    // Border stays fixed white regardless of app theme: it is a
+                    // contrast device against the (untheme-able) map tiles
+                    // underneath, not app chrome.
+                    color: model.hasFault ? theme.critical : (model.status === "IN_FLIGHT" ? theme.nominal : theme.accent)
                     border.color: "white"
                     border.width: 2
                     Text {
@@ -125,8 +132,10 @@ Item {
                 sourceItem: Rectangle {
                     id: pin
                     width: 16; height: 16; radius: 8
-                    color: model.role === "start" ? "#2ecc71"
-                           : (model.role === "no_fly_zone" ? "#f39c12" : "#e74c3c")
+                    // Border stays fixed black for the same reason as the
+                    // drone dot's border above.
+                    color: model.role === "start" ? theme.nominal
+                           : (model.role === "no_fly_zone" ? theme.warning : theme.critical)
                     border.color: "black"
                     border.width: 1
                 }

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from contracts.gui_orchestration import FaultSeverity, FaultType, InjectFault
+from gui.theme import theme_manager
 
 SYSID_ROLE = Qt.UserRole + 1
 
@@ -41,6 +42,7 @@ class FaultInjectionPanel(QWidget):
 
         self.drone_list = QListWidget()
         self.drone_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.drone_list.itemClicked.connect(self._on_item_clicked)
 
         self.select_all_btn = QPushButton("Select All")
         self.select_none_btn = QPushButton("Select None")
@@ -76,8 +78,9 @@ class FaultInjectionPanel(QWidget):
         form.addRow("Duration (0 = until reset)", self.duration_spin)
 
         self.inject_btn = QPushButton("Inject Fault")
-        self.inject_btn.setStyleSheet("font-weight: bold; color: #e74c3c;")
         self.inject_btn.clicked.connect(self._on_inject)
+        self._apply_theme()
+        theme_manager.theme_changed.connect(lambda _name: self._apply_theme())
 
         fault_group = QGroupBox("Fault Injection")
         fault_layout = QVBoxLayout(fault_group)
@@ -87,6 +90,15 @@ class FaultInjectionPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(target_group, stretch=1)
         layout.addWidget(fault_group)
+
+    def _apply_theme(self) -> None:
+        color = theme_manager.palette().critical
+        self.inject_btn.setStyleSheet(f"font-weight: bold; color: {color};")
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        item.setCheckState(
+            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+        )
 
     def update_active_sysids(self, sysids: list[int]) -> None:
         checked = {
