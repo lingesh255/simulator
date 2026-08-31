@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from contracts.gui_orchestration import DroneConfig, SwarmPreset
+from contracts.gui_orchestration import AppSettings, DroneConfig, SwarmPreset
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PROFILES_DIR = DATA_DIR / "profiles"
 PRESETS_DIR = DATA_DIR / "presets"
+APP_SETTINGS_PATH = DATA_DIR / "app_settings.json"
 
 
 def _slugify(name: str) -> str:
@@ -61,3 +62,20 @@ class ProfileStore:
         path = self.presets_dir / f"{_slugify(name)}.json"
         if path.exists():
             path.unlink()
+
+
+# ---- App-wide preferences (theme, ...) - one small JSON file, same
+# read/write-a-pydantic-model pattern as the profiles/presets above. ----
+
+def load_app_settings() -> AppSettings:
+    if not APP_SETTINGS_PATH.exists():
+        return AppSettings()
+    try:
+        return AppSettings.model_validate_json(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except ValueError:
+        return AppSettings()
+
+
+def save_app_settings(settings: AppSettings) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    APP_SETTINGS_PATH.write_text(settings.model_dump_json(indent=2), encoding="utf-8")

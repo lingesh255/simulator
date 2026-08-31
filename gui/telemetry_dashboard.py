@@ -24,9 +24,9 @@ from PySide6.QtWidgets import (
 
 from contracts.gui_orchestration import DroneStatus, DroneTelemetry
 from gui.artificial_horizon import ArtificialHorizon
+from gui.theme import theme_manager
 
 COLUMNS = ["SYSID", "Status", "Lat", "Lon", "Altitude (m)", "Battery %", "Link Quality %", "Active Faults"]
-FAULT_ROW_COLOR = QColor("#5c1e1e")
 NORMAL_ROW_COLOR = QColor(Qt.transparent)
 MAX_LOG_LINES = 500
 
@@ -46,8 +46,12 @@ class GlobalStateMatrix(QTableWidget):
         self.setEditTriggers(QTableWidget.NoEditTriggers)
         self.itemSelectionChanged.connect(self._on_selection_changed)
         self._row_by_sysid: dict[int, int] = {}
+        self._last_drones: list[DroneTelemetry] = []
+        theme_manager.theme_changed.connect(lambda _name: self.update_drones(self._last_drones))
 
     def update_drones(self, drones: list[DroneTelemetry]) -> None:
+        self._last_drones = drones
+        fault_row_color = QColor(theme_manager.palette().fault_row_bg)
         selected_sysid = self.selected_sysid()
         self.setRowCount(len(drones))
         self._row_by_sysid.clear()
@@ -66,7 +70,7 @@ class GlobalStateMatrix(QTableWidget):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setBackground(FAULT_ROW_COLOR if in_fault else NORMAL_ROW_COLOR)
+                item.setBackground(fault_row_color if in_fault else NORMAL_ROW_COLOR)
                 self.setItem(row, col, item)
         if selected_sysid is not None and selected_sysid in self._row_by_sysid:
             self.selectRow(self._row_by_sysid[selected_sysid])
