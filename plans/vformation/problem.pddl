@@ -84,13 +84,13 @@
         ;;
         ;;              drone-lead              (apex, 0 / 0)
         ;;             /          \
-        ;;      drone-left      drone-right     (wings, ~4.33 m behind,
-        ;;                                       2.5 m either side)
+        ;;      drone-left      drone-right     (wings, ~17.32 m behind,
+        ;;                                       10 m either side)
         ;;
-        ;; Along/cross offsets of +-2.5 m cross-track and ~4.33 m
+        ;; Along/cross offsets of +-10 m cross-track and ~17.32 m
         ;; along-track put the leader and both wings at the corners of
-        ;; an equilateral triangle with 5 m sides - every drone is
-        ;; exactly 5 m from both of the other two.
+        ;; an equilateral triangle with 20 m sides - every drone is
+        ;; exactly 20 m from both of the other two.
         ;;
         ;; `slot-direction` below is the real compass point that
         ;; offset actually points to for *this* source->destination
@@ -111,10 +111,21 @@
 
         (= (slot-along-offset drone-lead)    0)
         (= (slot-cross-offset drone-lead)    0)
-        (= (slot-along-offset drone-left)   -4.330127)
-        (= (slot-cross-offset drone-left)   -2.5)
-        (= (slot-along-offset drone-right)  -4.330127)
-        (= (slot-cross-offset drone-right)   2.5)
+        (= (slot-along-offset drone-left)   -17.320508)
+        (= (slot-cross-offset drone-left)   -10)
+        (= (slot-along-offset drone-right)  -17.320508)
+        (= (slot-cross-offset drone-right)   10)
+
+
+        ;; --------------------------------------------------------
+        ;; Staggered launch: the leader takes off alone and holds
+        ;; position (`hold-position`) for this many seconds before the
+        ;; wings' own `takeoff` unlocks - see domain.pddl ACTION 2 /
+        ;; ACTION 3b.
+        ;; --------------------------------------------------------
+
+        (= (seconds-since-leader-airborne) 0)
+        (= (wing-launch-delay) 5)
 
 
         ;; --------------------------------------------------------

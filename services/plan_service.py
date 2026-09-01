@@ -64,14 +64,15 @@ AREA_COVERAGE_DRONES = ("drone1", "drone2")  # names the Search domain's problem
 FORMATION_DRONES = ("drone-lead", "drone-left", "drone-right")
 # The V's shape, in metres: each wing sits this far behind its apex slot and
 # this far out to its side - together putting the leader and both wings at
-# the corners of an equilateral triangle with 5 m sides (every drone
-# exactly 5 m from both of the others). Must be kept in sync with the
-# `slot-along-offset`/`slot-cross-offset` numbers in
+# the corners of an equilateral triangle with 20 m sides (every drone
+# exactly 20 m from both of the others, at every point along the route -
+# source and destination alike, see `formation_wing_routes`). Must be kept
+# in sync with the `slot-along-offset`/`slot-cross-offset` numbers in
 # plans/vformation/problem.pddl - they describe the same geometry, but
 # aren't read from the PDDL file directly (formation_wing_routes works from
 # the apex's actual flown path, not the problem's numeric fluents).
-FORMATION_BACK_M = 4.330127
-FORMATION_SIDE_M = 2.5
+FORMATION_BACK_M = 17.320508
+FORMATION_SIDE_M = 10.0
 
 # Domain name (as written in `(define (domain NAME) ...)`) -> plan kind.
 # Anything not listed here defaults to "point_to_point" - the shape every

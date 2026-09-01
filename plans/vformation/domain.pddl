@@ -7,6 +7,16 @@
     ;; destination, no waypoint and no restricted-area handling for
     ;; this plan - as a rigid formation.
     ;;
+    ;; The launch is staggered, not simultaneous: the leader takes off
+    ;; alone and holds position (`hold-position`) while the wings are
+    ;; still on the ground; only once it has held for
+    ;; `wing-launch-delay` seconds - ticked up one `hold-position` call
+    ;; at a time via `seconds-since-leader-airborne` - are the wings'
+    ;; own `takeoff` calls unlocked (see ACTION 2's precondition).
+    ;; From there every drone climbs and joins the V independently, the
+    ;; same as before; the stagger only gates when the wings may leave
+    ;; the ground, not the formation logic itself.
+    ;;
     ;; A wing's position is labeled by real compass direction (one of
     ;; the 8 `direction` objects in problem.pddl - north/south/east/
     ;; west/north-east/north-west/south-east/south-west), not a fixed
@@ -14,7 +24,7 @@
     ;; source->destination bearing by
     ;; engine.vformation_problem.retarget_vformation_problem, the same
     ;; way engine.pddl_problem.retarget_problem fits `travell`'s route
-    ;; to wherever you click. Both wings sit exactly 5 m from the
+    ;; to wherever you click. Both wings sit exactly 20 m from the
     ;; leader and from each other (an equilateral triangle - see
     ;; problem.pddl's `slot-along-offset`/`slot-cross-offset`).
     ;;
@@ -200,6 +210,16 @@
         ;; `establish-v-formation` locks in.
         (slot-along-offset ?d - drone)
         (slot-cross-offset ?d - drone)
+
+        ;; Staggered launch: seconds the leader has held position since
+        ;; its own takeoff, one `hold-position` call at a time - the
+        ;; only thing that advances this clock. The wings' `takeoff` is
+        ;; locked out until it reaches `wing-launch-delay`.
+        (seconds-since-leader-airborne)
+
+        ;; How long the leader must hold before the wings may launch
+        ;; (seconds) - a mission-wide constant set in problem.pddl.
+        (wing-launch-delay)
     )
 
 
@@ -250,6 +270,14 @@
                 (gps-ok ?d)
                 (communication-ok ?d)
                 (drone-healthy ?d)
+
+                ;; Staggered launch: the leader may always go; a wing may
+                ;; only lift off once the leader has held position for
+                ;; the full `wing-launch-delay` - see `hold-position`.
+                (or
+                    (formation-leader ?d)
+                    (>= (seconds-since-leader-airborne) (wing-launch-delay))
+                )
             )
 
         :effect
@@ -288,6 +316,38 @@
                 (at-cruise-altitude ?d)
                 (decrease (battery ?d) (climb-energy ?d))
             )
+    )
+
+
+    ;; ============================================================
+    ;; ACTION 3b: LEADER HOLDS POSITION, WAITING FOR THE WINGS
+    ;; ============================================================
+
+    ;; The leader's side of the staggered launch: one call ticks the
+    ;; clock forward by exactly one second and represents it hovering in
+    ;; place rather than pressing on alone. Only the leader can call
+    ;; this (`formation-leader`), and only while the clock still has
+    ;; ground to make up - once it reaches `wing-launch-delay` the wings'
+    ;; own `takeoff` unlocks (see ACTION 2) and this action stops being
+    ;; applicable, so the leader can never over-hold.
+
+    (:action hold-position
+
+        :parameters
+            (?lead - drone)
+
+        :precondition
+            (and
+                (formation-leader ?lead)
+                (airborne ?lead)
+                (< (seconds-since-leader-airborne) (wing-launch-delay))
+                (gps-ok ?lead)
+                (communication-ok ?lead)
+                (drone-healthy ?lead)
+            )
+
+        :effect
+            (increase (seconds-since-leader-airborne) 1)
     )
 
 

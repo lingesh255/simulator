@@ -51,6 +51,11 @@ from services.storage import ProfileStore
 NFZ_CORNER_COUNT = 4  # a restricted area is a quadrilateral, click order = winding order
 FOREST_CORNER_COUNT = 4  # a search area is a quadrilateral too - "dynamic dimensions"
 
+# V-formation flight-path line colors, in FORMATION_DRONES order (apex, left
+# wing, right wing) - Indian-flag saffron/white/green, apex (the leader,
+# geometrically the middle line of the V) gets the middle stripe, white.
+FORMATION_FLAG_COLORS = ("#FFFFFF", "#FF9933", "#138808")
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -990,6 +995,10 @@ class MainWindow(QMainWindow):
         self.drone_management.set_running(True)
         self.fault_injection.update_active_sysids([d.sysid for d, _ in cleared_assignments])
         self.map_viewer.clear_paths()
+        if route_noun == "slot":
+            self.map_viewer.set_path_colors(
+                {d.sysid: color for (d, _r), color in zip(assignments, FORMATION_FLAG_COLORS)}
+            )
 
         if not self.thread_sim.start_mission_paths(cleared_assignments):
             self.drone_management.set_running(False)

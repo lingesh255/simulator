@@ -272,6 +272,11 @@ class MapViewer(QWidget):
     def clear_paths(self) -> None:
         self.path_model.clear()
 
+    def set_path_colors(self, colors: dict[int, str]) -> None:
+        """`colors` maps a drone's sysid to the hex color its flight-path
+        line should be drawn in (e.g. the V-formation's apex/wing roles)."""
+        self.path_model.set_colors(colors)
+
     def set_restricted_area(self, points: list) -> None:
         """`points` is a list of objects with `.lat`/`.lon` (a `LatLon`),
         in click order."""

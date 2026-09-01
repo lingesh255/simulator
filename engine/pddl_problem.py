@@ -741,11 +741,16 @@ def formation_wing_routes(
 ) -> tuple[list[LatLon], list[LatLon]]:
     """The two wing tracks of a V, parallel to `lead_route`.
 
-    Each wing waypoint sits `back_m` behind its lead waypoint (opposite the
-    direction of travel) and `side_m` out to one side - left wing to port,
-    right wing to starboard. Returns `(left_route, right_route)`, each the
-    same length as `lead_route`. A single-point (or empty) lead route is
-    returned unchanged for both wings.
+    Each wing waypoint - including the first (`source`) - sits `back_m`
+    behind its lead waypoint (opposite the direction of travel) and `side_m`
+    out to one side - left wing to port, right wing to starboard - so the
+    wing-to-lead (and wing-to-wing) spacing is the fixed formation distance
+    everywhere along the route, source to destination alike, not just once
+    airborne.
+
+    Returns `(left_route, right_route)`, each the same length as
+    `lead_route`. A single-point (or empty) lead route is returned unchanged
+    for both wings.
     """
     if len(lead_route) < 2:
         return list(lead_route), list(lead_route)

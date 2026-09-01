@@ -375,13 +375,15 @@ class PathModel(QAbstractListModel):
 
     SYSID = Qt.UserRole + 1
     POINTS = Qt.UserRole + 2
+    COLOR = Qt.UserRole + 3
 
-    _ROLE_NAMES = {SYSID: b"sysid", POINTS: b"points"}
+    _ROLE_NAMES = {SYSID: b"sysid", POINTS: b"points", COLOR: b"color"}
 
     def __init__(self, parent=None, max_points: int = 200):
         super().__init__(parent)
         self._paths: dict[int, list[tuple[float, float]]] = {}
         self._order: list[int] = []
+        self._colors: dict[int, str] = {}
         self._max_points = max_points
 
     def roleNames(self):
@@ -398,6 +400,8 @@ class PathModel(QAbstractListModel):
             return sysid
         if role == self.POINTS:
             return [{"latitude": lat, "longitude": lon} for lat, lon in self._paths[sysid]]
+        if role == self.COLOR:
+            return self._colors.get(sysid)
         return None
 
     def append_point(self, sysid: int, lat: float, lon: float) -> None:
@@ -411,8 +415,16 @@ class PathModel(QAbstractListModel):
             del points[: len(points) - self._max_points]
         self.endResetModel()
 
+    def set_colors(self, colors: dict[int, str]) -> None:
+        """Assign an explicit line color to each `sysid` (e.g. the V-formation's
+        apex/wing roles) - drones with no entry keep the delegate's default."""
+        self.beginResetModel()
+        self._colors = dict(colors)
+        self.endResetModel()
+
     def clear(self) -> None:
         self.beginResetModel()
         self._paths = {}
         self._order = []
+        self._colors = {}
         self.endResetModel()
