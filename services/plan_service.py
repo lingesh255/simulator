@@ -10,9 +10,9 @@ Runs on a worker thread - `run_enhsp` shells out to Java and blocks - and
 reports back through Qt signals, the same shape as `MavlinkSwarmBackend`'s
 worker in `services/mavlink_backend.py`.
 
-Two plan *kinds* are supported, told apart by which domain a plan folder's
+Three plan *kinds* are supported, told apart by which domain a plan folder's
 `domain.pddl` declares (see `plan_kind`) rather than by folder name, so any
-future plan sharing one of these two domains works with no further wiring:
+future plan sharing one of these domains works with no further wiring:
 
 - point-to-point (`swarm-drone-mission`, e.g. `plans/travell/`): one shared
   route, retargeted from a picked source/destination (+ optional restricted
@@ -20,6 +20,11 @@ future plan sharing one of these two domains works with no further wiring:
 - area-coverage (`forest-drone-search`, e.g. `plans/Search/`): one route per
   drone, retargeted from a picked base point + a marked search-area polygon
   via `engine.search_problem.retarget_search_problem`.
+- formation (`v-formation-drone-mission`, e.g. `plans/vformation/`): picked
+  like a point-to-point plan (source + destination), but ENHSP plans only
+  the apex's corridor (`engine.pddl_problem.retarget_formation_problem`) and
+  the two wing routes are derived parallel to it - three drones, one per V
+  slot, flown concurrently like the area-coverage per-drone routes.
 """
 from __future__ import annotations
 
@@ -37,17 +42,36 @@ from engine.pddl_planner import (
     PlanNotFound,
     PlannerError,
     PlanStep,
+    extract_formation_corridor,
     extract_multi_route,
     extract_route,
     run_enhsp,
 )
 from engine.pddl_problem import LatLon as PddlLatLon
-from engine.pddl_problem import read_locations, retarget_problem
+from engine.pddl_problem import (
+    formation_wing_routes,
+    read_locations,
+    retarget_formation_problem,
+    retarget_problem,
+)
 from engine.search_problem import retarget_search_problem
 
 PLANS_DIR = Path(__file__).resolve().parent.parent / "plans"
 PLAN_DRONE_OBJECT = "drone1"  # ENHSP solves the point-to-point route for this reference drone
 AREA_COVERAGE_DRONES = ("drone1", "drone2")  # names the Search domain's problem template fixes
+
+# Drone objects the vformation problem template fixes, apex first.
+FORMATION_DRONES = ("drone-lead", "drone-left", "drone-right")
+# The V's shape, in metres: each wing sits this far behind its apex slot and
+# this far out to its side - together putting the leader and both wings at
+# the corners of an equilateral triangle with 5 m sides (every drone
+# exactly 5 m from both of the others). Must be kept in sync with the
+# `slot-along-offset`/`slot-cross-offset` numbers in
+# plans/vformation/problem.pddl - they describe the same geometry, but
+# aren't read from the PDDL file directly (formation_wing_routes works from
+# the apex's actual flown path, not the problem's numeric fluents).
+FORMATION_BACK_M = 4.330127
+FORMATION_SIDE_M = 2.5
 
 # Domain name (as written in `(define (domain NAME) ...)`) -> plan kind.
 # Anything not listed here defaults to "point_to_point" - the shape every
@@ -55,6 +79,7 @@ AREA_COVERAGE_DRONES = ("drone1", "drone2")  # names the Search domain's problem
 _DOMAIN_KIND = {
     "swarm-drone-mission": "point_to_point",
     "forest-drone-search": "area_coverage",
+    "v-formation-drone-mission": "formation",
 }
 _DOMAIN_NAME = re.compile(r"\(define\s*\(domain\s+(\S+)\)")
 
@@ -170,6 +195,13 @@ class _Worker(QObject):
         destination: LatLon,
         no_fly_zone: Optional[list[LatLon]],
     ) -> PlanRunResult:
+        if plan_kind(plan_name) == "formation":
+            # Collected on the same two clicks as a point-to-point plan, so
+            # it arrives through the same `run` slot - it just retargets and
+            # extracts differently. `no_fly_zone` is not modelled by the
+            # formation domain and is ignored.
+            return self._run_formation(plan_name, source, destination)
+
         domain_path, template_path = self._plan_files(plan_name)
         template_text = template_path.read_text(encoding="utf-8")
         concrete_text = retarget_problem(
@@ -207,6 +239,63 @@ class _Worker(QObject):
             waypoints=waypoints,
             location_names=location_names,
             run_dir=run_dir,
+        )
+
+    def _run_formation(
+        self, plan_name: str, source: LatLon, destination: LatLon
+    ) -> PlanRunResult:
+        """V-formation plan: ENHSP plans the apex's waypoint corridor from
+        the picked source/destination; the two wing tracks are then derived
+        parallel to it (`formation_wing_routes`), and all three fly
+        concurrently through `_start_area_coverage_mission`'s per-drone-route
+        path - one drone per slot, apex/left/right in `FORMATION_DRONES`
+        order."""
+        domain_path, template_path = self._plan_files(plan_name)
+        template_text = template_path.read_text(encoding="utf-8")
+        concrete_text = retarget_formation_problem(
+            template_text,
+            PddlLatLon(lat=source.lat, lon=source.lon),
+            PddlLatLon(lat=destination.lat, lon=destination.lon),
+        )
+
+        run_dir = self._start_run(plan_name, concrete_text)
+        steps, stdout = run_enhsp(domain_path, run_dir / "problem.pddl")
+        (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
+
+        corridor = extract_formation_corridor(steps)
+        if not corridor:
+            raise PlanNotFound(
+                "ENHSP found a plan but it contains no 'formation-cruise' legs."
+            )
+        locations = read_locations(concrete_text)
+        try:
+            lead_route = [
+                PddlLatLon(lat=locations[name].lat, lon=locations[name].lon)
+                for name in corridor
+            ]
+        except KeyError as exc:
+            raise PlanNotFound(
+                f"Plan references location {exc} with no coordinates in problem.pddl"
+            ) from exc
+
+        left_route, right_route = formation_wing_routes(
+            lead_route, back_m=FORMATION_BACK_M, side_m=FORMATION_SIDE_M
+        )
+
+        def _as_gui(route: list[PddlLatLon]) -> list[LatLon]:
+            return [LatLon(lat=p.lat, lon=p.lon) for p in route]
+
+        per_drone_waypoints = dict(
+            zip(FORMATION_DRONES, (_as_gui(lead_route), _as_gui(left_route), _as_gui(right_route)))
+        )
+
+        return PlanRunResult(
+            plan_name=plan_name,
+            steps=steps,
+            waypoints=_as_gui(lead_route),
+            location_names=corridor,
+            run_dir=run_dir,
+            per_drone_waypoints=per_drone_waypoints,
         )
 
     def _run_area(

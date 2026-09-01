@@ -7,6 +7,11 @@ interaction through to the Renode Emulation Backend's UDP contract via
 """
 from __future__ import annotations
 
+import re
+import subprocess
+import sys
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
@@ -28,6 +33,7 @@ from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
 from gui.telemetry_dashboard import TelemetryDashboard
 from services.api_client import OrchestrationClient
+from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import PlanRunResult, PlanService, plan_kind
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
@@ -92,6 +98,23 @@ class MainWindow(QMainWindow):
         self.local_sim = LocalFlightSimulator(self)
         self.thread_sim = ThreadSwarmBackend(self)
         self.flight_sim = self.local_sim
+
+        # A third, opt-in path for a PDDL-planned point-to-point mission: fly
+        # the solved route as one real MAVLink mission against an external
+        # SITL/vehicle instead of thread_sim's in-process pipeline - see the
+        # Mission Planner panel's "Fly via real MAVLink" toggle and
+        # `_run_planned_mission`. Not part of the flight_sim/thread_sim
+        # swap above since it isn't a telemetry source the rest of the GUI
+        # polls; it just reports progress/finished/failed while it runs.
+        self.mavlink_flight = MavlinkFlightService(self)
+        # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
+        # when the panel's "Use built-in mock vehicle" box is checked - a
+        # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
+        self._mock_sitl_proc: subprocess.Popen | None = None
+        # Cleared on Stop so telemetry batches already queued from a worker
+        # thread when Stop was pressed can't slip through and repopulate the
+        # map after everything has been torn down. Re-armed by each run start.
+        self._accepting_telemetry = True
 
         self.drone_management = DroneManagementPanel(self.store)
         self.map_viewer = MapViewer()
@@ -259,9 +282,15 @@ class MainWindow(QMainWindow):
             lambda msg: self.statusBar().showMessage(f"Drone node: {msg}", 15000)
         )
 
+        self.mavlink_flight.batch_ready.connect(self._on_telemetry)
+        self.mavlink_flight.progress.connect(self._on_mavlink_flight_progress)
+        self.mavlink_flight.finished.connect(self._on_mavlink_flight_finished)
+        self.mavlink_flight.failed.connect(self._on_mavlink_flight_failed)
+
     # ---- Connection ----
 
     def _on_connect_clicked(self) -> None:
+        self._accepting_telemetry = True
         sysids = self.drone_management.checked_sysids()
         if not sysids:
             sysids = [1, 2]  # Default if nothing selected
@@ -315,6 +344,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_emulate(self, drones: list) -> None:
+        self._accepting_telemetry = True
         for drone in drones:
             self.client.register_drone(drone)
         self.client.connect_telemetry([d.sysid for d in drones])
@@ -534,7 +564,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(summary)
 
     def _on_stop(self) -> None:
+        self._accepting_telemetry = False
         self.flight_sim.stop()
+        self.mavlink_flight.abort()
+        self._stop_mock_vehicle()
         self.flight_label.setText("No flight")
         # Markers are cleared below, so the points they stood for go too.
         self._landing_candidates.clear()
@@ -550,6 +583,7 @@ class MainWindow(QMainWindow):
         self.client.stop_swarm()
         self.client.disconnect_telemetry()
         self.map_viewer.clear_markers()
+        self.map_viewer.clear_drones()
         self.map_viewer.clear_paths()
         self.map_viewer.clear_restricted_area()
         self.fault_injection.update_active_sysids([])
@@ -725,6 +759,7 @@ class MainWindow(QMainWindow):
             )
 
     def _on_plan_ready(self, result: PlanRunResult) -> None:
+        self._accepting_telemetry = True
         self.mission_planner.set_plan_steps(result.plan_name, result.steps)
 
         drones = self.drone_management.checked_drones()
@@ -734,7 +769,12 @@ class MainWindow(QMainWindow):
             return
 
         if result.per_drone_waypoints is not None:
-            self._start_area_coverage_mission(result, drones)
+            noun = "slot" if self._plan_kind == "formation" else "lane"
+            self._start_area_coverage_mission(result, drones, route_noun=noun)
+            return
+
+        if self.mission_planner.use_external_mavlink():
+            self._start_external_mavlink_mission(result, drones)
             return
 
         flights = plan_route_flights(drones, result.waypoints)
@@ -781,13 +821,139 @@ class MainWindow(QMainWindow):
         self._pending_plan_name = None
         self._plan_source = None
 
-    def _start_area_coverage_mission(self, result: PlanRunResult, drones: list) -> None:
+    def _start_external_mavlink_mission(self, result: PlanRunResult, drones: list) -> None:
+        """Fly the solved route as one real MAVLink mission against an
+        external SITL/vehicle (see MissionPlannerPanel's "Fly via real
+        MAVLink" toggle), instead of thread_sim's in-process drone-thread
+        pipeline. A point-to-point plan has exactly one shared route
+        regardless of how many drones are checked, so this always flies one
+        external connection - it isn't "one per checked drone".
+
+        Skips the internal battery-feasibility check `_on_plan_ready`
+        otherwise runs (`plan_route_flights`): that model is this app's own
+        `DroneConfig` battery curve, which has nothing to do with whatever
+        vehicle is actually listening on the far end of `connection`.
+        """
+        connection = self.mission_planner.mavlink_connection_string()
+        if not connection:
+            message = "Enter a MAVLink connection string first, e.g. udp:127.0.0.1:14550."
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return
+
+        route_text = " -> ".join(result.location_names)
+        altitude_m = drones[0].cruise_altitude_m
+        sysid = drones[0].sysid
+        source = result.waypoints[0]  # the exact point this route was solved from
+
+        if self.mission_planner.use_mock_vehicle():
+            if not self._start_mock_vehicle(connection, source):
+                return  # status/console already explain why
+
+        self.drone_management.set_running(True)
+        # Drop any marker/trail left by a previous run so this mission's first
+        # fix appears straight at its own source instead of the icon gliding
+        # across the map from wherever the last one ended.
+        self.map_viewer.clear_drones()
+        self.map_viewer.clear_paths()
+        self.mission_planner.set_status(
+            f"Plan '{result.plan_name}' ({route_text}): connecting to {connection} ..."
+        )
+        self.statusBar().showMessage(
+            f"Flying plan '{result.plan_name}' via real MAVLink at {connection}."
+        )
+        print(f"[MAVLink] Plan '{result.plan_name}' ({route_text}): connecting to {connection} ...")
+        self.mavlink_flight.run_async(result.waypoints, connection, altitude_m, sysid)
+        self._pending_plan_name = None
+        self._plan_source = None
+
+    @staticmethod
+    def _parse_udp_connection(connection: str) -> tuple[str, int] | None:
+        """`"udp:host:port"` -> `(host, port)`, or None for anything else
+        (tcp:/serial device/other transport) - the mock vehicle is only ever
+        launched over UDP, matching what `engine.mavlink_mission` expects."""
+        match = re.match(r"^udp:([^:]+):(\d+)$", connection.strip())
+        return (match.group(1), int(match.group(2))) if match else None
+
+    def _start_mock_vehicle(self, connection: str, source: LatLon) -> bool:
+        """Launch `scripts/mock_sitl.py`, seeded with the plan's actual
+        source point, so no one has to hand-run it or type --home themselves.
+        Its own stdout/stderr are left un-redirected, so its prints land in
+        this same console alongside ours."""
+        parsed = self._parse_udp_connection(connection)
+        if parsed is None:
+            message = (
+                f"Mock vehicle needs a udp:host:port connection string, got '{connection}'."
+            )
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return False
+        _host, port = parsed
+
+        self._stop_mock_vehicle()
+        script = Path(__file__).resolve().parent.parent / "scripts" / "mock_sitl.py"
+        args = [
+            sys.executable, str(script),
+            "--port", str(port),
+            "--home", f"{source.lat},{source.lon}",
+        ]
+        print(f"[MAVLink] Launching mock vehicle: {' '.join(args)}")
+        try:
+            self._mock_sitl_proc = subprocess.Popen(args, cwd=str(script.parent.parent))
+        except OSError as exc:
+            message = f"Could not launch mock vehicle: {exc}"
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return False
+        return True
+
+    def _stop_mock_vehicle(self) -> None:
+        proc, self._mock_sitl_proc = self._mock_sitl_proc, None
+        if proc is not None and proc.poll() is None:
+            print("[MAVLink] Stopping mock vehicle.")
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def _on_mavlink_flight_progress(self, message: str) -> None:
+        print(f"[MAVLink] {message}")
+        if not self._accepting_telemetry:
+            return  # the run was stopped; don't clobber the "stopped" status
+        self.mission_planner.set_status(message)
+        self.statusBar().showMessage(message, 5000)
+
+    def _on_mavlink_flight_finished(self) -> None:
+        self._stop_mock_vehicle()
+        if not self._accepting_telemetry:
+            # Worker unwound because of a Stop - `_on_stop` already reported it.
+            return
+        self.drone_management.set_running(False)
+        self.mission_planner.set_status("External MAVLink mission complete.")
+        self.statusBar().showMessage("External MAVLink mission complete.", 8000)
+        print("[MAVLink] Mission complete.")
+
+    def _on_mavlink_flight_failed(self, message: str) -> None:
+        self.drone_management.set_running(False)
+        self.mission_planner.set_status(f"External MAVLink mission failed: {message}")
+        self.statusBar().showMessage(f"External MAVLink mission failed: {message}", 15000)
+        print(f"[MAVLink] FAILED: {message}")
+        self._stop_mock_vehicle()
+
+    def _start_area_coverage_mission(
+        self, result: PlanRunResult, drones: list, *, route_noun: str = "lane"
+    ) -> None:
         """Assign each checked drone to one of the plan's per-drone routes,
         in order (the first checked drone flies `drone1`'s lane, the second
         `drone2`'s, ...), and fly them concurrently - every lane needs its
         own drone, so extra checked drones beyond the number of lanes simply
         sit this mission out, and fewer checked drones than lanes means it
-        can't run at all yet."""
+        can't run at all yet.
+
+        `route_noun` is just what these per-drone routes are called in the
+        status line - "lane" for an area-coverage sweep, "slot" for a
+        V-formation's apex/left/right tracks; the mechanism is identical."""
         routes = list(result.per_drone_waypoints.values())
         if len(drones) < len(routes):
             self.mission_planner.set_status(
@@ -810,10 +976,10 @@ class MainWindow(QMainWindow):
 
         if len(cleared_assignments) < len(routes):
             self.mission_planner.set_status(
-                f"Plan '{result.plan_name}': not every drone has the battery for its lane."
+                f"Plan '{result.plan_name}': not every drone has the battery for its {route_noun}."
             )
             self.statusBar().showMessage(
-                f"Plan '{result.plan_name}' ready, but not every drone has the battery for its lane."
+                f"Plan '{result.plan_name}' ready, but not every drone has the battery for its {route_noun}."
             )
             return
 
@@ -832,11 +998,11 @@ class MainWindow(QMainWindow):
 
         self.mission_planner.set_status(
             f"Flying plan '{result.plan_name}' - {len(cleared_assignments)} drone(s), "
-            f"{len(routes)} lane(s), {total_distance_km:.1f} km combined."
+            f"{len(routes)} {route_noun}(s), {total_distance_km:.1f} km combined."
         )
         self.statusBar().showMessage(
             f"Flying {len(cleared_assignments)} drone(s) on plan '{result.plan_name}' "
-            f"({len(routes)} lane(s))."
+            f"({len(routes)} {route_noun}(s))."
         )
         self._pending_plan_name = None
         self._plan_source = None
@@ -851,6 +1017,10 @@ class MainWindow(QMainWindow):
     # ---- Telemetry wiring ----
 
     def _on_telemetry(self, batch) -> None:
+        if not self._accepting_telemetry:
+            # A run was stopped; this batch was already in the queue from a
+            # worker thread. Dropping it keeps the torn-down map clear.
+            return
         self.map_viewer.update_drones(batch.drones)
         self.telemetry_dashboard.update_drones(self._glide_matched_telemetry(batch.drones))
         self.fault_injection.update_active_sysids([d.sysid for d in batch.drones])

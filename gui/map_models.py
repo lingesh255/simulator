@@ -97,6 +97,27 @@ class DroneMarkerModel(QAbstractListModel):
         on how this model smooths what it reports to the map."""
         self._glide_speed = max(0.01, speed)
 
+    def clear(self) -> None:
+        """Drop every tracked drone and all its glide state. Called on
+        Stop/Reset and at the start of each new run so a stale icon can't
+        linger on the map, and so the next mission's first fix is treated as
+        a first sighting (placed straight at the new source) instead of the
+        marker gliding in from wherever the previous run left it - the
+        external-MAVLink path never reports TAKING_OFF, so `_is_fresh_launch`
+        alone can't catch that case."""
+        if self._order:
+            self.beginRemoveRows(QModelIndex(), 0, len(self._order) - 1)
+            self._order.clear()
+            self._latest.clear()
+            self._displayed.clear()
+            self._displayed_alt.clear()
+            self._prior_fix.clear()
+            self._observed_mps.clear()
+            self._observed_vps.clear()
+            self._prev_status.clear()
+            self.endRemoveRows()
+        self._last_tick_s = None
+
     def displayed_position(self, sysid: int) -> Optional[tuple[float, float, float]]:
         """The (lat, lon, altitude_m) this model is currently showing for
         `sysid` - the same smoothed position/altitude the map marker itself

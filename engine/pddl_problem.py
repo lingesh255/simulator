@@ -599,3 +599,173 @@ def retarget_problem(
     # leave the template's own detour facts as the fallback.
 
     return result
+
+
+# ---- V-formation retargeting -------------------------------------------------
+
+# The 8 compass objects declared in plans/vformation/problem.pddl's
+# :objects, in bearing order starting from north (0 deg) and stepping 45 deg
+# clockwise - index i is the nearest compass point to a bearing of i * 45 deg.
+_COMPASS_POINTS = (
+    "north", "north-east", "east", "south-east",
+    "south", "south-west", "west", "north-west",
+)
+
+_SLOT_DIRECTION_FACT = re.compile(r"(\(slot-direction\s+(\S+)\s+)(\S+)(\))")
+
+
+def _unary_fact_value(problem_text: str, predicate: str, obj: str) -> float | None:
+    """`(= (predicate obj) v)` -> v - the one-argument counterpart to
+    `_fact_value`, for per-drone fluents like `slot-along-offset`."""
+    pattern = re.compile(
+        rf"\(=\s*\({re.escape(predicate)}\s+{re.escape(obj)}\)\s*([-\d.eE]+)\s*\)"
+    )
+    match = pattern.search(problem_text)
+    return float(match.group(1)) if match else None
+
+
+def _bearing_deg(a: LatLon, b: LatLon) -> float:
+    """Compass bearing (0 = north, clockwise) from `a` to `b` - locally
+    flat, accurate at the leg lengths a formation mission flies."""
+    east, north = _to_local(b, a)
+    return math.degrees(math.atan2(east, north)) % 360.0
+
+
+def _nearest_compass_point(bearing_deg: float) -> str:
+    return _COMPASS_POINTS[round(bearing_deg / 45.0) % 8]
+
+
+def _wing_slot_direction(travel_bearing_deg: float, along_offset_m: float, cross_offset_m: float) -> str:
+    """The real compass point a wing's fixed (along, cross) offset - in the
+    frame of a formation travelling at `travel_bearing_deg` - points to,
+    relative to the leader. `along` is measured backward along the
+    direction of travel (negative = behind, the template's convention);
+    `cross` is perpendicular to it (negative = left of travel, positive =
+    right)."""
+    rad = math.radians(travel_bearing_deg)
+    east = along_offset_m * math.sin(rad) + cross_offset_m * math.cos(rad)
+    north = along_offset_m * math.cos(rad) - cross_offset_m * math.sin(rad)
+    return _nearest_compass_point(math.degrees(math.atan2(east, north)) % 360.0)
+
+
+def _set_slot_direction(problem_text: str, drone_name: str, direction_name: str) -> str:
+    def _repl(match: re.Match) -> str:
+        if match.group(2) != drone_name:
+            return match.group(0)
+        return f"{match.group(1)}{direction_name}{match.group(4)}"
+
+    return _SLOT_DIRECTION_FACT.sub(_repl, problem_text)
+
+
+def retarget_formation_problem(
+    problem_text: str,
+    new_source: LatLon,
+    new_destination: LatLon,
+    *,
+    source_name: str = "source",
+    destination_name: str = "destination",
+    left_wing_name: str = "drone-left",
+    right_wing_name: str = "drone-right",
+) -> str:
+    """Relocate a `v-formation-drone-mission` problem onto a picked
+    source/destination.
+
+    Same coordinate relocation as `retarget_problem` - every location is
+    carried through the rotate+scale+translate that maps the template's
+    `source->destination` onto the new one, and each edge's distance /
+    energy-required is recomputed from the moved points at that edge's own
+    original per-metre rate - but the connectivity graph
+    (`connected` / `safe-route`) is left exactly as the template wrote it.
+
+    The V flies a fixed waypoint corridor, not a source/destination choice
+    between a direct leg and a detour, so there is nothing here to switch
+    between and no `no_fly_zone` handling: `retarget_problem`'s
+    `_set_direct_route_only` would strip the very `safe-route` facts
+    `formation-cruise` needs.
+
+    Each wing's `slot-direction` (the real compass point - north/south/
+    east/west/north-east/north-west/south-east/south-west - its fixed
+    `slot-along-offset`/`slot-cross-offset` geometry actually points to) is
+    also recomputed here, from the *new* source->destination bearing - a
+    wing sitting behind and to the left of a formation heading east points
+    north-west; the same offset heading north points north-east instead.
+    The offsets themselves (what puts the leader and both wings at the
+    corners of a fixed-size triangle) never change; only which compass
+    label that shape's wings happen to point at does.
+    """
+    locations = read_locations(problem_text)
+    if source_name not in locations or destination_name not in locations:
+        raise ValueError(
+            f"template has no latitude/longitude for {source_name!r}/{destination_name!r}"
+        )
+
+    transform = _similarity_transform(
+        locations[source_name], locations[destination_name], new_source, new_destination
+    )
+    moved = {name: transform(point) for name, point in locations.items()}
+    moved[source_name] = new_source
+    moved[destination_name] = new_destination
+
+    result = problem_text
+    for name, point in moved.items():
+        result = _set_latlon(result, name, point)
+
+    for a, b in _read_edges(problem_text):
+        if a not in moved or b not in moved:
+            continue
+        old_distance = _fact_value(problem_text, "distance", a, b)
+        old_energy = _fact_value(problem_text, "energy-required", a, b)
+        rate = (
+            old_energy / old_distance
+            if old_distance and old_energy is not None
+            else DEFAULT_ENERGY_RATE
+        )
+        new_distance = haversine_m(moved[a], moved[b])
+        if old_distance is not None:
+            result = _set_fact_value(result, "distance", a, b, new_distance)
+        if old_energy is not None:
+            result = _set_fact_value(result, "energy-required", a, b, new_distance * rate)
+
+    bearing = _bearing_deg(new_source, new_destination)
+    for wing_name in (left_wing_name, right_wing_name):
+        along = _unary_fact_value(problem_text, "slot-along-offset", wing_name)
+        cross = _unary_fact_value(problem_text, "slot-cross-offset", wing_name)
+        if along is not None and cross is not None:
+            result = _set_slot_direction(result, wing_name, _wing_slot_direction(bearing, along, cross))
+
+    return result
+
+
+def formation_wing_routes(
+    lead_route: list[LatLon], *, back_m: float, side_m: float
+) -> tuple[list[LatLon], list[LatLon]]:
+    """The two wing tracks of a V, parallel to `lead_route`.
+
+    Each wing waypoint sits `back_m` behind its lead waypoint (opposite the
+    direction of travel) and `side_m` out to one side - left wing to port,
+    right wing to starboard. Returns `(left_route, right_route)`, each the
+    same length as `lead_route`. A single-point (or empty) lead route is
+    returned unchanged for both wings.
+    """
+    if len(lead_route) < 2:
+        return list(lead_route), list(lead_route)
+
+    left: list[LatLon] = []
+    right: list[LatLon] = []
+    for i, here in enumerate(lead_route):
+        ahead = lead_route[i + 1] if i + 1 < len(lead_route) else lead_route[i]
+        behind = lead_route[i - 1] if i > 0 else lead_route[i]
+        # Local travel direction at this waypoint: the leg leaving it, or -
+        # at the last point - the leg arriving into it.
+        dx, dy = _to_local(ahead, behind)
+        norm = math.hypot(dx, dy)
+        if norm < 1e-6:
+            left.append(here)
+            right.append(here)
+            continue
+        fwd = (dx / norm, dy / norm)          # unit "forward" (east, north)
+        port = (-fwd[1], fwd[0])               # 90 deg left of forward
+        back = (-fwd[0] * back_m, -fwd[1] * back_m)
+        left.append(_from_local((back[0] + port[0] * side_m, back[1] + port[1] * side_m), here))
+        right.append(_from_local((back[0] - port[0] * side_m, back[1] - port[1] * side_m), here))
+    return left, right

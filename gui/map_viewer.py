@@ -266,6 +266,9 @@ class MapViewer(QWidget):
     def clear_markers(self) -> None:
         self.marker_model.clear()
 
+    def clear_drones(self) -> None:
+        self.drone_model.clear()
+
     def clear_paths(self) -> None:
         self.path_model.clear()
 

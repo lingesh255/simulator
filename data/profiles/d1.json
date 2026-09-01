@@ -1,14 +1,16 @@
 {
-  "name": "d1",
+  "name": "D1",
   "sysid": 1,
   "mass_kg": 1.5,
   "max_velocity_mps": 15.0,
-  "battery_capacity_mah": 9000.0,
+  "battery_capacity_mah": 15200.0,
   "cruise_altitude_m": 50.0,
   "sensors": [
     "gps",
     "imu",
     "barometer",
-    "magnetometer"
+    "magnetometer",
+    "camera",
+    "lidar"
   ]
 }
