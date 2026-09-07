@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -48,10 +49,46 @@ class MissionPlannerPanel(QWidget):
             "the mission only detours around it if it actually sits in the way."
         )
 
+        self.external_mavlink_check = QCheckBox("Fly via real MAVLink (SITL/hardware)")
+        self.external_mavlink_check.setToolTip(
+            "Unchecked (default): fly using this app's own in-process drone-thread "
+            "pipeline - works with no extra setup.\n"
+            "Checked: instead upload the planned route as one real MAVLink mission "
+            "to the connection string below and fly it there - needs an actual "
+            "ArduPilot/PX4 (SITL or hardware) already listening, or the mission "
+            "fails immediately rather than hanging."
+        )
+        self.external_mavlink_check.toggled.connect(self._on_external_mavlink_toggled)
+
+        self.mavlink_connection_edit = QLineEdit("udp:127.0.0.1:14550")
+        self.mavlink_connection_edit.setEnabled(False)
+        self.mavlink_connection_edit.setToolTip(
+            "pymavlink connection string, e.g. udp:127.0.0.1:14550 for ArduPilot "
+            "SITL's default output."
+        )
+        connection_row = QHBoxLayout()
+        connection_row.addWidget(QLabel("Connect:"))
+        connection_row.addWidget(self.mavlink_connection_edit, stretch=1)
+
+        self.mock_vehicle_check = QCheckBox("Use built-in mock vehicle (auto-launch, for testing)")
+        self.mock_vehicle_check.setEnabled(False)
+        self.mock_vehicle_check.setToolTip(
+            "Unchecked: you manage the vehicle yourself - point Connect at a real "
+            "ArduPilot/PX4 (SITL or hardware) you already started.\n"
+            "Checked: the app launches scripts/mock_sitl.py for you, seeded with "
+            "the source point you click on the map - no separate terminal or "
+            "manual --home needed. Only for testing; leave unchecked against a "
+            "real vehicle (checking this alongside a real local SITL on the same "
+            "port would run two vehicles at once)."
+        )
+
         plan_group = QGroupBox("Named Plan (plans/<name>/)")
         plan_layout = QVBoxLayout(plan_group)
         plan_layout.addLayout(pick_row)
         plan_layout.addWidget(self.restricted_check)
+        plan_layout.addWidget(self.external_mavlink_check)
+        plan_layout.addLayout(connection_row)
+        plan_layout.addWidget(self.mock_vehicle_check)
         plan_layout.addWidget(self.plan_btn)
 
         self.status_label = QLabel("Idle.")
@@ -88,6 +125,21 @@ class MissionPlannerPanel(QWidget):
 
     def mark_restricted_area(self) -> bool:
         return self.restricted_check.isChecked()
+
+    def _on_external_mavlink_toggled(self, checked: bool) -> None:
+        self.mavlink_connection_edit.setEnabled(checked)
+        self.mock_vehicle_check.setEnabled(checked)
+        if not checked:
+            self.mock_vehicle_check.setChecked(False)
+
+    def use_external_mavlink(self) -> bool:
+        return self.external_mavlink_check.isChecked()
+
+    def mavlink_connection_string(self) -> str:
+        return self.mavlink_connection_edit.text().strip()
+
+    def use_mock_vehicle(self) -> bool:
+        return self.mock_vehicle_check.isChecked()
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)

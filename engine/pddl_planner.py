@@ -196,3 +196,27 @@ def extract_multi_route(steps: list[PlanStep], drones: list[str]) -> dict[str, l
         route.extend(to for _from, to in legs)
         routes[drone] = route
     return routes
+
+
+def extract_formation_corridor(steps: list[PlanStep]) -> list[str]:
+    """The ordered location chain a V-formation flies, from its
+    `(formation-cruise <lead> <from> <to>)` legs (the `v-formation-drone-mission`
+    domain - see `plans/vformation/`).
+
+    Only the apex leg is planned in PDDL; both wings hold station off it, so
+    the plan carries just this one corridor and the wings' parallel tracks
+    are derived from it geometrically when the route is drawn
+    (`engine.pddl_problem.formation_wing_routes`). Chained the same way
+    `extract_route` does: the first leg's `from`, then every leg's `to`.
+    Empty if the plan has no `formation-cruise` legs.
+    """
+    legs = [
+        step.args[1:3]
+        for step in sorted(steps, key=lambda s: s.index)
+        if step.action == "formation-cruise" and len(step.args) >= 3
+    ]
+    if not legs:
+        return []
+    corridor = [legs[0][0]]
+    corridor.extend(to for _from, to in legs)
+    return corridor

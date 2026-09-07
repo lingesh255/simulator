@@ -1,9 +1,9 @@
 {
-  "name": "d3",
-  "sysid": 3,
+  "name": "D3",
+  "sysid": 69,
   "mass_kg": 1.5,
   "max_velocity_mps": 15.0,
-  "battery_capacity_mah": 100000.0,
+  "battery_capacity_mah": 5200.0,
   "cruise_altitude_m": 50.0,
   "sensors": [
     "gps",

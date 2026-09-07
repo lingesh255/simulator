@@ -60,12 +60,16 @@ Item {
             border.width: 2
         }
 
-        // Flight-path vector overlays, one polyline per drone (§3.2.2)
+        // Flight-path vector overlays, one polyline per drone (§3.2.2). A
+        // plan can assign a specific drone's line an explicit color (e.g.
+        // the V-formation's saffron/white/green apex+wings, set via
+        // MapViewer.set_path_colors); anything without one falls back to
+        // the default blue.
         MapItemView {
             model: pathModel
             delegate: MapPolyline {
                 line.width: 2
-                line.color: theme.accent
+                line.color: model.color || "#3498db"
                 path: model.points
             }
         }

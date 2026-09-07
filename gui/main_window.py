@@ -1,35 +1,45 @@
 """Module 1 - GUI Application main window (SRS §3).
 
-Ties together the Drone Management Panel, Map Viewer, Live Telemetry
-Dashboard, Fault Injection Controls and Mission Planner, wiring user
-interaction through to the Renode Emulation Backend's UDP contract via
-`services.api_client.OrchestrationClient`.
+Ties together the Drone Management Panel, Map Viewer, Flight Log, Fault
+Injection Controls and Mission Planner - laid out as one vertically
+scrollable page - wiring user interaction through to the Renode Emulation
+Backend's UDP contract via `services.api_client.OrchestrationClient`.
 """
 from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QComboBox,
-    QDockWidget,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
 from contracts.gui_orchestration import FlockCommand, LatLon
 from gui.drone_management import DroneManagementPanel
 from gui.fault_injection import FaultInjectionPanel
+from gui.flight_log_panel import FlightLogPanel
 from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
 from gui.telemetry_dashboard import TelemetryDashboard
 from gui.theme import theme_manager
 from services.api_client import OrchestrationClient
+from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import PlanRunResult, PlanService, plan_kind
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
@@ -95,47 +105,30 @@ class MainWindow(QMainWindow):
         self.thread_sim = ThreadSwarmBackend(self)
         self.flight_sim = self.local_sim
 
+        # A third, opt-in path for a PDDL-planned point-to-point mission: fly
+        # the solved route as one real MAVLink mission against an external
+        # SITL/vehicle instead of thread_sim's in-process pipeline - see the
+        # Mission Planner panel's "Fly via real MAVLink" toggle and
+        # `_run_planned_mission`. Not part of the flight_sim/thread_sim
+        # swap above since it isn't a telemetry source the rest of the GUI
+        # polls; it just reports progress/finished/failed while it runs.
+        self.mavlink_flight = MavlinkFlightService(self)
+        # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
+        # when the panel's "Use built-in mock vehicle" box is checked - a
+        # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
+        self._mock_sitl_proc: subprocess.Popen | None = None
+        # Cleared on Stop so telemetry batches already queued from a worker
+        # thread when Stop was pressed can't slip through and repopulate the
+        # map after everything has been torn down. Re-armed by each run start.
+        self._accepting_telemetry = True
+
         self.drone_management = DroneManagementPanel(self.store)
         self.map_viewer = MapViewer()
-        self.telemetry_dashboard = TelemetryDashboard()
+        self.flight_log = FlightLogPanel()
         self.fault_injection = FaultInjectionPanel()
         self.mission_planner = MissionPlannerPanel()
 
-        self.setCentralWidget(self.map_viewer)
-
-        self.left_dock = QDockWidget("Drone Management", self)
-        self.left_dock.setWidget(self.drone_management)
-        self.left_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
-
-        self.right_dock = QDockWidget("Fault Injection", self)
-        self.right_dock.setWidget(self.fault_injection)
-        self.right_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
-
-        self.planner_dock = QDockWidget("Mission Planner", self)
-        self.planner_dock.setWidget(self.mission_planner)
-        self.planner_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.planner_dock)
-        # Mission Planner sits to the left of Fault Injection, not stacked under it.
-        self.splitDockWidget(self.planner_dock, self.right_dock, Qt.Horizontal)
-
-        # Working Area spans the full window width beneath the drone, map and
-        # fault panels, so the map keeps the whole central area.
-        self.setCorner(Qt.BottomLeftCorner, Qt.BottomDockWidgetArea)
-        self.setCorner(Qt.BottomRightCorner, Qt.BottomDockWidgetArea)
-
-        self.region_dock = QDockWidget("Working Area (Bounding Box)", self)
-        self.region_dock.setWidget(self.map_viewer.region_panel())
-        self.region_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.region_dock)
-
-        self.bottom_dock = QDockWidget("Live Telemetry", self)
-        self.bottom_dock.setWidget(self.telemetry_dashboard)
-        self.bottom_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.bottom_dock)
-        # Stack them: Working Area strip on top, telemetry below it.
-        self.splitDockWidget(self.region_dock, self.bottom_dock, Qt.Vertical)
+        self.setCentralWidget(self._build_page())
 
         self._build_connection_toolbar()
         self._build_flight_source_toolbar()
@@ -145,17 +138,75 @@ class MainWindow(QMainWindow):
         self._apply_theme_colors()
         theme_manager.theme_changed.connect(lambda _name: self._apply_theme_colors())
 
-        # Give the map the majority of the window by default; docks can
-        # still be dragged wider/taller by the user at any time.
-        QTimer.singleShot(0, self._tune_initial_dock_sizes)
+    # ---- Layout ----
 
-    def _tune_initial_dock_sizes(self) -> None:
-        self.resizeDocks([self.left_dock, self.right_dock], [300, 300], Qt.Horizontal)
-        self.resizeDocks(
-            [self.region_dock, self.bottom_dock],
-            [self.region_dock.sizeHint().height(), max(220, int(self.height() * 0.28))],
-            Qt.Vertical,
+    # Side panels cap their width and never stretch; the map (top) and the
+    # Flight Log (bottom) absorb all the horizontal slack, so the page
+    # always spans exactly the viewport width - no left/right scrollbar,
+    # only a vertical one when the window is too short for the fixed row
+    # heights below.
+    SIDE_PANEL_MAX_WIDTH = 340
+    PLANNER_PANEL_MAX_WIDTH = 440
+    MAP_MIN_WIDTH = 260
+    MAP_MIN_HEIGHT = 460
+    LOWER_MIN_HEIGHT = 380
+
+    def _build_page(self) -> QScrollArea:
+        """One page, vertical scroll only: Drone Management, the map and
+        Fault Injection across the top; the Flight Log beside the Mission
+        Planner below. Everything is width-elastic - the row grows and
+        shrinks with the window - while the map and lower blocks keep
+        minimum heights so a short window scrolls instead of squashing the
+        log and the planner's PDDL output out of view."""
+        top_row = QHBoxLayout()
+        top_row.addWidget(
+            self._titled("Drone Management", self.drone_management, self.SIDE_PANEL_MAX_WIDTH)
         )
+        top_row.addWidget(self.map_viewer, stretch=1)
+        top_row.addWidget(
+            self._titled("Fault Injection", self.fault_injection, self.SIDE_PANEL_MAX_WIDTH)
+        )
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(self.flight_log, stretch=1)
+        bottom_row.addWidget(
+            self._titled("Mission Planner", self.mission_planner, self.PLANNER_PANEL_MAX_WIDTH)
+        )
+
+        self.map_viewer.setMinimumSize(self.MAP_MIN_WIDTH, self.MAP_MIN_HEIGHT)
+        self.flight_log.setMinimumWidth(self.MAP_MIN_WIDTH)
+        self.flight_log.setMinimumHeight(self.LOWER_MIN_HEIGHT)
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(6, 6, 6, 6)
+        page_layout.setSpacing(8)
+        page_layout.addLayout(top_row)
+        page_layout.addLayout(bottom_row)
+
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        # Vertical scrolling only - the layout is sized to fit the width.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        return scroll
+
+    @staticmethod
+    def _titled(title: str, widget: QWidget, max_width: int | None = None) -> QGroupBox:
+        """Wrap a panel in a titled group box - the caption the dock title
+        bars used to carry. `max_width` caps how wide it can get (it still
+        shrinks with the window); it never stretches to eat slack, so the
+        map / Flight Log beside it take the extra space."""
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(widget)
+        if max_width is not None:
+            box.setMaximumWidth(max_width)
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        return box
 
     # ---- Setup ----
 
@@ -289,9 +340,15 @@ class MainWindow(QMainWindow):
             lambda msg: self.statusBar().showMessage(f"Drone node: {msg}", 15000)
         )
 
+        self.mavlink_flight.batch_ready.connect(self._on_telemetry)
+        self.mavlink_flight.progress.connect(self._on_mavlink_flight_progress)
+        self.mavlink_flight.finished.connect(self._on_mavlink_flight_finished)
+        self.mavlink_flight.failed.connect(self._on_mavlink_flight_failed)
+
     # ---- Connection ----
 
     def _on_connect_clicked(self) -> None:
+        self._accepting_telemetry = True
         sysids = self.drone_management.checked_sysids()
         if not sysids:
             sysids = [1, 2]  # Default if nothing selected
@@ -350,6 +407,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_emulate(self, drones: list) -> None:
+        self._accepting_telemetry = True
+        self.flight_log.log_event(
+            f"Emulate started - {len(drones)} drone(s): "
+            f"{', '.join(f'SYSID {d.sysid}' for d in drones)}"
+        )
         for drone in drones:
             self.client.register_drone(drone)
         self.client.connect_telemetry([d.sysid for d in drones])
@@ -569,7 +631,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(summary)
 
     def _on_stop(self) -> None:
+        self._accepting_telemetry = False
         self.flight_sim.stop()
+        self.mavlink_flight.abort()
+        self._stop_mock_vehicle()
         self.flight_label.setText("No flight")
         # Markers are cleared below, so the points they stood for go too.
         self._landing_candidates.clear()
@@ -585,9 +650,11 @@ class MainWindow(QMainWindow):
         self.client.stop_swarm()
         self.client.disconnect_telemetry()
         self.map_viewer.clear_markers()
+        self.map_viewer.clear_drones()
         self.map_viewer.clear_paths()
         self.map_viewer.clear_restricted_area()
         self.fault_injection.update_active_sysids([])
+        self.flight_log.log_event("Run stopped - swarm torn down, inputs unlocked.")
         self.statusBar().showMessage("Swarm stopped. Configuration inputs unlocked.")
 
     # ---- Map wiring ----
@@ -742,25 +809,52 @@ class MainWindow(QMainWindow):
                 return
         elif self._plan_destination is None:
             return
-        if not self.drone_management.checked_drones():
+        checked = self.drone_management.checked_drones()
+        if not checked:
             QMessageBox.information(
                 self, "No active drones",
                 "Check drones in the Drone Management panel before planning a mission.",
             )
             return
+        if self._plan_kind == "area_coverage" and len(checked) < 2:
+            QMessageBox.information(
+                self, "Area search needs at least 2 drones",
+                "An area search splits the marked area into one lane per drone and "
+                "keeps the drones separated, so it needs at least 2 checked drones. "
+                "For a single drone, use the 'travell' plan instead.",
+            )
+            return
         self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         self.statusBar().showMessage(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         if self._plan_kind == "area_coverage":
+            # One lane (and one PDDL drone) per checked drone, so the marked
+            # area is split across however many drones the swarm has.
             self.plan_service.run_area_async(
-                self._pending_plan_name, self._plan_source, self._plan_forest_corners
+                self._pending_plan_name,
+                self._plan_source,
+                self._plan_forest_corners,
+                drone_count=len(self.drone_management.checked_drones()),
             )
         else:
+            # One PDDL drone per checked drone, so the solved plan sends the
+            # whole swarm to the same destination together.
             self.plan_service.run_async(
-                self._pending_plan_name, self._plan_source, self._plan_destination, self._plan_no_fly_zone
+                self._pending_plan_name,
+                self._plan_source,
+                self._plan_destination,
+                self._plan_no_fly_zone,
+                drone_count=len(self.drone_management.checked_drones()),
             )
 
     def _on_plan_ready(self, result: PlanRunResult) -> None:
+        self._accepting_telemetry = True
         self.mission_planner.set_plan_steps(result.plan_name, result.steps)
+
+        # Mirror ENHSP's solved action sequence into the log alongside the
+        # travel lines, so the whole run reads top to bottom in one place.
+        self.flight_log.log_event(f"Plan '{result.plan_name}' ready - {len(result.steps)} step(s):")
+        for step in sorted(result.steps, key=lambda s: s.index):
+            self.flight_log.log_line(f"    {step}")
 
         drones = self.drone_management.checked_drones()
         if not drones:
@@ -769,7 +863,12 @@ class MainWindow(QMainWindow):
             return
 
         if result.per_drone_waypoints is not None:
-            self._start_area_coverage_mission(result, drones)
+            noun = "slot" if self._plan_kind == "formation" else "lane"
+            self._start_area_coverage_mission(result, drones, route_noun=noun)
+            return
+
+        if self.mission_planner.use_external_mavlink():
+            self._start_external_mavlink_mission(result, drones)
             return
 
         flights = plan_route_flights(drones, result.waypoints)
@@ -816,13 +915,139 @@ class MainWindow(QMainWindow):
         self._pending_plan_name = None
         self._plan_source = None
 
-    def _start_area_coverage_mission(self, result: PlanRunResult, drones: list) -> None:
+    def _start_external_mavlink_mission(self, result: PlanRunResult, drones: list) -> None:
+        """Fly the solved route as one real MAVLink mission against an
+        external SITL/vehicle (see MissionPlannerPanel's "Fly via real
+        MAVLink" toggle), instead of thread_sim's in-process drone-thread
+        pipeline. A point-to-point plan has exactly one shared route
+        regardless of how many drones are checked, so this always flies one
+        external connection - it isn't "one per checked drone".
+
+        Skips the internal battery-feasibility check `_on_plan_ready`
+        otherwise runs (`plan_route_flights`): that model is this app's own
+        `DroneConfig` battery curve, which has nothing to do with whatever
+        vehicle is actually listening on the far end of `connection`.
+        """
+        connection = self.mission_planner.mavlink_connection_string()
+        if not connection:
+            message = "Enter a MAVLink connection string first, e.g. udp:127.0.0.1:14550."
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return
+
+        route_text = " -> ".join(result.location_names)
+        altitude_m = drones[0].cruise_altitude_m
+        sysid = drones[0].sysid
+        source = result.waypoints[0]  # the exact point this route was solved from
+
+        if self.mission_planner.use_mock_vehicle():
+            if not self._start_mock_vehicle(connection, source):
+                return  # status/console already explain why
+
+        self.drone_management.set_running(True)
+        # Drop any marker/trail left by a previous run so this mission's first
+        # fix appears straight at its own source instead of the icon gliding
+        # across the map from wherever the last one ended.
+        self.map_viewer.clear_drones()
+        self.map_viewer.clear_paths()
+        self.mission_planner.set_status(
+            f"Plan '{result.plan_name}' ({route_text}): connecting to {connection} ..."
+        )
+        self.statusBar().showMessage(
+            f"Flying plan '{result.plan_name}' via real MAVLink at {connection}."
+        )
+        print(f"[MAVLink] Plan '{result.plan_name}' ({route_text}): connecting to {connection} ...")
+        self.mavlink_flight.run_async(result.waypoints, connection, altitude_m, sysid)
+        self._pending_plan_name = None
+        self._plan_source = None
+
+    @staticmethod
+    def _parse_udp_connection(connection: str) -> tuple[str, int] | None:
+        """`"udp:host:port"` -> `(host, port)`, or None for anything else
+        (tcp:/serial device/other transport) - the mock vehicle is only ever
+        launched over UDP, matching what `engine.mavlink_mission` expects."""
+        match = re.match(r"^udp:([^:]+):(\d+)$", connection.strip())
+        return (match.group(1), int(match.group(2))) if match else None
+
+    def _start_mock_vehicle(self, connection: str, source: LatLon) -> bool:
+        """Launch `scripts/mock_sitl.py`, seeded with the plan's actual
+        source point, so no one has to hand-run it or type --home themselves.
+        Its own stdout/stderr are left un-redirected, so its prints land in
+        this same console alongside ours."""
+        parsed = self._parse_udp_connection(connection)
+        if parsed is None:
+            message = (
+                f"Mock vehicle needs a udp:host:port connection string, got '{connection}'."
+            )
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return False
+        _host, port = parsed
+
+        self._stop_mock_vehicle()
+        script = Path(__file__).resolve().parent.parent / "scripts" / "mock_sitl.py"
+        args = [
+            sys.executable, str(script),
+            "--port", str(port),
+            "--home", f"{source.lat},{source.lon}",
+        ]
+        print(f"[MAVLink] Launching mock vehicle: {' '.join(args)}")
+        try:
+            self._mock_sitl_proc = subprocess.Popen(args, cwd=str(script.parent.parent))
+        except OSError as exc:
+            message = f"Could not launch mock vehicle: {exc}"
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return False
+        return True
+
+    def _stop_mock_vehicle(self) -> None:
+        proc, self._mock_sitl_proc = self._mock_sitl_proc, None
+        if proc is not None and proc.poll() is None:
+            print("[MAVLink] Stopping mock vehicle.")
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def _on_mavlink_flight_progress(self, message: str) -> None:
+        print(f"[MAVLink] {message}")
+        if not self._accepting_telemetry:
+            return  # the run was stopped; don't clobber the "stopped" status
+        self.mission_planner.set_status(message)
+        self.statusBar().showMessage(message, 5000)
+
+    def _on_mavlink_flight_finished(self) -> None:
+        self._stop_mock_vehicle()
+        if not self._accepting_telemetry:
+            # Worker unwound because of a Stop - `_on_stop` already reported it.
+            return
+        self.drone_management.set_running(False)
+        self.mission_planner.set_status("External MAVLink mission complete.")
+        self.statusBar().showMessage("External MAVLink mission complete.", 8000)
+        print("[MAVLink] Mission complete.")
+
+    def _on_mavlink_flight_failed(self, message: str) -> None:
+        self.drone_management.set_running(False)
+        self.mission_planner.set_status(f"External MAVLink mission failed: {message}")
+        self.statusBar().showMessage(f"External MAVLink mission failed: {message}", 15000)
+        print(f"[MAVLink] FAILED: {message}")
+        self._stop_mock_vehicle()
+
+    def _start_area_coverage_mission(
+        self, result: PlanRunResult, drones: list, *, route_noun: str = "lane"
+    ) -> None:
         """Assign each checked drone to one of the plan's per-drone routes,
         in order (the first checked drone flies `drone1`'s lane, the second
         `drone2`'s, ...), and fly them concurrently - every lane needs its
         own drone, so extra checked drones beyond the number of lanes simply
         sit this mission out, and fewer checked drones than lanes means it
-        can't run at all yet."""
+        can't run at all yet.
+
+        `route_noun` is just what these per-drone routes are called in the
+        status line - "lane" for an area-coverage sweep, "slot" for a
+        V-formation's apex/left/right tracks; the mechanism is identical."""
         routes = list(result.per_drone_waypoints.values())
         if len(drones) < len(routes):
             self.mission_planner.set_status(
@@ -845,10 +1070,10 @@ class MainWindow(QMainWindow):
 
         if len(cleared_assignments) < len(routes):
             self.mission_planner.set_status(
-                f"Plan '{result.plan_name}': not every drone has the battery for its lane."
+                f"Plan '{result.plan_name}': not every drone has the battery for its {route_noun}."
             )
             self.statusBar().showMessage(
-                f"Plan '{result.plan_name}' ready, but not every drone has the battery for its lane."
+                f"Plan '{result.plan_name}' ready, but not every drone has the battery for its {route_noun}."
             )
             return
 
@@ -867,11 +1092,11 @@ class MainWindow(QMainWindow):
 
         self.mission_planner.set_status(
             f"Flying plan '{result.plan_name}' - {len(cleared_assignments)} drone(s), "
-            f"{len(routes)} lane(s), {total_distance_km:.1f} km combined."
+            f"{len(routes)} {route_noun}(s), {total_distance_km:.1f} km combined."
         )
         self.statusBar().showMessage(
             f"Flying {len(cleared_assignments)} drone(s) on plan '{result.plan_name}' "
-            f"({len(routes)} lane(s))."
+            f"({len(routes)} {route_noun}(s))."
         )
         self._pending_plan_name = None
         self._plan_source = None
@@ -886,14 +1111,18 @@ class MainWindow(QMainWindow):
     # ---- Telemetry wiring ----
 
     def _on_telemetry(self, batch) -> None:
+        if not self._accepting_telemetry:
+            # A run was stopped; this batch was already in the queue from a
+            # worker thread. Dropping it keeps the torn-down map clear.
+            return
         self.map_viewer.update_drones(batch.drones)
-        self.telemetry_dashboard.update_drones(self._glide_matched_telemetry(batch.drones))
+        self.flight_log.log_batch(self._glide_matched_telemetry(batch.drones))
         self.fault_injection.update_active_sysids([d.sysid for d in batch.drones])
 
     def _glide_matched_telemetry(self, drones: list) -> list:
-        """The Global State Matrix / Drone Inspector read the same
-        glide-smoothed lat/lon/altitude the map marker is drawn at, not the
-        raw telemetry batch directly - otherwise the numbers race ahead of
+        """The Flight Log reads the same glide-smoothed lat/lon/altitude the
+        map marker is drawn at, not the raw telemetry batch directly -
+        otherwise the numbers race ahead of
         (or lag behind) whatever the map's Speed slider makes the marker
         visually do, which reads as the two being unrelated. Purely
         cosmetic: `batch.drones` itself - the flight-path trail, battery/

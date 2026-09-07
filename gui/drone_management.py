@@ -1,19 +1,17 @@
 """Drone Management Panel (SRS §3.2.1).
 
-Create/edit/save/delete drone configuration profiles; select a saved swarm
-preset; "Emulate" locks configuration inputs and hands the active swarm
-selection off to Module 2; "Stop/Reset" tears the run down and unlocks
-configuration inputs again.
+Create/edit/save/delete drone configuration profiles; check drones to
+include in the active swarm; "Emulate" locks configuration inputs and
+hands the active swarm selection off to Module 2; "Stop/Reset" tears the
+run down and unlocks configuration inputs again.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -23,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from contracts.gui_orchestration import DroneConfig, SwarmPreset
+from contracts.gui_orchestration import DroneConfig
 from gui.drone_config_dialog import DroneConfigDialog
 from services.storage import ProfileStore
 
@@ -66,21 +64,6 @@ class DroneManagementPanel(QWidget):
         profile_layout.addWidget(self.profile_list)
         profile_layout.addLayout(crud_row)
 
-        self.preset_combo = QComboBox()
-        self.load_preset_btn = QPushButton("Load")
-        self.save_preset_btn = QPushButton("Save Current As...")
-        self.load_preset_btn.clicked.connect(self._on_load_preset)
-        self.save_preset_btn.clicked.connect(self._on_save_preset)
-
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(self.preset_combo, stretch=1)
-        preset_row.addWidget(self.load_preset_btn)
-
-        preset_group = QGroupBox("Swarm Selector (Preset)")
-        preset_layout = QVBoxLayout(preset_group)
-        preset_layout.addLayout(preset_row)
-        preset_layout.addWidget(self.save_preset_btn)
-
         self.emulate_btn = QPushButton("Emulate")
         self.emulate_btn.setStyleSheet("font-weight: bold;")
         self.stop_btn = QPushButton("Stop / Reset")
@@ -94,11 +77,9 @@ class DroneManagementPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addWidget(profile_group, stretch=1)
-        layout.addWidget(preset_group)
         layout.addLayout(run_row)
 
         self.reload_profiles()
-        self.reload_presets()
 
     # ---- Data loading ----
 
@@ -123,11 +104,6 @@ class DroneManagementPanel(QWidget):
         item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         item.setData(SYSID_ROLE, drone.name)
         self.profile_list.addItem(item)
-
-    def reload_presets(self) -> None:
-        self.preset_combo.clear()
-        for preset in self.store.list_presets():
-            self.preset_combo.addItem(preset.name, preset)
 
     # ---- CRUD ----
 
@@ -183,7 +159,7 @@ class DroneManagementPanel(QWidget):
         self.reload_profiles()
         self.status_message.emit(f"Deleted profile '{name}'.")
 
-    # ---- Presets ----
+    # ---- Swarm selection ----
 
     def _checked_drones(self) -> list[DroneConfig]:
         drones = []
@@ -192,28 +168,6 @@ class DroneManagementPanel(QWidget):
             if item.checkState() == Qt.Checked:
                 drones.append(self._profiles[item.data(SYSID_ROLE)])
         return drones
-
-    def _on_load_preset(self) -> None:
-        preset: SwarmPreset = self.preset_combo.currentData()
-        if preset is None:
-            return
-        preset_names = {d.name for d in preset.drones}
-        for i in range(self.profile_list.count()):
-            item = self.profile_list.item(i)
-            item.setCheckState(Qt.Checked if item.data(SYSID_ROLE) in preset_names else Qt.Unchecked)
-        self.status_message.emit(f"Loaded swarm preset '{preset.name}'.")
-
-    def _on_save_preset(self) -> None:
-        drones = self._checked_drones()
-        if not drones:
-            QMessageBox.information(self, "No drones selected", "Check at least one drone profile first.")
-            return
-        name, ok = QInputDialog.getText(self, "Save Swarm Preset", "Preset name (e.g. 'Alpha Swarm - 5 Units'):")
-        if not ok or not name.strip():
-            return
-        self.store.save_preset(SwarmPreset(name=name.strip(), drones=drones))
-        self.reload_presets()
-        self.status_message.emit(f"Saved swarm preset '{name.strip()}'.")
 
     # ---- Emulate / Stop ----
 
@@ -238,9 +192,6 @@ class DroneManagementPanel(QWidget):
             self.new_btn,
             self.edit_btn,
             self.delete_btn,
-            self.preset_combo,
-            self.load_preset_btn,
-            self.save_preset_btn,
         ):
             widget.setEnabled(not running)
 
