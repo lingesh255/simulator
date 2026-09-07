@@ -205,8 +205,8 @@
         (= (distance source destination) 3399.03)
         (= (distance destination source) 3399.03)
 
-        (= (energy-required source destination) 35.88)
-        (= (energy-required destination source) 35.88)
+        (= (energy-required source destination) 10.00)
+        (= (energy-required destination source) 10.00)
     )
 
 

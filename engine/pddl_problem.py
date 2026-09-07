@@ -601,6 +601,81 @@ def retarget_problem(
     return result
 
 
+# ---- Swarm expansion: one reference drone -> N identical drones ------------
+
+_DRONE1_TOKEN = re.compile(r"\bdrone1\b")
+
+
+def _clone_drone1_lines(text: str, span: tuple[int, int], extra_names: list[str]) -> str:
+    """Duplicate every line inside ``text[span[0]:span[1]]`` that mentions the
+    token ``drone1`` - once per name in ``extra_names``, with ``drone1``
+    swapped for that name - inserting the copies just before the span's end
+    (i.e. before the section's / the goal ``(and ...)``'s closing paren)."""
+    _open, close_pos = span
+    clones: list[str] = []
+    for line in text[_open:close_pos].splitlines():
+        if _DRONE1_TOKEN.search(line):
+            clones.extend(_DRONE1_TOKEN.sub(name, line) for name in extra_names)
+    if not clones:
+        return text
+    head = text[:close_pos].rstrip()
+    addition = "".join("\n" + line for line in clones)
+    return f"{head}{addition}\n    {text[close_pos:]}"
+
+
+def expand_point_to_point_drones(problem_text: str, count: int) -> str:
+    """Grow a point-to-point ``swarm-drone-mission`` problem from its single
+    reference drone (``drone1``) to ``count`` identical drones
+    (``drone1`` .. ``drone{count}``), so a swarm of that many checked drones
+    all fly the planned route to the same destination.
+
+    Every ``(:init ...)`` fact and numeric fluent that mentions ``drone1`` is
+    duplicated for each extra drone (same start location, battery, health,
+    GPS/comms state), the ``(:objects ...)`` declaration is widened, and the
+    goal's ``(and ...)`` gains a ``(mission-completed droneN)`` /
+    ``(at droneN destination)`` pair per drone.
+
+    ``count <= 1`` returns the text unchanged - the ordinary single-drone
+    problem. Purely additive text substitution over ``drone1``; the waypoint
+    graph, routes and coordinates are untouched (retarget those first).
+    """
+    if count <= 1:
+        return problem_text
+
+    all_names = [f"drone{i}" for i in range(1, count + 1)]
+    extra_names = all_names[1:]
+
+    # 1. widen the (:objects ...) declaration: "drone1 - drone" -> "drone1 drone2 ... - drone"
+    obj_open, obj_close = _section_span(problem_text, "objects")
+    widened = re.sub(
+        r"\bdrone1\b(\s*-\s*drone\b)",
+        lambda m: " ".join(all_names) + m.group(1),
+        problem_text[obj_open:obj_close],
+        count=1,
+    )
+    if widened == problem_text[obj_open:obj_close]:
+        raise ValueError("point-to-point template has no 'drone1 - drone' object to expand")
+    problem_text = problem_text[:obj_open] + widened + problem_text[obj_close:]
+
+    # 2. clone every (:init ...) fact that references drone1
+    problem_text = _clone_drone1_lines(
+        problem_text, _section_span(problem_text, "init"), extra_names
+    )
+
+    # 3. clone the goal's per-drone conjuncts, inside its (and ...) so the
+    #    result stays a single well-formed goal expression
+    goal_open, goal_close = _section_span(problem_text, "goal")
+    and_match = re.search(r"\(and\b", problem_text[goal_open:goal_close])
+    if and_match:
+        and_open = goal_open + and_match.start()
+        span = (and_open, _find_matching_paren(problem_text, and_open))
+    else:
+        span = (goal_open, goal_close)
+    problem_text = _clone_drone1_lines(problem_text, span, extra_names)
+
+    return problem_text
+
+
 # ---- V-formation retargeting -------------------------------------------------
 
 # The 8 compass objects declared in plans/vformation/problem.pddl's

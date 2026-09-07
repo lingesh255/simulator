@@ -1,9 +1,9 @@
 """Module 1 - GUI Application main window (SRS §3).
 
-Ties together the Drone Management Panel, Map Viewer, Live Telemetry
-Dashboard, Fault Injection Controls and Mission Planner, wiring user
-interaction through to the Renode Emulation Backend's UDP contract via
-`services.api_client.OrchestrationClient`.
+Ties together the Drone Management Panel, Map Viewer, Flight Log, Fault
+Injection Controls and Mission Planner - laid out as one vertically
+scrollable page - wiring user interaction through to the Renode Emulation
+Backend's UDP contract via `services.api_client.OrchestrationClient`.
 """
 from __future__ import annotations
 
@@ -12,26 +12,29 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
-    QDockWidget,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
 from contracts.gui_orchestration import FlockCommand, LatLon
 from gui.drone_management import DroneManagementPanel
 from gui.fault_injection import FaultInjectionPanel
+from gui.flight_log_panel import FlightLogPanel
 from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
-from gui.telemetry_dashboard import TelemetryDashboard
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import PlanRunResult, PlanService, plan_kind
@@ -50,11 +53,6 @@ from services.storage import ProfileStore
 
 NFZ_CORNER_COUNT = 4  # a restricted area is a quadrilateral, click order = winding order
 FOREST_CORNER_COUNT = 4  # a search area is a quadrilateral too - "dynamic dimensions"
-
-# V-formation flight-path line colors, in FORMATION_DRONES order (apex, left
-# wing, right wing) - Indian-flag saffron/white/green, apex (the leader,
-# geometrically the middle line of the V) gets the middle stripe, white.
-FORMATION_FLAG_COLORS = ("#FFFFFF", "#FF9933", "#138808")
 
 
 class MainWindow(QMainWindow):
@@ -123,61 +121,86 @@ class MainWindow(QMainWindow):
 
         self.drone_management = DroneManagementPanel(self.store)
         self.map_viewer = MapViewer()
-        self.telemetry_dashboard = TelemetryDashboard()
+        self.flight_log = FlightLogPanel()
         self.fault_injection = FaultInjectionPanel()
         self.mission_planner = MissionPlannerPanel()
 
-        self.setCentralWidget(self.map_viewer)
-
-        self.left_dock = QDockWidget("Drone Management", self)
-        self.left_dock.setWidget(self.drone_management)
-        self.left_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
-
-        self.right_dock = QDockWidget("Fault Injection", self)
-        self.right_dock.setWidget(self.fault_injection)
-        self.right_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
-
-        self.planner_dock = QDockWidget("Mission Planner", self)
-        self.planner_dock.setWidget(self.mission_planner)
-        self.planner_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.planner_dock)
-        self.splitDockWidget(self.right_dock, self.planner_dock, Qt.Vertical)
-
-        # Working Area spans the full window width beneath the drone, map and
-        # fault panels, so the map keeps the whole central area.
-        self.setCorner(Qt.BottomLeftCorner, Qt.BottomDockWidgetArea)
-        self.setCorner(Qt.BottomRightCorner, Qt.BottomDockWidgetArea)
-
-        self.region_dock = QDockWidget("Working Area (Bounding Box)", self)
-        self.region_dock.setWidget(self.map_viewer.region_panel())
-        self.region_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.region_dock)
-
-        self.bottom_dock = QDockWidget("Live Telemetry", self)
-        self.bottom_dock.setWidget(self.telemetry_dashboard)
-        self.bottom_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.bottom_dock)
-        # Stack them: Working Area strip on top, telemetry below it.
-        self.splitDockWidget(self.region_dock, self.bottom_dock, Qt.Vertical)
+        self.setCentralWidget(self._build_page())
 
         self._build_connection_toolbar()
         self._build_flight_source_toolbar()
         self._build_status_bar()
         self._wire_signals()
 
-        # Give the map the majority of the window by default; docks can
-        # still be dragged wider/taller by the user at any time.
-        QTimer.singleShot(0, self._tune_initial_dock_sizes)
+    # ---- Layout ----
 
-    def _tune_initial_dock_sizes(self) -> None:
-        self.resizeDocks([self.left_dock, self.right_dock], [300, 300], Qt.Horizontal)
-        self.resizeDocks(
-            [self.region_dock, self.bottom_dock],
-            [self.region_dock.sizeHint().height(), max(220, int(self.height() * 0.28))],
-            Qt.Vertical,
+    # Side panels cap their width and never stretch; the map (top) and the
+    # Flight Log (bottom) absorb all the horizontal slack, so the page
+    # always spans exactly the viewport width - no left/right scrollbar,
+    # only a vertical one when the window is too short for the fixed row
+    # heights below.
+    SIDE_PANEL_MAX_WIDTH = 340
+    PLANNER_PANEL_MAX_WIDTH = 440
+    MAP_MIN_WIDTH = 260
+    MAP_MIN_HEIGHT = 460
+    LOWER_MIN_HEIGHT = 380
+
+    def _build_page(self) -> QScrollArea:
+        """One page, vertical scroll only: Drone Management, the map and
+        Fault Injection across the top; the Flight Log beside the Mission
+        Planner below. Everything is width-elastic - the row grows and
+        shrinks with the window - while the map and lower blocks keep
+        minimum heights so a short window scrolls instead of squashing the
+        log and the planner's PDDL output out of view."""
+        top_row = QHBoxLayout()
+        top_row.addWidget(
+            self._titled("Drone Management", self.drone_management, self.SIDE_PANEL_MAX_WIDTH)
         )
+        top_row.addWidget(self.map_viewer, stretch=1)
+        top_row.addWidget(
+            self._titled("Fault Injection", self.fault_injection, self.SIDE_PANEL_MAX_WIDTH)
+        )
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(self.flight_log, stretch=1)
+        bottom_row.addWidget(
+            self._titled("Mission Planner", self.mission_planner, self.PLANNER_PANEL_MAX_WIDTH)
+        )
+
+        self.map_viewer.setMinimumSize(self.MAP_MIN_WIDTH, self.MAP_MIN_HEIGHT)
+        self.flight_log.setMinimumWidth(self.MAP_MIN_WIDTH)
+        self.flight_log.setMinimumHeight(self.LOWER_MIN_HEIGHT)
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(6, 6, 6, 6)
+        page_layout.setSpacing(8)
+        page_layout.addLayout(top_row)
+        page_layout.addLayout(bottom_row)
+
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        # Vertical scrolling only - the layout is sized to fit the width.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        return scroll
+
+    @staticmethod
+    def _titled(title: str, widget: QWidget, max_width: int | None = None) -> QGroupBox:
+        """Wrap a panel in a titled group box - the caption the dock title
+        bars used to carry. `max_width` caps how wide it can get (it still
+        shrinks with the window); it never stretches to eat slack, so the
+        map / Flight Log beside it take the extra space."""
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(widget)
+        if max_width is not None:
+            box.setMaximumWidth(max_width)
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        return box
 
     # ---- Setup ----
 
@@ -350,6 +373,10 @@ class MainWindow(QMainWindow):
 
     def _on_emulate(self, drones: list) -> None:
         self._accepting_telemetry = True
+        self.flight_log.log_event(
+            f"Emulate started - {len(drones)} drone(s): "
+            f"{', '.join(f'SYSID {d.sysid}' for d in drones)}"
+        )
         for drone in drones:
             self.client.register_drone(drone)
         self.client.connect_telemetry([d.sysid for d in drones])
@@ -592,6 +619,7 @@ class MainWindow(QMainWindow):
         self.map_viewer.clear_paths()
         self.map_viewer.clear_restricted_area()
         self.fault_injection.update_active_sysids([])
+        self.flight_log.log_event("Run stopped - swarm torn down, inputs unlocked.")
         self.statusBar().showMessage("Swarm stopped. Configuration inputs unlocked.")
 
     # ---- Map wiring ----
@@ -746,26 +774,52 @@ class MainWindow(QMainWindow):
                 return
         elif self._plan_destination is None:
             return
-        if not self.drone_management.checked_drones():
+        checked = self.drone_management.checked_drones()
+        if not checked:
             QMessageBox.information(
                 self, "No active drones",
                 "Check drones in the Drone Management panel before planning a mission.",
             )
             return
+        if self._plan_kind == "area_coverage" and len(checked) < 2:
+            QMessageBox.information(
+                self, "Area search needs at least 2 drones",
+                "An area search splits the marked area into one lane per drone and "
+                "keeps the drones separated, so it needs at least 2 checked drones. "
+                "For a single drone, use the 'travell' plan instead.",
+            )
+            return
         self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         self.statusBar().showMessage(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         if self._plan_kind == "area_coverage":
+            # One lane (and one PDDL drone) per checked drone, so the marked
+            # area is split across however many drones the swarm has.
             self.plan_service.run_area_async(
-                self._pending_plan_name, self._plan_source, self._plan_forest_corners
+                self._pending_plan_name,
+                self._plan_source,
+                self._plan_forest_corners,
+                drone_count=len(self.drone_management.checked_drones()),
             )
         else:
+            # One PDDL drone per checked drone, so the solved plan sends the
+            # whole swarm to the same destination together.
             self.plan_service.run_async(
-                self._pending_plan_name, self._plan_source, self._plan_destination, self._plan_no_fly_zone
+                self._pending_plan_name,
+                self._plan_source,
+                self._plan_destination,
+                self._plan_no_fly_zone,
+                drone_count=len(self.drone_management.checked_drones()),
             )
 
     def _on_plan_ready(self, result: PlanRunResult) -> None:
         self._accepting_telemetry = True
         self.mission_planner.set_plan_steps(result.plan_name, result.steps)
+
+        # Mirror ENHSP's solved action sequence into the log alongside the
+        # travel lines, so the whole run reads top to bottom in one place.
+        self.flight_log.log_event(f"Plan '{result.plan_name}' ready - {len(result.steps)} step(s):")
+        for step in sorted(result.steps, key=lambda s: s.index):
+            self.flight_log.log_line(f"    {step}")
 
         drones = self.drone_management.checked_drones()
         if not drones:
@@ -995,10 +1049,6 @@ class MainWindow(QMainWindow):
         self.drone_management.set_running(True)
         self.fault_injection.update_active_sysids([d.sysid for d, _ in cleared_assignments])
         self.map_viewer.clear_paths()
-        if route_noun == "slot":
-            self.map_viewer.set_path_colors(
-                {d.sysid: color for (d, _r), color in zip(assignments, FORMATION_FLAG_COLORS)}
-            )
 
         if not self.thread_sim.start_mission_paths(cleared_assignments):
             self.drone_management.set_running(False)
@@ -1031,13 +1081,13 @@ class MainWindow(QMainWindow):
             # worker thread. Dropping it keeps the torn-down map clear.
             return
         self.map_viewer.update_drones(batch.drones)
-        self.telemetry_dashboard.update_drones(self._glide_matched_telemetry(batch.drones))
+        self.flight_log.log_batch(self._glide_matched_telemetry(batch.drones))
         self.fault_injection.update_active_sysids([d.sysid for d in batch.drones])
 
     def _glide_matched_telemetry(self, drones: list) -> list:
-        """The Global State Matrix / Drone Inspector read the same
-        glide-smoothed lat/lon/altitude the map marker is drawn at, not the
-        raw telemetry batch directly - otherwise the numbers race ahead of
+        """The Flight Log reads the same glide-smoothed lat/lon/altitude the
+        map marker is drawn at, not the raw telemetry batch directly -
+        otherwise the numbers race ahead of
         (or lag behind) whatever the map's Speed slider makes the marker
         visually do, which reads as the two being unrelated. Purely
         cosmetic: `batch.drones` itself - the flight-path trail, battery/

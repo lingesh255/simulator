@@ -48,7 +48,10 @@ class MapViewer(QWidget):
         self.quick_widget = QQuickWidget()
         self.quick_widget.setResizeMode(QQuickWidget.SizeRootObjectToView)
         self.quick_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.quick_widget.setMinimumHeight(200)
+        # An explicit minimum (not just a hint): the QML Map otherwise reports
+        # a ~1300px minimum-size hint, which would force the whole scrollable
+        # page wider than the window and bring back the horizontal scrollbar.
+        self.quick_widget.setMinimumSize(200, 200)
         # Growing the widget (maximising the window, dragging the splitter) can
         # leave the newly exposed band showing the previous frame, which reads as
         # a dark seam across the map. Repaint the whole surface on every resize.

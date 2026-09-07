@@ -167,7 +167,7 @@ def main() -> None:
         pos_alt = 0.0
         leg_index = 0
         flying = True
-        print(f"  (fake) airborne at ({pos_lat:.6f}, {pos_lon:.6f}) - flying {len(mission)} item(s)")
+        print(f" airborne at ({pos_lat:.6f}, {pos_lon:.6f}) - flying {len(mission)} item(s)")
 
     while True:
         now = time.monotonic()
@@ -194,12 +194,12 @@ def main() -> None:
                 remaining = _haversine_m(pos_lat, pos_lon, target_lat, target_lon)
                 if remaining <= ARRIVAL_RADIUS_M:
                     send(mav.mission_item_reached_encode(leg_index))
-                    print(f"  (fake) reached waypoint {leg_index}/{len(mission) - 1}  [{target_name}]")
+                    print(f"  reached waypoint {leg_index}/{len(mission) - 1}  [{target_name}]")
                     leg_index += 1
                     if leg_index >= len(mission):
                         flying = False
                         armed = False
-                        print("  (fake) mission complete - disarmed")
+                        print("  mission complete - disarmed")
                 else:
                     step = CRUISE_SPEED_MPS * dt
                     fraction = min(1.0, step / remaining)

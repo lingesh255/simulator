@@ -40,7 +40,7 @@
         (connected ?from - location ?to - location)
 
         ;; Safe route
-        (safe-route ?from - location ?to - location)
+        (safe-route ?from - location ?to - location) 
 
         ;; Restricted / no-fly route
         (restricted-route ?from - location ?to - location)
