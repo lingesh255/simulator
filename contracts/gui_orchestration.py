@@ -123,3 +123,14 @@ class FlockCommand(BaseModel):
     sysids: list[int]
     destination: LatLon
     altitude_m: Optional[float] = None
+
+
+# --------------------------------------------------------------------------
+# App-wide GUI preferences (persisted locally, not part of the UDP contract)
+# --------------------------------------------------------------------------
+
+class AppSettings(BaseModel):
+    """Small local preferences file - currently just the light/dark theme
+    choice (gui/theme.py)."""
+
+    theme: str = "dark"

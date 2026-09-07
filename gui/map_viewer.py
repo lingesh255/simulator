@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from contracts.gui_orchestration import DroneTelemetry
 from gui.map_models import DroneMarkerModel, PathModel, PointMarkerModel, RestrictedAreaModel
+from gui.theme import ThemeBridge
 
 QML_PATH = Path(__file__).resolve().parent.parent / "qml" / "Map.qml"
 TILE_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "tiles"
@@ -44,6 +45,7 @@ class MapViewer(QWidget):
         self.marker_model = PointMarkerModel(self)
         self.path_model = PathModel(self)
         self.restricted_area_model = RestrictedAreaModel(self)
+        self.theme_bridge = ThemeBridge(self)
 
         self.quick_widget = QQuickWidget()
         self.quick_widget.setResizeMode(QQuickWidget.SizeRootObjectToView)
@@ -61,6 +63,7 @@ class MapViewer(QWidget):
         context.setContextProperty("markerModel", self.marker_model)
         context.setContextProperty("pathModel", self.path_model)
         context.setContextProperty("restrictedAreaModel", self.restricted_area_model)
+        context.setContextProperty("theme", self.theme_bridge)
         context.setContextProperty("tileCacheDir", str(TILE_CACHE_DIR))
         context.setContextProperty("offlineMode", False)
         self.quick_widget.setSource(QUrl.fromLocalFile(str(QML_PATH)))

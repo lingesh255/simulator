@@ -12,7 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -35,6 +36,8 @@ from gui.fault_injection import FaultInjectionPanel
 from gui.flight_log_panel import FlightLogPanel
 from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
+from gui.telemetry_dashboard import TelemetryDashboard
+from gui.theme import theme_manager
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import PlanRunResult, PlanService, plan_kind
@@ -129,8 +132,11 @@ class MainWindow(QMainWindow):
 
         self._build_connection_toolbar()
         self._build_flight_source_toolbar()
+        self._build_appearance_toolbar()
         self._build_status_bar()
         self._wire_signals()
+        self._apply_theme_colors()
+        theme_manager.theme_changed.connect(lambda _name: self._apply_theme_colors())
 
     # ---- Layout ----
 
@@ -216,11 +222,9 @@ class MainWindow(QMainWindow):
         self.sysid_combo.addItems(["1", "2", "3"])
 
         self.inject_isr_btn = QPushButton("Inject Hardware ISR")
-        self.inject_isr_btn.setStyleSheet("background-color: #e74c3c; color: white;")
         self.inject_isr_btn.clicked.connect(self._on_inject_isr_clicked)
 
         self.restore_isr_btn = QPushButton("Restore State")
-        self.restore_isr_btn.setStyleSheet("background-color: #2ecc71; color: white;")
         self.restore_isr_btn.clicked.connect(self._on_restore_isr_clicked)
 
         container = QWidget()
@@ -256,6 +260,33 @@ class MainWindow(QMainWindow):
         row.addWidget(self.backend_combo)
         toolbar.addWidget(container)
 
+    def _build_appearance_toolbar(self) -> None:
+        """App-wide preference, not a per-panel setting - kept in its own
+        globally accessible toolbar rather than buried in a settings dialog."""
+        toolbar = QToolBar("Appearance", self)
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self.dark_mode_action = QAction("Dark Mode", self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setChecked(theme_manager.current_theme() == "dark")
+        self.dark_mode_action.toggled.connect(
+            lambda checked: theme_manager.set_theme("dark" if checked else "light")
+        )
+        toolbar.addAction(self.dark_mode_action)
+
+    def _apply_theme_colors(self) -> None:
+        """Refreshes everything in this window styled via a per-widget
+        `setStyleSheet()` call - those don't pick up the app-level QSS
+        cascade (see main.py), so they have to be redone by hand on every
+        theme change."""
+        palette = theme_manager.palette()
+        self.inject_isr_btn.setStyleSheet(f"background-color: {palette.critical}; color: white;")
+        self.restore_isr_btn.setStyleSheet(f"background-color: {palette.nominal}; color: white;")
+        self._update_connection_label()
+        if self.dark_mode_action.isChecked() != (theme_manager.current_theme() == "dark"):
+            self.dark_mode_action.setChecked(theme_manager.current_theme() == "dark")
+
     def _on_backend_changed(self) -> None:
         """Swap the active flight source. Both expose the same surface, so
         nothing else in the window changes."""
@@ -274,7 +305,6 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.flight_label)
 
         self.connection_label = QLabel("Disconnected")
-        self.connection_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
         self.statusBar().addPermanentWidget(self.connection_label)
         self.statusBar().showMessage("Ready.")
 
@@ -341,11 +371,16 @@ class MainWindow(QMainWindow):
         if connected:
             # Real telemetry supersedes the local preview.
             self.flight_sim.stop()
+        self._update_connection_label()
+
+    def _update_connection_label(self) -> None:
+        palette = theme_manager.palette()
+        if self._connected:
             self.connection_label.setText("Connected")
-            self.connection_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
+            self.connection_label.setStyleSheet(f"color: {palette.nominal}; font-weight: bold;")
         else:
             self.connection_label.setText("Disconnected")
-            self.connection_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+            self.connection_label.setStyleSheet(f"color: {palette.critical}; font-weight: bold;")
 
     def _on_request_failed(self, tag: str, error: str) -> None:
         self.statusBar().showMessage(f"[{tag}] request failed: {error}", 5000)
