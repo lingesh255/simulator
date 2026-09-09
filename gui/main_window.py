@@ -41,6 +41,7 @@ from gui.theme import theme_manager
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import PlanRunResult, PlanService, plan_kind
+from services.renode_launch_service import RenodeLaunchService
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -113,6 +114,12 @@ class MainWindow(QMainWindow):
         # swap above since it isn't a telemetry source the rest of the GUI
         # polls; it just reports progress/finished/failed while it runs.
         self.mavlink_flight = MavlinkFlightService(self)
+        # Opt-in fourth flight source: launches the standalone Renode +
+        # Pixhawk6C/6X package and, once its MAVLink port is live, hands the
+        # resulting connection string to the Mission Planner panel's
+        # existing "Fly via real MAVLink" field - mavlink_flight above then
+        # consumes it completely unchanged.
+        self.renode_launch = RenodeLaunchService(self)
         # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
         # when the panel's "Use built-in mock vehicle" box is checked - a
         # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
@@ -344,6 +351,13 @@ class MainWindow(QMainWindow):
         self.mavlink_flight.progress.connect(self._on_mavlink_flight_progress)
         self.mavlink_flight.finished.connect(self._on_mavlink_flight_finished)
         self.mavlink_flight.failed.connect(self._on_mavlink_flight_failed)
+
+        self.mission_planner.renode_launch_requested.connect(self.renode_launch.start_async)
+        self.renode_launch.progress.connect(self.mission_planner.set_status)
+        self.renode_launch.failed.connect(
+            lambda msg: self.mission_planner.set_status(f"Renode launch failed: {msg}")
+        )
+        self.renode_launch.ready.connect(self._on_renode_ready)
 
     # ---- Connection ----
 
@@ -1028,6 +1042,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("External MAVLink mission complete.", 8000)
         print("[MAVLink] Mission complete.")
 
+    def _on_renode_ready(self, connection_string: str) -> None:
+        self.mission_planner.mavlink_connection_edit.setText(connection_string)
+        self.mission_planner.set_status(f"Renode ready - connection set to {connection_string}.")
+
     def _on_mavlink_flight_failed(self, message: str) -> None:
         self.drone_management.set_running(False)
         self.mission_planner.set_status(f"External MAVLink mission failed: {message}")
@@ -1107,6 +1125,12 @@ class MainWindow(QMainWindow):
         self.mission_planner.set_status("Planning failed - see the log below.")
         QMessageBox.warning(self, "Mission planning failed", message)
         self.statusBar().showMessage("Mission planning failed - see the dialog.", 8000)
+
+    # ---- Shutdown ----
+
+    def closeEvent(self, event) -> None:
+        self.renode_launch.stop()
+        super().closeEvent(event)
 
     # ---- Telemetry wiring ----
 

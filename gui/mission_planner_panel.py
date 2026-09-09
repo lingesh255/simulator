@@ -4,6 +4,8 @@ comes back.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -26,6 +28,7 @@ class MissionPlannerPanel(QWidget):
     """Select a plan, request it, and read back its parsed step list."""
 
     plan_requested = Signal(str)  # plan name
+    renode_launch_requested = Signal(str)  # standalone folder path
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -82,6 +85,21 @@ class MissionPlannerPanel(QWidget):
             "port would run two vehicles at once)."
         )
 
+        self.renode_dir_edit = QLineEdit(
+            str(Path(__file__).resolve().parent.parent / "pixhawk6c_renode_standalone")
+        )
+        self.renode_dir_edit.setEnabled(False)
+        self.renode_dir_edit.setToolTip(
+            "Path to the standalone Renode + Pixhawk6C/6X package (contains "
+            "renode-bin/renode and launch.resc)."
+        )
+        self.renode_launch_btn = QPushButton("Launch Renode")
+        self.renode_launch_btn.setEnabled(False)
+        self.renode_launch_btn.clicked.connect(self._on_renode_launch_clicked)
+        renode_row = QHBoxLayout()
+        renode_row.addWidget(self.renode_dir_edit, stretch=1)
+        renode_row.addWidget(self.renode_launch_btn)
+
         plan_group = QGroupBox("Named Plan (plans/<name>/)")
         plan_layout = QVBoxLayout(plan_group)
         plan_layout.addLayout(pick_row)
@@ -89,6 +107,7 @@ class MissionPlannerPanel(QWidget):
         plan_layout.addWidget(self.external_mavlink_check)
         plan_layout.addLayout(connection_row)
         plan_layout.addWidget(self.mock_vehicle_check)
+        plan_layout.addLayout(renode_row)
         plan_layout.addWidget(self.plan_btn)
 
         self.status_label = QLabel("Idle.")
@@ -129,8 +148,13 @@ class MissionPlannerPanel(QWidget):
     def _on_external_mavlink_toggled(self, checked: bool) -> None:
         self.mavlink_connection_edit.setEnabled(checked)
         self.mock_vehicle_check.setEnabled(checked)
+        self.renode_dir_edit.setEnabled(checked)
+        self.renode_launch_btn.setEnabled(checked)
         if not checked:
             self.mock_vehicle_check.setChecked(False)
+
+    def _on_renode_launch_clicked(self) -> None:
+        self.renode_launch_requested.emit(self.renode_dir_edit.text().strip())
 
     def use_external_mavlink(self) -> bool:
         return self.external_mavlink_check.isChecked()
