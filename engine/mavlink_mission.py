@@ -28,7 +28,8 @@ def build_mission_items(
     waypoints: list[tuple[float, float]],
     altitude_m: float,
 ):
-    """[(lat, lon), ...] -> MISSION_ITEM_INT messages: TAKEOFF, WAYPOINT x N, LAND.
+    """[(lat, lon), ...] -> MISSION_ITEM_INT messages: HOME placeholder,
+    TAKEOFF, WAYPOINT x N, LAND.
 
     Mirrors the shape ArduPilot expects for a normal auto mission: item 0 is
     a takeoff (climbs from wherever the vehicle currently is - lat/lon are
@@ -37,6 +38,25 @@ def build_mission_items(
     points are exactly the route the PDDL planner worked out - including any
     detour it planned around a restricted area - so flying them in order
     clears that area by construction; nothing here re-checks it.
+
+    Item 0 in the list this returns is NOT the takeoff, though - it's an
+    unused placeholder. Confirmed by direct empirical test (uploading a
+    mission, then reading it straight back over MAVLink): mission sequence
+    0 is unconditionally reserved for home by ArduPilot's own mission
+    storage and is never actually readable/usable as a real command -
+    AP_Mission::read_cmd_from_storage() (AP_Mission.cpp:832) hard-codes
+    "if (index == 0) { ... return home ...}" with no way to opt out, and
+    MissionItemProtocol_Waypoints::get_item() (MissionItemProtocol_
+    Waypoints.cpp:69) passes the wire seq straight through with no offset
+    ("seq != 0 && // always allow HOME to be read"). A real run proved this
+    the hard way: with takeoff at seq 0, a readback showed seq 0 coming
+    back as a synthetic NAV_WAYPOINT at (0,0) - not our uploaded
+    NAV_TAKEOFF at all - and ModeAuto::init() then failed every time with
+    "Missing Takeoff Cmd", because the mission's first REAL command was our
+    seq-1 item, which was a plain waypoint/land, not a takeoff. Real GCS
+    implementations (QGroundControl, Mission Planner) always upload an
+    explicit, effectively-unused item at seq 0 for exactly this reason -
+    this mirrors that, not a Renode-specific workaround.
     """
     if len(waypoints) < 2:
         raise ValueError("need at least a source and a destination")
@@ -44,16 +64,26 @@ def build_mission_items(
     items = [
         mav.mission_item_int_encode(
             target_system, target_component,
-            0,  # seq
+            0,  # seq - reserved for home, see docstring; content is unused
+            mav2.MAV_FRAME_GLOBAL,
+            mav2.MAV_CMD_NAV_WAYPOINT,
+            0, 1,  # current, autocontinue
+            0, 0, 0, 0,
+            0, 0, 0,
+        ),
+        mav.mission_item_int_encode(
+            target_system, target_component,
+            1,  # seq
             mav2.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
             mav2.MAV_CMD_NAV_TAKEOFF,
             0, 1,  # current, autocontinue
             0, 0, 0, 0,
             0, 0, altitude_m,
-        )
+        ),
     ]
-    last_seq = len(waypoints) - 1
-    for seq, (lat, lon) in enumerate(waypoints[1:], start=1):
+    last_seq = len(waypoints)
+    for offset, (lat, lon) in enumerate(waypoints[1:], start=1):
+        seq = offset + 1
         is_final = seq == last_seq
         items.append(
             mav.mission_item_int_encode(
@@ -158,7 +188,52 @@ def upload_and_fly(
     )
     ack = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=item_timeout_s)
     report(f"Arm ack: {ack}")
-    set_mode("AUTO")
+
+    # DO_SET_MODE's own COMMAND_ACK does not guarantee the mode actually
+    # took - AUTO mode's init() can reject the switch internally (e.g. a
+    # mission-state race right after upload) with no NACK, leaving the
+    # vehicle silently still in GUIDED. Confirm via HEARTBEAT.custom_mode
+    # actually reflecting AUTO - a small, bounded number of retries with a
+    # real delay between them, not a single blind attempt or a fixed sleep
+    # standing in for confirmation.
+    auto_mode_id = modes.get("AUTO")
+    if auto_mode_id is None:
+        raise RuntimeError("vehicle has no 'AUTO' mode in its mode_mapping()")
+    auto_confirmed = False
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        set_mode("AUTO")
+        attempt_deadline = time.monotonic() + 1.0
+        while time.monotonic() < attempt_deadline:
+            message = master.recv_match(
+                type=["HEARTBEAT", "STATUSTEXT"], blocking=True,
+                timeout=max(0.0, attempt_deadline - time.monotonic()),
+            )
+            if message is None:
+                continue
+            # Route every message seen during this retry loop back through
+            # the same callbacks the main poll loop below uses, so a caller
+            # tracking armed state / STATUSTEXT (e.g. for real evidence of
+            # what happened here) has no blind spot just because this
+            # specific wait happened inside a retry rather than the main
+            # loop.
+            if on_message is not None:
+                on_message(message)
+            kind = message.get_type()
+            if kind == "STATUSTEXT":
+                report(f"[FC] {message.text}")
+            elif kind == "HEARTBEAT" and message.custom_mode == auto_mode_id:
+                auto_confirmed = True
+                break
+        if auto_confirmed:
+            break
+        report(f"AUTO mode not confirmed yet (attempt {attempt}/{max_attempts}), retrying.")
+        time.sleep(0.5)
+    if not auto_confirmed:
+        raise RuntimeError(
+            f"AUTO mode never confirmed via HEARTBEAT.custom_mode after "
+            f"{max_attempts} attempts"
+        )
 
     report("Flying mission.")
     last_seq = len(items) - 1

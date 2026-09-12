@@ -29,6 +29,11 @@ class _Worker(QObject):
             self.progress.emit(f"Starting Renode from {standalone_dir} ...")
             self._launcher = RenodeLauncher(standalone_dir, port=port)
             connection_string = self._launcher.start()
+            self.progress.emit(f"Renode ready on {connection_string} - provisioning first-boot params ...")
+            # A separate, short-lived connection, closed before this
+            # returns - see RenodeLauncher.start()'s docstring for why this
+            # isn't folded into that same connection.
+            self._launcher.provision_first_boot_params()
             self.progress.emit(f"Renode ready on {connection_string}")
             self.ready.emit(connection_string)
         except (RenodeLauncherError, TimeoutError, OSError) as exc:
