@@ -55,8 +55,12 @@ class RenodeLauncherError(Exception):
 
 
 class RenodeLauncher:
-    # Confirmed, not placeholder, values - see the module docstring and
-    # renode_firmware_guide.md Part 4.4 for how each was pinned down:
+    # Confirmed, not placeholder, values - each derivation is explained
+    # inline below (renode_firmware_guide.md's Part 4.4 is about verifying
+    # the standalone extraction's independence, not these specific values -
+    # a stale cross-reference here was found and corrected during a
+    # verification pass; there was never a missing derivation, just a wrong
+    # section number pointing at it):
     #   - lat/lon/alt/heading: AP_PhysicsTruth.Stationary's own defaults
     #     (peripherals/common/AP_Physics.cs), matching launch.py's own
     #     defaults and the "Home: ..." line renode-physics prints back.
@@ -152,7 +156,6 @@ class RenodeLauncher:
     # equivalent of the accel case's simple_accel_cal(), documented for
     # exactly this "re-validate an existing/known-good reading" situation.
     COMPASS_OFFSET = 0.01
-    COMPASS_CAL_TIMEOUT_S = 15.0
     PREFLIGHT_CALIBRATION_MAGNETOMETER_FORCE_SAVE = 76
 
     # "3D Accel calibration needed": AP_InertialSensor::accel_calibrated_ok_all()
@@ -172,8 +175,10 @@ class RenodeLauncher:
     # single-orientation calibration that only needs the vehicle level and
     # stationary (true here: physics starts it in a level hover) and, on
     # success, sets offset/scale/id AND `_accel_id_ok[k] = true` directly, live,
-    # with no reboot (AP_InertialSensor.cpp ~line 2682-2692).
-    ACCEL_CAL_TIMEOUT_S = 30.0
+    # with no reboot (AP_InertialSensor.cpp ~line 2682-2692). Its own
+    # timeout is not a separate constant here - it shares
+    # provision_first_boot_params()'s overall deadline budget, like every
+    # other step in that method.
 
     # ARMING_SKIPCHK: "RC not found" (ArduCopter/AP_Arming_Copter.cpp:114,
     # rc_throttle_failsafe_checks() - true when
@@ -257,9 +262,27 @@ class RenodeLauncher:
     # @RebootRequired - takes effect live.
     AUTO_OPTIONS = 2
 
-    def __init__(self, standalone_dir: str, port: int = 5762):
+    def __init__(
+        self,
+        standalone_dir: str,
+        port: int = 5762,
+        latitude_deg: float | None = None,
+        longitude_deg: float | None = None,
+    ):
         self.standalone_dir = Path(standalone_dir).expanduser().resolve()
         self.port = port
+        # Per-instance override of where the vehicle spawns, e.g. to match
+        # a real mission's own clicked Start point - defaults to the
+        # confirmed-working PHYSICS_LATITUDE_DEG/LONGITUDE_DEG constants
+        # (Canberra) when not given, so every existing caller that never
+        # passes these keeps its exact previous behavior. Altitude/heading
+        # are deliberately NOT parametrized here - they stay at their own
+        # confirmed AP_PhysicsTruth.Stationary-derived defaults regardless
+        # of location; a real elevation for an arbitrary clicked point
+        # isn't available, and mismatched elevation is a different,
+        # unrelated risk this change wasn't asked to take on.
+        self.latitude_deg = self.PHYSICS_LATITUDE_DEG if latitude_deg is None else latitude_deg
+        self.longitude_deg = self.PHYSICS_LONGITUDE_DEG if longitude_deg is None else longitude_deg
 
         self.renode_bin = self.standalone_dir / "renode-bin" / "renode"
         self.launch_script = self.standalone_dir / "launch.resc"
@@ -306,19 +329,17 @@ class RenodeLauncher:
         dead the whole time).
 
         This does NOT provision first-boot params (FRAME_CLASS/FRAME_TYPE/
-        COMPASS_USE) - call `provision_first_boot_params()` afterward for
-        that, on its own short-lived connection, closed before the real
-        mission connection opens. Frame params used to be folded into this
-        same connection/method, but that was undone: a control test
-        (disabling only that step, changing nothing else) showed the
-        vehicle can still fail to reach healthy gyro state even without
-        it, proving the combined step was never actually the cause of that
-        failure - the gyro-health cause is still open (see
-        renode_firmware_guide.md Part 4.6) and isn't chased further here.
-        Splitting the two keeps `start()` itself to the one thing it has
-        real, positive evidence for (GPS-fix boot health), rather than
-        bundling in a step whose own connection-handling was never
-        actually implicated.
+        ARMING_SKIPCHK/etc) - call `provision_first_boot_params()` afterward
+        for that, on its own short-lived connection, closed before the real
+        mission connection opens, followed by `wait_until_armable()` before
+        handing the connection to a real mission. Frame params used to be
+        folded into this same connection/method; splitting them out was
+        originally a documented fallback rather than a fix for a diagnosed
+        cause, but the split itself is still the right shape regardless -
+        `start()` stays scoped to the one thing it has real, positive
+        evidence for (GPS-fix boot health), and the (now fully root-caused
+        and fixed - see renode_firmware_guide.md Part 4.7) IMU/compass/
+        arming work lives in its own methods.
 
         `gps_ready_timeout_s` covers Renode's own boot, the MAVLink
         handshake, and GPS settling once connected - real data from tonight
@@ -422,7 +443,7 @@ class RenodeLauncher:
 
         physics_connect = 'physics Connect %d "%s" %.6f %.6f %.1f %.1f %d' % (
             self.PHYSICS_PORT, self.PHYSICS_MODEL,
-            self.PHYSICS_LATITUDE_DEG, self.PHYSICS_LONGITUDE_DEG,
+            self.latitude_deg, self.longitude_deg,
             self.PHYSICS_ALTITUDE_M, self.PHYSICS_HEADING_DEG,
             self.PHYSICS_RATE_HZ,
         )
@@ -441,9 +462,17 @@ class RenodeLauncher:
         connection refusal as failure."""
         last_error: Exception | None = None
         while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
+            proc = self._proc
+            # `stop()` can genuinely run concurrently with this loop - it's
+            # called from the GUI thread (e.g. closing the app while a
+            # launch is still in flight on its worker thread) and clears
+            # self._proc to None. Reproduced directly: closing the app
+            # mid-launch raced this exact check and crashed with a raw
+            # AttributeError instead of a clean, catchable error.
+            if proc is None or proc.poll() is not None:
                 raise RenodeLauncherError(
-                    f"renode exited early (code {self._proc.returncode})"
+                    "renode was stopped" if proc is None
+                    else f"renode exited early (code {proc.returncode})"
                 )
             try:
                 return mavutil.mavlink_connection(self.connection_string)
@@ -483,9 +512,13 @@ class RenodeLauncher:
                 mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1,
             )
             while time.monotonic() < deadline:
-                if self._proc.poll() is not None:
+                proc = self._proc
+                # See _connect_mavlink's own comment - stop() can genuinely
+                # run concurrently with this loop from another thread.
+                if proc is None or proc.poll() is not None:
                     raise RenodeLauncherError(
-                        f"renode exited early (code {self._proc.returncode})"
+                        "renode was stopped" if proc is None
+                        else f"renode exited early (code {proc.returncode})"
                     )
                 message = connection.recv_match(
                     type="GPS_RAW_INT", blocking=True, timeout=2
@@ -500,11 +533,14 @@ class RenodeLauncher:
             connection.close()
 
     def provision_first_boot_params(self, timeout_s: float = 45.0) -> None:
-        """FRAME_CLASS/FRAME_TYPE/COMPASS_USE (each confirmed via a real
-        PARAM_VALUE ack) plus a real simple accelerometer calibration
-        (confirmed via a real COMMAND_ACK) - not fire-and-assume for any of
-        them. No reboot follows this - see the class-level comments above
-        these constants for why.
+        """FRAME_CLASS/FRAME_TYPE/ARMING_SKIPCHK/FS_THR_ENABLE/AUTO_OPTIONS
+        (each confirmed via a real PARAM_VALUE ack), plus a real simple
+        accelerometer calibration, a real compass force-save, and a real
+        safety-switch-off command (each confirmed via a real COMMAND_ACK) -
+        not fire-and-assume for any of them. No reboot follows this - see
+        the class-level comments above these constants for why, and
+        renode_firmware_guide.md Part 4.7 for the full story of why each
+        one is here.
 
         Call this AFTER `start()` returns, not as part of it: it opens its
         own short-lived connection and fully closes it again before
@@ -702,10 +738,11 @@ class RenodeLauncher:
     def _run_simple_accel_cal(connection, timeout_s: float) -> None:
         """Send MAV_CMD_PREFLIGHT_CALIBRATION (param5=SIMPLE) and confirm a
         real MAV_RESULT_ACCEPTED ack - see the class-level comment above
-        ACCEL_CAL_TIMEOUT_S for why this, not a direct param_set, is the
-        real fix for "3D Accel calibration needed". Vehicle-side this takes
-        up to ~10s (AP_InertialSensor.cpp's simple_accel_cal() convergence
-        loop), so the timeout here is generous, not tight.
+        the "3D Accel calibration needed" heading for why this, not a
+        direct param_set, is the real fix. Vehicle-side this takes up to
+        ~10s (AP_InertialSensor.cpp's simple_accel_cal() convergence
+        loop), so `timeout_s` (the caller's remaining deadline budget,
+        not a fixed constant here) should be generous, not tight.
         """
         connection.mav.command_long_send(
             connection.target_system, connection.target_component,

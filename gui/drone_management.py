@@ -8,6 +8,7 @@ run down and unlocks configuration inputs again.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QGroupBox,
@@ -27,11 +28,28 @@ from services.storage import ProfileStore
 
 SYSID_ROLE = Qt.UserRole + 1
 
+# DroneConfigDialog's own default for a brand-new profile - the app's
+# conservative reference point, and the actual profile shape ("D1")
+# tonight's flights were validated against.
+DEFAULT_MAX_VELOCITY_MPS = 15.0
+# Twice that default: a conservative buffer well beneath the 100 m/s
+# value this session's own testing confirmed destabilizes the EKF and
+# causes repeated failsafe cycling - flags a profile as visibly
+# "hot"/aggressive, not a claim that everything below this line is
+# proven safe.
+HOT_VELOCITY_THRESHOLD_MPS = 2 * DEFAULT_MAX_VELOCITY_MPS
+
 
 class DroneManagementPanel(QWidget):
     emulate_requested = Signal(list)   # list[DroneConfig]
     stop_requested = Signal()
     status_message = Signal(str)
+    # Fires whenever the set of CHECKED (not just selected/current) drones
+    # could have changed - a checkbox toggle, or a reload that carries
+    # checked state across. Added for "Launch Renode requires a drone
+    # selected first" (a real QOL gap: nothing previously told the rest of
+    # the GUI when the checked set changed at all).
+    selection_changed = Signal()
 
     def __init__(self, store: ProfileStore, parent=None):
         super().__init__(parent)
@@ -45,6 +63,7 @@ class DroneManagementPanel(QWidget):
         # current, which would leave Edit/Delete with no target. Treat a click
         # anywhere on the row as selecting it.
         self.profile_list.itemClicked.connect(self.profile_list.setCurrentItem)
+        self.profile_list.itemChanged.connect(lambda _item: self.selection_changed.emit())
 
         self.new_btn = QPushButton("New")
         self.edit_btn = QPushButton("Edit")
@@ -97,9 +116,41 @@ class DroneManagementPanel(QWidget):
         for drone in self.store.list_profiles():
             self._profiles[drone.name] = drone
             self._add_list_item(drone, checked=drone.name in checked)
+        # Belt and suspenders: setCheckState() on a freshly-inserted item
+        # emits itemChanged in practice, but this doesn't rely on that -
+        # the checked set can genuinely differ after a reload (a checked
+        # profile could have been deleted).
+        self.selection_changed.emit()
 
     def _add_list_item(self, drone: DroneConfig, checked: bool = False) -> None:
-        item = QListWidgetItem(f"{drone.name}  (SYSID {drone.sysid})")
+        # Show mass/velocity directly in the row - the two numbers that
+        # actually distinguish a conservative profile (e.g. the app's own
+        # 15 m/s / 1.5 kg default) from a deliberately over-tuned one (e.g.
+        # 100 m/s / 0.6 kg), rather than making the user open Edit to find
+        # out (Part D.2).
+        label = (
+            f"{drone.name}  (SYSID {drone.sysid}) - "
+            f"{drone.max_velocity_mps:g} m/s, {drone.mass_kg:g} kg"
+        )
+        is_hot = drone.max_velocity_mps >= HOT_VELOCITY_THRESHOLD_MPS
+        if is_hot:
+            label += "  ⚠ aggressive profile"
+        item = QListWidgetItem(label)
+        if is_hot:
+            # Bold + color AND the text marker above - a color-only cue
+            # would be lost on a colorblind user or a monochrome terminal
+            # screenshot.
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            item.setForeground(QColor("darkorange"))
+            item.setToolTip(
+                f"Max velocity {drone.max_velocity_mps:g} m/s is well above this "
+                f"app's default new-profile velocity ({DEFAULT_MAX_VELOCITY_MPS:g} "
+                "m/s). This session's own testing confirmed similarly aggressive "
+                "speeds destabilize the EKF and cause repeated failsafe cycling - "
+                "expect lower reliability from this profile than a conservative one."
+            )
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         item.setData(SYSID_ROLE, drone.name)
