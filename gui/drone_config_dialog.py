@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
     QLineEdit,
     QSpinBox,
     QVBoxLayout,

@@ -47,3 +47,11 @@ tools/enhsp/
 
 # Per-run generated PDDL problems and ENHSP output
 plans/*/runs/
+
+# ------------------------------------------
+# 5. Standalone Renode + Pixhawk6C/6X package
+# ------------------------------------------
+# Local, required-to-run dependency (~700MB of Renode binaries and firmware
+# images), not build output - never commit it. If it's ever missing, see
+# renode_firmware_guide.md for how to regenerate it.
+pixhawk6c_renode_standalone/
