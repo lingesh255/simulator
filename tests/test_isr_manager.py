@@ -1,8 +1,7 @@
 """Tests for the ISR Manager (snapshotting and restoring Renode CPU state)."""
 from __future__ import annotations
 
-import pytest
-from backend.isr_manager import IsrManager, EmulationSnapshot
+from backend.isr_manager import IsrManager
 
 class MockCPU:
     def __init__(self):
