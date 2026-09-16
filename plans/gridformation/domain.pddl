@@ -1,6 +1,5 @@
-(define (domain v-formation-drone-mission)
+(define (domain grid-formation-drone-mission)
 
-    ;; V-formation drone mission with staggered launch and coordinated flight
     (:requirements
         :strips
         :typing
@@ -12,54 +11,48 @@
         :conditional-effects
     )
 
-
     ;; Types used in the mission
     (:types
         drone
         location
         controller
-        direction
     )
 
-
-    ;; Facts that describe drone positions, states, and formation
+    ;; Mission state and formation facts
     (:predicates
 
         ;; Drone position
         (at ?d - drone ?l - location)
 
-        ;; Current location of the whole formation
+        ;; Current formation position
         (formation-at ?l - location)
 
         ;; Mission locations and routes
         (source ?l - location)
         (destination ?l - location)
+
         (connected ?from - location ?to - location)
         (safe-route ?from - location ?to - location)
 
-        ;; Flight states
+        ;; Flight state
         (landed ?d - drone)
         (airborne ?d - drone)
         (flying ?d - drone)
         (at-cruise-altitude ?d - drone)
 
-        ;; Formation slots
-        (slot-apex ?d - drone)
-        (slot-direction ?d - drone ?dir - direction)
+        ;; Formation assignment
         (has-slot ?d - drone)
-        (wing-drone ?d - drone)
+        (grid-member ?d - drone)
         (formation-leader ?d - drone)
         (in-formation ?d - drone)
-
-        ;; Formation status
-        (v-formation-established)
-        (wings-closed)
+        (grid-formation-established)
+        (grid-closed)
 
         ;; Neighbor communication
-        (wing-neighbor ?d1 - drone ?d2 - drone)
+        (grid-neighbor ?d1 - drone ?d2 - drone)
         (neighbor-comm-ok ?d - drone)
 
-        ;; Pre-flight check
+        ;; Pre-flight status
         (preflight-done ?d - drone)
 
         ;; System health
@@ -86,20 +79,16 @@
         (max-battery ?d - drone)
         (minimum-return-battery ?d - drone)
 
-        ;; Drone altitude
+        ;; Altitude and energy
         (altitude ?d - drone)
         (hover-altitude ?d - drone)
         (target-altitude ?d - drone)
-
-        ;; Energy consumption
         (climb-energy ?d - drone)
         (cruise-leg-energy ?d - drone)
         (energy-required ?from - location ?to - location)
-
-        ;; Distance between locations
         (distance ?from - location ?to - location)
 
-        ;; Drone health
+        ;; Health
         (health ?d - drone)
         (minimum-health ?d - drone)
 
@@ -107,15 +96,14 @@
         (latitude ?l - location)
         (longitude ?l - location)
 
-        ;; V-formation slot offsets
+        ;; Grid slot offsets
         (slot-along-offset ?d - drone)
         (slot-cross-offset ?d - drone)
 
         ;; Staggered launch timing
         (seconds-since-leader-airborne)
-        (wing-launch-delay)
+        (grid-launch-delay)
     )
-
 
     ;; Check the drone before takeoff
     (:action pre-flight-check
@@ -141,8 +129,7 @@
             (preflight-done ?d)
     )
 
-
-    ;; Take off from the source location
+    ;; Take off from the source
     (:action takeoff
 
         :parameters
@@ -159,10 +146,9 @@
                 (communication-ok ?d)
                 (drone-healthy ?d)
 
-                ;; Wings can take off after the leader waits
                 (or
                     (formation-leader ?d)
-                    (>= (seconds-since-leader-airborne) (wing-launch-delay))
+                    (>= (seconds-since-leader-airborne) (grid-launch-delay))
                 )
             )
 
@@ -175,8 +161,7 @@
             )
     )
 
-
-    ;; Leader waits while the wing drones prepare for takeoff
+    ;; Climb to the cruise altitude
     (:action climb-to-cruise-altitude
 
         :parameters
@@ -201,8 +186,7 @@
             )
     )
 
-
-    ;; Increase the launch delay by one second
+    ;; Leader waits for the other drones
     (:action hold-position
 
         :parameters
@@ -212,7 +196,7 @@
             (and
                 (formation-leader ?lead)
                 (airborne ?lead)
-                (< (seconds-since-leader-airborne) (wing-launch-delay))
+                (< (seconds-since-leader-airborne) (grid-launch-delay))
                 (gps-ok ?lead)
                 (communication-ok ?lead)
                 (drone-healthy ?lead)
@@ -222,9 +206,8 @@
             (increase (seconds-since-leader-airborne) 1)
     )
 
-
-    ;; Move the drone into its assigned formation slot
-    (:action take-formation-slot
+    ;; Move into the assigned grid slot
+    (:action take-grid-slot
 
         :parameters
             (?d - drone)
@@ -245,9 +228,8 @@
             (in-formation ?d)
     )
 
-
-    ;; Establish the V formation when all drones are ready
-    (:action establish-v-formation
+    ;; Establish the grid formation
+    (:action establish-grid-formation
 
         :parameters
             (?lead - drone
@@ -256,22 +238,21 @@
         :precondition
             (and
                 (formation-leader ?lead)
-                (slot-apex ?lead)
                 (in-formation ?lead)
                 (at ?lead ?l)
                 (at-cruise-altitude ?lead)
                 (>= (altitude ?lead) (target-altitude ?lead))
                 (neighbor-comm-ok ?lead)
 
-                (forall (?w - drone)
+                (forall (?m - drone)
                     (or
-                        (not (wing-drone ?w))
+                        (not (grid-member ?m))
                         (and
-                            (in-formation ?w)
-                            (at ?w ?l)
-                            (at-cruise-altitude ?w)
-                            (>= (altitude ?w) (target-altitude ?w))
-                            (neighbor-comm-ok ?w)
+                            (in-formation ?m)
+                            (at ?m ?l)
+                            (at-cruise-altitude ?m)
+                            (>= (altitude ?m) (target-altitude ?m))
+                            (neighbor-comm-ok ?m)
                         )
                     )
                 )
@@ -279,14 +260,13 @@
 
         :effect
             (and
-                (v-formation-established)
+                (grid-formation-established)
                 (formation-at ?l)
-                (wings-closed)
+                (grid-closed)
             )
     )
 
-
-    ;; Move the apex to the next location
+    ;; Move the formation to the next location
     (:action formation-cruise
 
         :parameters
@@ -296,11 +276,10 @@
 
         :precondition
             (and
-                (v-formation-established)
-                (wings-closed)
+                (grid-formation-established)
+                (grid-closed)
 
                 (formation-leader ?lead)
-                (slot-apex ?lead)
                 (in-formation ?lead)
 
                 (formation-at ?from)
@@ -328,16 +307,14 @@
                 (not (at ?lead ?from))
                 (at ?lead ?to)
 
-                ;; Wings must close up before the next leg
-                (not (wings-closed))
+                (not (grid-closed))
 
                 (decrease (battery ?lead) (energy-required ?from ?to))
             )
     )
 
-
-    ;; Move all wing drones to the apex location
-    (:action close-up-wings
+    ;; Move grid members back to the leader
+    (:action close-up-grid
 
         :parameters
             (?lead - drone
@@ -345,8 +322,8 @@
 
         :precondition
             (and
-                (v-formation-established)
-                (not (wings-closed))
+                (grid-formation-established)
+                (not (grid-closed))
 
                 (formation-leader ?lead)
                 (in-formation ?lead)
@@ -354,18 +331,18 @@
                 (formation-at ?to)
                 (at ?lead ?to)
 
-                (forall (?w - drone)
+                (forall (?m - drone)
                     (or
-                        (not (wing-drone ?w))
+                        (not (grid-member ?m))
                         (and
-                            (in-formation ?w)
-                            (at-cruise-altitude ?w)
-                            (>= (altitude ?w) (target-altitude ?w))
-                            (gps-ok ?w)
-                            (communication-ok ?w)
-                            (drone-healthy ?w)
-                            (neighbor-comm-ok ?w)
-                            (> (battery ?w) (cruise-leg-energy ?w))
+                            (in-formation ?m)
+                            (at-cruise-altitude ?m)
+                            (>= (altitude ?m) (target-altitude ?m))
+                            (gps-ok ?m)
+                            (communication-ok ?m)
+                            (drone-healthy ?m)
+                            (neighbor-comm-ok ?m)
+                            (> (battery ?m) (cruise-leg-energy ?m))
                         )
                     )
                 )
@@ -373,24 +350,39 @@
 
         :effect
             (and
-                (forall (?w - drone) (forall (?x - location)
-                    (when (and (wing-drone ?w) (at ?w ?x))
-                        (not (at ?w ?x)))))
+                (forall (?m - drone) (forall (?x - location)
+                    (when
+                        (and
+                            (grid-member ?m)
+                            (at ?m ?x)
+                        )
+                        (not (at ?m ?x))
+                    )
+                ))
 
-                (forall (?w - drone)
-                    (when (wing-drone ?w) (at ?w ?to)))
+                (forall (?m - drone)
+                    (when
+                        (grid-member ?m)
+                        (at ?m ?to)
+                    )
+                )
 
-                (forall (?w - drone)
-                    (when (wing-drone ?w)
-                        (decrease (battery ?w) (cruise-leg-energy ?w))))
+                (forall (?m - drone)
+                    (when
+                        (grid-member ?m)
+                        (decrease
+                            (battery ?m)
+                            (cruise-leg-energy ?m)
+                        )
+                    )
+                )
 
-                (wings-closed)
+                (grid-closed)
             )
     )
 
-
-    ;; Complete the mission when the whole formation reaches the destination
-    (:action complete-formation-mission
+    ;; Complete the mission at the destination
+    (:action complete-grid-mission
 
         :parameters
             (?lead - drone
@@ -399,20 +391,19 @@
         :precondition
             (and
                 (destination ?dest)
-                (v-formation-established)
+                (grid-formation-established)
                 (formation-at ?dest)
 
                 (formation-leader ?lead)
-                (slot-apex ?lead)
                 (in-formation ?lead)
                 (at ?lead ?dest)
 
-                (forall (?w - drone)
+                (forall (?m - drone)
                     (or
-                        (not (wing-drone ?w))
+                        (not (grid-member ?m))
                         (and
-                            (in-formation ?w)
-                            (at ?w ?dest)
+                            (in-formation ?m)
+                            (at ?m ?dest)
                         )
                     )
                 )
@@ -422,14 +413,16 @@
             (and
                 (mission-completed ?lead)
 
-                (forall (?w - drone)
-                    (when (wing-drone ?w)
-                        (mission-completed ?w)))
+                (forall (?m - drone)
+                    (when
+                        (grid-member ?m)
+                        (mission-completed ?m)
+                    )
+                )
 
                 (formation-mission-complete)
             )
     )
-
 
     ;; Detect GPS failure
     (:action detect-gps-loss
@@ -451,7 +444,6 @@
             )
     )
 
-
     ;; Detect communication failure
     (:action detect-communication-loss
 
@@ -471,7 +463,6 @@
                 (not (in-formation ?d))
             )
     )
-
 
     ;; Detect neighbor communication failure
     (:action detect-neighbor-link-loss
@@ -493,8 +484,7 @@
             )
     )
 
-
-    ;; Detect when drone health becomes too low
+    ;; Detect health failure
     (:action detect-health-failure
 
         :parameters
@@ -514,8 +504,7 @@
             )
     )
 
-
-    ;; Inform the ground controller about a failure
+    ;; Notify the ground controller
     (:action notify-ground-controller
 
         :parameters

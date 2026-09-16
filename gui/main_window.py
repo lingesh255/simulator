@@ -37,7 +37,7 @@ from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
-from services.plan_service import PlanRunResult, PlanService, plan_kind
+from services.plan_service import MIN_GRID_DRONES, PlanRunResult, PlanService, plan_kind
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -781,12 +781,54 @@ class MainWindow(QMainWindow):
                 "Check drones in the Drone Management panel before planning a mission.",
             )
             return
+        sysid_counts: dict[int, list[str]] = {}
+        for d in checked:
+            sysid_counts.setdefault(d.sysid, []).append(d.name)
+        duplicate_sysids = {sysid: names for sysid, names in sysid_counts.items() if len(names) > 1}
+        if duplicate_sysids:
+            # The flight backend addresses every drone by SYSID (it's the UDP
+            # link identity - see services.thread_backend._spawn_drone), so
+            # two checked drones sharing one collapse onto the same node: the
+            # second's link bind fails and it's silently dropped from the
+            # swarm rather than flying its own route.
+            detail = "; ".join(
+                f"SYSID {sysid}: {', '.join(names)}" for sysid, names in duplicate_sysids.items()
+            )
+            QMessageBox.information(
+                self, "Duplicate drone SYSIDs",
+                "Checked drones must each have a unique SYSID - drones sharing one "
+                "collapse onto the same flight node instead of flying separately, "
+                "which silently shrinks the swarm.\n\n"
+                f"{detail}\n\n"
+                "Edit the affected profiles in Drone Management and give each a "
+                "distinct SYSID.",
+            )
+            return
         if self._plan_kind == "area_coverage" and len(checked) < 2:
             QMessageBox.information(
                 self, "Area search needs at least 2 drones",
                 "An area search splits the marked area into one lane per drone and "
                 "keeps the drones separated, so it needs at least 2 checked drones. "
                 "For a single drone, use the 'travell' plan instead.",
+            )
+            return
+        if self._plan_kind == "formation" and (len(checked) < 3 or len(checked) % 2 == 0):
+            QMessageBox.information(
+                self, "V-formation needs an odd number of drones",
+                "A V-formation has one drone at the apex and the rest split evenly "
+                "between both wings, so it needs an odd number of checked drones "
+                f"(3, 5, 7, ...). {len(checked)} are currently checked.",
+            )
+            return
+        if self._plan_kind == "grid_formation" and len(checked) < MIN_GRID_DRONES:
+            QMessageBox.information(
+                self, "Grid formation needs more drones",
+                "A grid formation needs at least "
+                f"{MIN_GRID_DRONES} checked drones to read as a 2-D grid rather than "
+                f"a single line. {len(checked)} are currently checked.\n\n"
+                "Any count from there works - a perfect square (4, 9, 16, ...) forms "
+                "a square grid, and any other count forms the closest rectangle that "
+                "fits it exactly (e.g. 8 -> 2x4, 12 -> 3x4).",
             )
             return
         self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
@@ -828,7 +870,10 @@ class MainWindow(QMainWindow):
             return
 
         if result.per_drone_waypoints is not None:
-            noun = "slot" if self._plan_kind == "formation" else "lane"
+            if self._plan_kind in ("formation", "grid_formation"):
+                noun = "slot"
+            else:
+                noun = "lane"
             self._start_area_coverage_mission(result, drones, route_noun=noun)
             return
 
@@ -1012,7 +1057,9 @@ class MainWindow(QMainWindow):
 
         `route_noun` is just what these per-drone routes are called in the
         status line - "lane" for an area-coverage sweep, "slot" for a
-        V-formation's apex/left/right tracks; the mechanism is identical."""
+        V-formation's apex/wing tracks or a grid formation's leader/member
+        tracks (however many drones the mission has); the mechanism is
+        identical."""
         routes = list(result.per_drone_waypoints.values())
         if len(drones) < len(routes):
             self.mission_planner.set_status(

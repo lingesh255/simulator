@@ -8,10 +8,7 @@
         :conditional-effects
     )
 
-    ;; ============================================================
-    ;; TYPES
-    ;; ============================================================
-
+    ;; Types used in the mission
     (:types
         drone
         location
@@ -19,210 +16,102 @@
         controller
     )
 
-
-    ;; ============================================================
-    ;; PREDICATES
-    ;; ============================================================
-
+    ;; Facts that describe the drone and search mission
     (:predicates
 
-        ;; --------------------------------------------------------
         ;; Drone position
-        ;; --------------------------------------------------------
-
         (at ?d - drone ?l - location)
 
-        ;; --------------------------------------------------------
-        ;; Forest areas
-        ;; --------------------------------------------------------
-
+        ;; Forest areas and their coverage
         (forest ?f - forest-area)
-
         (area-location ?a - forest-area ?l - location)
-
         (area-covered ?a - forest-area)
 
-        ;; --------------------------------------------------------
-        ;; Coverage assignment
-        ;; --------------------------------------------------------
-
+        ;; Drone-to-area assignment
         (assigned ?d - drone ?a - forest-area)
 
-        ;; --------------------------------------------------------
-        ;; Connectivity
-        ;; --------------------------------------------------------
-
+        ;; Location connectivity
         (connected ?from - location ?to - location)
 
-        ;; The one location drones launch from and must actually return to -
-        ;; without this, nothing stops return-to-base (below) from being
-        ;; used for an ordinary interior hop, since otherwise its
-        ;; precondition looks just like move-search's.
-
+        ;; Base location
         (is-base ?l - location)
 
-        ;; --------------------------------------------------------
-        ;; Safe movement
-        ;; --------------------------------------------------------
-
+        ;; Safe routes
         (safe-route ?from - location ?to - location)
 
-        ;; --------------------------------------------------------
         ;; Drone states
-        ;; --------------------------------------------------------
-
         (flying ?d - drone)
-
         (hovering ?d - drone)
-
         (searching ?d - drone)
-
         (search-completed ?d - drone)
-
         (returning ?d - drone)
 
-        ;; --------------------------------------------------------
         ;; System health
-        ;; --------------------------------------------------------
-
         (gps-ok ?d - drone)
-
         (communication-ok ?d - drone)
-
         (drone-healthy ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Fault states
-        ;; --------------------------------------------------------
-
+        ;; Failure states
         (gps-lost ?d - drone)
-
         (communication-lost ?d - drone)
-
         (health-failure ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Controller
-        ;; --------------------------------------------------------
-
+        ;; Controller commands
         (controller-notified ?d - drone)
-
         (controller-return ?d - drone)
-
         (controller-hover ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Battery
-        ;; --------------------------------------------------------
-
+        ;; Battery status
         (battery-insufficient ?d - drone)
-
         (battery-checked ?d - drone)
 
-        ;; --------------------------------------------------------
         ;; Collision avoidance
-        ;; --------------------------------------------------------
-
-        ;; `separation-ok` is what actually gates movement (see move-search /
-        ;; return-to-base below) - `safe-separation` is kept as the
-        ;; informational per-pair record `check-drone-separation` produces,
-        ;; the same way `battery-insufficient` records a battery check's
-        ;; outcome without itself blocking anything.
-
         (safe-separation ?d1 - drone ?d2 - drone)
-
         (separation-ok ?d - drone)
-
         (collision-warning ?d1 - drone ?d2 - drone)
 
-        ;; --------------------------------------------------------
-        ;; Mission
-        ;; --------------------------------------------------------
-
+        ;; Mission status
         (forest-search-completed)
-
         (mission-completed ?d - drone)
     )
 
-
-    ;; ============================================================
-    ;; NUMERIC FUNCTIONS
-    ;; ============================================================
-
+    ;; Numeric values used by the planner
     (:functions
 
-        ;; --------------------------------------------------------
-        ;; Battery
-        ;; --------------------------------------------------------
-
+        ;; Battery information
         (battery ?d - drone)
-
         (max-battery ?d - drone)
-
         (minimum-return-battery ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Movement energy
-        ;; --------------------------------------------------------
-
+        ;; Energy and distance
         (energy-required ?from - location ?to - location)
-
-        ;; --------------------------------------------------------
-        ;; Distance
-        ;; --------------------------------------------------------
-
         (distance ?from - location ?to - location)
 
-        ;; --------------------------------------------------------
-        ;; Drone physical properties
-        ;; --------------------------------------------------------
-
+        ;; Drone size and separation
         (drone-width ?d - drone)
-
         (minimum-drone-separation ?d1 - drone ?d2 - drone)
 
-        ;; --------------------------------------------------------
         ;; Forest dimensions
-        ;; --------------------------------------------------------
-
         (forest-length ?f - forest-area)
-
         (forest-width ?f - forest-area)
 
-        ;; --------------------------------------------------------
-        ;; Coverage
-        ;; --------------------------------------------------------
-
+        ;; Search coverage width
         (coverage-width ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Health
-        ;; --------------------------------------------------------
-
+        ;; Drone health
         (health ?d - drone)
-
         (minimum-health ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Hover energy
-        ;; --------------------------------------------------------
-
+        ;; Energy used while hovering
         (hover-energy ?d - drone)
 
-        ;; --------------------------------------------------------
-        ;; Latitude and longitude
-        ;; --------------------------------------------------------
-
+        ;; Location coordinates
         (latitude ?l - location)
-
         (longitude ?l - location)
     )
 
 
-    ;; ============================================================
-    ;; ACTION 1: CHECK BATTERY
-    ;; ============================================================
-
+    ;; Check if the drone has enough battery for a move
     (:action check-battery
 
         :parameters
@@ -233,9 +122,7 @@
         :precondition
             (and
                 (at ?d ?from)
-
                 (connected ?from ?to)
-
                 (> (battery ?d)
                    (energy-required ?from ?to))
             )
@@ -245,10 +132,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 2: REPORT INSUFFICIENT BATTERY
-    ;; ============================================================
-
+    ;; Record that the drone does not have enough battery
     (:action notify-insufficient-battery
 
         :parameters
@@ -259,9 +143,7 @@
         :precondition
             (and
                 (at ?d ?from)
-
                 (connected ?from ?to)
-
                 (<= (battery ?d)
                     (energy-required ?from ?to))
             )
@@ -271,19 +153,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 3: CHECK SAFE SEPARATION
-    ;; ============================================================
-
-    ;; Records that ?d1/?d2 are currently far enough apart, from their
-    ;; *actual* current locations - not assumed true from the start. Both
-    ;; drones' `separation-ok` comes from the same check because in this
-    ;; two-drone domain there is only ever one "other" drone to be separated
-    ;; from; `move-search`/`return-to-base` each consume their own drone's
-    ;; flag and require a fresh one before the next hop (see below), so the
-    ;; two lanes' progress has to actually stay paired up distance-wise for
-    ;; the plan to go through at all.
-
+    ;; Check the required distance between two drones
     (:action check-drone-separation
 
         :parameters
@@ -295,9 +165,7 @@
         :precondition
             (and
                 (at ?d1 ?l1)
-
                 (at ?d2 ?l2)
-
                 (not (= ?d1 ?d2))
 
                 (>=
@@ -315,10 +183,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 4: START SEARCH
-    ;; ============================================================
-
+    ;; Start searching an assigned forest area
     (:action start-search
 
         :parameters
@@ -329,35 +194,24 @@
         :precondition
             (and
                 (at ?d ?l)
-
                 (forest ?a)
-
                 (area-location ?a ?l)
-
                 (assigned ?d ?a)
-
                 (gps-ok ?d)
-
                 (communication-ok ?d)
-
                 (drone-healthy ?d)
-
                 (not (area-covered ?a))
             )
 
         :effect
             (and
                 (searching ?d)
-
                 (flying ?d)
             )
     )
 
 
-    ;; ============================================================
-    ;; ACTION 5: SEARCH / COVER FOREST AREA
-    ;; ============================================================
-
+    ;; Mark the assigned forest area as searched
     (:action cover-area
 
         :parameters
@@ -368,31 +222,23 @@
         :precondition
             (and
                 (at ?d ?l)
-
                 (forest ?a)
-
                 (area-location ?a ?l)
-
                 (assigned ?d ?a)
-
                 (searching ?d)
-
                 (gps-ok ?d)
-
                 (communication-ok ?d)
-
                 (drone-healthy ?d)
-
                 (not (area-covered ?a))
             )
 
         :effect
             (and
 
-                ;; Forest region is now searched
+                ;; Mark the forest area as covered
                 (area-covered ?a)
 
-                ;; Drone completed this search section
+                ;; Mark the drone's search as completed
                 (search-completed ?d)
 
                 (not (searching ?d))
@@ -400,19 +246,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 6: MOVE TO NEXT SEARCH LOCATION
-    ;; ============================================================
-
-    ;; Deliberately does NOT require `search-completed`: the drone's very
-    ;; first hop (base -> its assigned area) necessarily happens *before*
-    ;; `cover-area` can ever fire (that action itself requires already being
-    ;; at the assigned location), so gating movement on it would make the
-    ;; mission unsolvable before it starts. Reaching the goal still forces
-    ;; `start-search`/`cover-area` to happen somewhere in the plan, because
-    ;; `forest-search-completed` (required to return to base at all) depends
-    ;; on it - just not as a per-hop gate on every individual move.
-
+    ;; Move the drone to the next search location
     (:action move-search
 
         :parameters
@@ -423,21 +257,13 @@
         :precondition
             (and
                 (at ?d ?from)
-
                 (connected ?from ?to)
-
                 (safe-route ?from ?to)
-
                 (separation-ok ?d)
-
                 (gps-ok ?d)
-
                 (communication-ok ?d)
-
                 (drone-healthy ?d)
-
                 (battery-checked ?d)
-
                 (> (battery ?d)
                    (energy-required ?from ?to))
             )
@@ -447,7 +273,6 @@
 
                 ;; Move drone
                 (at ?d ?to)
-
                 (not (at ?d ?from))
 
                 ;; Drone is flying
@@ -459,19 +284,14 @@
                     (energy-required ?from ?to)
                 )
 
-                ;; Reset checks for next movement - a fresh separation check
-                ;; is required before the drone is allowed to hop again
+                ;; Require fresh checks before the next move
                 (not (battery-checked ?d))
-
                 (not (separation-ok ?d))
             )
     )
 
 
-    ;; ============================================================
-    ;; ACTION 7: COMPLETE FOREST SEARCH
-    ;; ============================================================
-
+    ;; Mark the forest search as complete
     (:action complete-forest-search
 
         :parameters
@@ -481,9 +301,7 @@
         :precondition
             (and
                 (area-covered ?a1)
-
                 (area-covered ?a2)
-
                 (not (= ?a1 ?a2))
             )
 
@@ -492,10 +310,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 8: RETURN TO BASE
-    ;; ============================================================
-
+    ;; Return the drone to the base after searching
     (:action return-to-base
 
         :parameters
@@ -506,30 +321,20 @@
         :precondition
             (and
                 (at ?d ?current)
-
                 (is-base ?base)
-
                 (connected ?current ?base)
-
                 (safe-route ?current ?base)
-
                 (separation-ok ?d)
-
                 (forest-search-completed)
-
                 (> (battery ?d)
                    (energy-required ?current ?base))
             )
 
         :effect
             (and
-
                 (at ?d ?base)
-
                 (not (at ?d ?current))
-
                 (not (flying ?d))
-
                 (returning ?d)
 
                 (decrease
@@ -540,10 +345,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 9: COMPLETE DRONE MISSION
-    ;; ============================================================
-
+    ;; Complete the drone mission after returning to base
     (:action complete-drone-mission
 
         :parameters
@@ -553,25 +355,19 @@
         :precondition
             (and
                 (at ?d ?base)
-
                 (returning ?d)
-
                 (forest-search-completed)
             )
 
         :effect
             (and
                 (mission-completed ?d)
-
                 (not (returning ?d))
             )
     )
 
 
-    ;; ============================================================
-    ;; ACTION 10: LOW BATTERY RETURN
-    ;; ============================================================
-
+    ;; Start returning when the battery is too low
     (:action emergency-low-battery-return
 
         :parameters
@@ -590,10 +386,7 @@
     )
 
 
-    ;; ============================================================
-    ;; ACTION 11: GPS FAILURE
-    ;; ============================================================
-
+    ;; Detect GPS failure during flight
     (:action detect-gps-loss
 
         :parameters
@@ -602,23 +395,18 @@
         :precondition
             (and
                 (flying ?d)
-
                 (not (gps-ok ?d))
             )
 
         :effect
             (and
                 (gps-lost ?d)
-
                 (not (flying ?d))
             )
     )
 
 
-    ;; ============================================================
-    ;; ACTION 12: COMMUNICATION FAILURE
-    ;; ============================================================
-
+    ;; Detect communication failure during flight
     (:action detect-communication-loss
 
         :parameters
@@ -627,23 +415,18 @@
         :precondition
             (and
                 (flying ?d)
-
                 (not (communication-ok ?d))
             )
 
         :effect
             (and
                 (communication-lost ?d)
-
                 (not (flying ?d))
             )
     )
 
 
-    ;; ============================================================
-    ;; ACTION 13: HEALTH FAILURE
-    ;; ============================================================
-
+    ;; Detect when drone health becomes too low
     (:action detect-health-failure
 
         :parameters
@@ -652,7 +435,6 @@
         :precondition
             (and
                 (flying ?d)
-
                 (<
                     (health ?d)
                     (minimum-health ?d)
@@ -662,7 +444,6 @@
         :effect
             (and
                 (health-failure ?d)
-
                 (not (flying ?d))
             )
     )

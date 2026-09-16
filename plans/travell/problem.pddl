@@ -2,10 +2,7 @@
 
     (:domain swarm-drone-mission)
 
-    ;; ============================================================
-    ;; OBJECTS
-    ;; ============================================================
-
+    ;; Objects used in the mission
     (:objects
 
         drone1 - drone
@@ -20,26 +17,16 @@
     )
 
 
-    ;; ============================================================
-    ;; INITIAL STATE
-    ;; ============================================================
-
     (:init
 
-        ;; --------------------------------------------------------
-        ;; Drone starting position
-        ;; --------------------------------------------------------
-
+        ;; Drone starts at the source
         (at drone1 source)
 
         (source source)
         (destination destination)
 
 
-        ;; --------------------------------------------------------
-        ;; Route connectivity
-        ;; --------------------------------------------------------
-
+        ;; Locations connected by possible routes
         (connected source destination)
 
         (connected source waypoint1)
@@ -51,13 +38,7 @@
         (connected destination waypoint2)
 
 
-        ;; --------------------------------------------------------
-        ;; SAFE ROUTES
-        ;; --------------------------------------------------------
-
-        ;; Direct route is NOT safe because it crosses
-        ;; the restricted area.
-
+        ;; Safe routes avoid the restricted direct route
         (safe-route source waypoint1)
         (safe-route waypoint1 waypoint2)
         (safe-route waypoint2 destination)
@@ -67,73 +48,43 @@
         (safe-route destination waypoint2)
 
 
-        ;; --------------------------------------------------------
-        ;; RESTRICTED ROUTE
-        ;; --------------------------------------------------------
-
+        ;; Direct route is restricted
         (restricted-route source destination)
 
 
-        ;; --------------------------------------------------------
-        ;; Drone system state
-        ;; --------------------------------------------------------
-
+        ;; Drone starts in a normal operating state
         (gps-ok drone1)
         (communication-ok drone1)
         (drone-healthy drone1)
 
 
-        ;; --------------------------------------------------------
-        ;; Drone is initially not flying
-        ;; --------------------------------------------------------
-
-
-        ;; --------------------------------------------------------
         ;; Geographic coordinates
-        ;; --------------------------------------------------------
-
-        ;; Source
         (= (latitude source) 13.0827)
         (= (longitude source) 80.2707)
 
-        ;; Destination
         (= (latitude destination) 13.0674)
         (= (longitude destination) 80.2376)
 
-        ;; Waypoint 1
         (= (latitude waypoint1) 13.0830)
         (= (longitude waypoint1) 80.2250)
 
-        ;; Waypoint 2
         (= (latitude waypoint2) 13.0650)
         (= (longitude waypoint2) 80.2250)
 
 
-        ;; --------------------------------------------------------
-        ;; DISTANCES
-        ;; These values are calculated by the external
-        ;; mission-generation program.
-        ;; --------------------------------------------------------
-
-        ;; Direct distance
+        ;; Distances are provided by the mission-generation program
         (= (distance source destination) 4300)
 
-        ;; Alternative route
         (= (distance source waypoint1) 3900)
         (= (distance waypoint1 waypoint2) 2100)
         (= (distance waypoint2 destination) 1800)
 
-        ;; Return distances
         (= (distance waypoint1 source) 3900)
         (= (distance waypoint2 waypoint1) 2100)
         (= (distance destination waypoint2) 1800)
 
 
-        ;; --------------------------------------------------------
-        ;; ENERGY REQUIRED
-        ;; Example: energy units / percentage
-        ;; --------------------------------------------------------
-
+        ;; Energy required for each route
         (= (energy-required source destination) 45)
 
         (= (energy-required source waypoint1) 20)
@@ -145,56 +96,34 @@
         (= (energy-required destination waypoint2) 10)
 
 
-        ;; --------------------------------------------------------
-        ;; BATTERY
-        ;; --------------------------------------------------------
-
+        ;; Initial battery and battery limits
         (= (battery drone1) 85)
-
         (= (max-battery drone1) 100)
 
-        ;; Drone should start emergency return when
-        ;; battery becomes <= 30%
-
+        ;; Start emergency return at or below 30% battery
         (= (minimum-return-battery drone1) 30)
 
-        ;; Battery consumed during hovering
-
+        ;; Battery used for each hover action
         (= (hover-energy drone1) 2)
 
 
-        ;; --------------------------------------------------------
-        ;; HEALTH
-        ;; --------------------------------------------------------
-
+        ;; Initial drone health and minimum health
         (= (health drone1) 95)
-
         (= (minimum-health drone1) 40)
 
 
-        ;; --------------------------------------------------------
-        ;; Restricted area
-        ;; --------------------------------------------------------
-
-        ;; This is represented by the waypoint/route
-        ;; preprocessing layer.
-
+        ;; Waypoint 1 is inside the restricted area
         (no-fly-zone waypoint1)
     )
 
-
-    ;; ============================================================
-    ;; GOAL
-    ;; ============================================================
 
     (:goal
 
         (and
 
-            ;; Drone must reach destination
+            ;; Mission is complete when the drone reaches the destination
             (mission-completed drone1)
 
-            ;; Drone should be at destination
             (at drone1 destination)
         )
     )
