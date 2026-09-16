@@ -23,6 +23,15 @@ from PySide6.QtWidgets import (
 from engine.pddl_planner import PlanStep
 from services.plan_service import list_plans
 
+# Display-only labels for plan folders under plans/ - the underlying folder
+# name (used everywhere else as the plan identifier) is unchanged.
+PLAN_DISPLAY_NAMES = {
+    "travell": "Travell",
+    "Search": "Search Forest",
+    "vformation": "V-Formation",
+    "gridformation": "Grid-Formation",
+}
+
 
 class MissionPlannerPanel(QWidget):
     """Select a plan, request it, and read back its parsed step list."""
@@ -179,15 +188,16 @@ class MissionPlannerPanel(QWidget):
         self.reload_plans()
 
     def reload_plans(self) -> None:
-        current = self.plan_combo.currentText()
+        current = self.plan_combo.currentData()
         self.plan_combo.clear()
-        self.plan_combo.addItems(list_plans())
-        index = self.plan_combo.findText(current)
+        for name in list_plans():
+            self.plan_combo.addItem(PLAN_DISPLAY_NAMES.get(name, name), name)
+        index = self.plan_combo.findData(current)
         if index >= 0:
             self.plan_combo.setCurrentIndex(index)
 
     def _on_plan_clicked(self) -> None:
-        name = self.plan_combo.currentText()
+        name = self.plan_combo.currentData()
         if not name:
             self.set_status("No plans found under plans/ - add a domain.pddl + problem.pddl folder.")
             return
