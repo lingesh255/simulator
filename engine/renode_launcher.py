@@ -318,7 +318,7 @@ class RenodeLauncher:
     def start(
         self,
         physics_ready_timeout_s: float = 30.0,
-        gps_ready_timeout_s: float = 150.0,
+        gps_ready_timeout_s: float = 240.0,
     ) -> str:
         """Two-stage start: renode-physics first, confirmed listening, then
         Renode itself with physics and the GPS UART wired in before `start`
@@ -614,7 +614,7 @@ class RenodeLauncher:
         raise TimeoutError(f"no safety-off COMMAND_ACK within {timeout_s}s")
 
     def wait_until_armable(
-        self, timeout_s: float = 120.0, stable_window_s: float = 5.0,
+        self, timeout_s: float = 180.0, stable_window_s: float = 5.0,
     ) -> None:
         """Wait for EKF_STATUS_REPORT.flags to hold EKF_POS_HORIZ_ABS
         continuously for `stable_window_s`, with no "PreArm:"/"Arm:"
