@@ -365,12 +365,17 @@ class RenodeLauncher:
 
     def _start_physics(self, ready_timeout_s: float) -> None:
         # New process group, same as Renode below, so stop() can reliably
-        # reach every child - not just this one PID.
+        # reach every child - not just this one PID. stdin is DEVNULL, not
+        # inherited: a new session (setsid) does not stop a child from
+        # using the parent's inherited tty fd, and Renode's console
+        # switches that tty to raw mode and never restores it (see
+        # _start_renode) - same rule for both children.
         self._physics_proc = subprocess.Popen(
             [str(self.physics_bin), "--model", self.PHYSICS_MODEL,
              "--physics-port", str(self.PHYSICS_PORT)],
             cwd=self.standalone_dir,
             preexec_fn=os.setsid,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -415,10 +420,17 @@ class RenodeLauncher:
         # than an early exit code - this is the only way to see why.
         self._renode_log_path = self.standalone_dir / "renode-console.log"
         self._renode_log = open(self._renode_log_path, "wb")
+        # stdin=DEVNULL is load-bearing: with it inherited, Renode's
+        # `--console` put the launching terminal into raw mode (ECHO/
+        # ICANON/ISIG off) and never restored it - reproduced on a real
+        # pty, the shell was left broken after the app exited by any path
+        # (also made Ctrl+C reach Renode's console as a character instead
+        # of SIGINT for the app).
         self._proc = subprocess.Popen(
             [str(self.renode_bin), "--disable-xwt", "--console", "-e", command],
             cwd=self.standalone_dir,
             preexec_fn=os.setsid,
+            stdin=subprocess.DEVNULL,
             stdout=self._renode_log,
             stderr=subprocess.STDOUT,
         )

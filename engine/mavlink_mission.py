@@ -15,6 +15,7 @@ full mission the way a real GCS does it.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable, Optional
 
@@ -106,6 +107,52 @@ class FlightAborted(RuntimeError):
 TELEMETRY_TYPES = ("GLOBAL_POSITION_INT", "SYS_STATUS", "GPS_RAW_INT", "HEARTBEAT")
 _TRACKED_TYPES = ("MISSION_ITEM_REACHED", "STATUSTEXT") + TELEMETRY_TYPES
 
+# Wall-clock bound on the whole "Flying mission." wait - see
+# `estimate_max_flight_s`. The silence timeout (`mission_timeout_s`) can't
+# catch a vehicle that keeps streaming telemetry but never finishes the
+# mission: a failsafe LAND (EKF "GPS Glitch" -> "EKF Failsafe: changed to
+# Land Mode") or a restarted mission never emits MISSION_ITEM_REACHED for the
+# last item, and every telemetry message resets that silence timer, so the
+# loop below used to spin forever.
+#
+# Rates are deliberately far slower than measured on this project's own real
+# Renode flights, which run slower than real time AND vary ~2.4x between
+# runs (same code, same leg). Fast run: a 550 m leg at 50 m took ~445 s
+# wall-clock start to touchdown - climb ~0.6 m/s (~80 s), leg ~2.75 m/s
+# (190 s), land ~0.4 m/s (~125 s). Slow run (boot took 298 s vs ~155 s):
+# climb only ~0.29 m/s, which would put a healthy flight near ~1070 s. A
+# bound tuned to the fast run would falsely fail healthy flights on a slow
+# host, which is worse than waiting a while longer on a real hang, so these
+# sit well below the slowest observed speeds: 0.15 m/s vertical and
+# 0.6 m/s horizontal give ~1650 s for that same leg (~3.7x the fast run,
+# ~1.5x the slow one), and scale with route length so a legitimately long
+# route isn't cut off the way a flat constant would.
+_FLIGHT_VERTICAL_MPS = 0.15
+_FLIGHT_HORIZONTAL_MPS = 0.6
+_FLIGHT_SLACK_S = 60.0  # mode switch / arming / EKF settling around the flight itself
+
+
+def _route_length_m(waypoints: list[tuple[float, float]]) -> float:
+    """Sum of great-circle leg lengths (haversine) along `waypoints`."""
+    radius_m = 6371000.0
+    total = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(waypoints, waypoints[1:]):
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        a = (math.sin((p2 - p1) / 2) ** 2
+             + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+        total += 2 * radius_m * math.asin(math.sqrt(a))
+    return total
+
+
+def estimate_max_flight_s(waypoints: list[tuple[float, float]], altitude_m: float) -> float:
+    """Generous upper bound on how long one uploaded mission should take:
+    climb to `altitude_m` + fly the route + land from `altitude_m`."""
+    return (
+        _FLIGHT_SLACK_S
+        + 2 * altitude_m / _FLIGHT_VERTICAL_MPS
+        + _route_length_m(waypoints) / _FLIGHT_HORIZONTAL_MPS
+    )
+
 
 def upload_and_fly(
     master,
@@ -115,6 +162,7 @@ def upload_and_fly(
     heartbeat_timeout_s: float = 10.0,
     item_timeout_s: float = 10.0,
     mission_timeout_s: float = 600.0,
+    max_flight_s: Optional[float] = None,
     on_progress: Optional[Callable[[str], None]] = None,
     should_abort: Optional[Callable[[], bool]] = None,
     on_message: Optional[Callable[[object], None]] = None,
@@ -124,8 +172,10 @@ def upload_and_fly(
 
     `master` is an already-constructed `pymavlink.mavutil.mavlink_connection`
     (not created here, so the caller controls the connection string and its
-    lifetime). Raises `RuntimeError`/`TimeoutError` on any protocol failure,
-    or `FlightAborted` if `should_abort` reports true. Blocking throughout -
+    lifetime). Raises `RuntimeError`/`TimeoutError` on any protocol failure
+    (including the flight not finishing within `max_flight_s` - default:
+    `estimate_max_flight_s()` for this route), or `FlightAborted` if
+    `should_abort` reports true. Blocking throughout -
     callers on a GUI thread should run this on a worker thread.
 
     `on_message`, if given, is called with every raw MAVLink message seen
@@ -238,9 +288,16 @@ def upload_and_fly(
     report("Flying mission.")
     last_seq = len(items) - 1
     last_message_at = time.monotonic()
+    flight_limit_s = max_flight_s if max_flight_s is not None else estimate_max_flight_s(waypoints, altitude_m)
+    flight_deadline = last_message_at + flight_limit_s
     while True:
         if aborted():
             raise FlightAborted("aborted mid-flight")
+        if time.monotonic() >= flight_deadline:
+            raise TimeoutError(
+                f"mission did not complete within {flight_limit_s:.0f}s - the vehicle may "
+                f"have failsafed (e.g. EKF failsafe -> LAND) before reaching the last waypoint"
+            )
         # Poll in short slices so an abort (or a vehicle that goes silent -
         # e.g. the mock subprocess being killed on Stop) is noticed within a
         # second instead of blocking this worker thread until the full
