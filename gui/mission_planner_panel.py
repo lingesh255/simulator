@@ -53,10 +53,12 @@ class MissionPlannerPanel(QWidget):
         self.external_mavlink_check.setToolTip(
             "Unchecked (default): fly using this app's own in-process drone-thread "
             "pipeline - works with no extra setup.\n"
-            "Checked: instead upload the planned route as one real MAVLink mission "
-            "to the connection string below and fly it there - needs an actual "
+            "Checked: instead upload the planned route as a real MAVLink mission "
+            "and fly it against the connection string below - needs an actual "
             "ArduPilot/PX4 (SITL or hardware) already listening, or the mission "
-            "fails immediately rather than hanging."
+            "fails immediately rather than hanging. A forest-search plan flies "
+            "one mission per drone, on consecutive ports from the one below "
+            "(14550, 14551, ...)."
         )
         self.external_mavlink_check.toggled.connect(self._on_external_mavlink_toggled)
 

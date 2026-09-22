@@ -44,6 +44,12 @@ from services.local_flight import EmergencyLanding, nearest_point, plan_flights
 
 POLL_MS = 100
 
+# How close (metres) a drone's altitude must be to its target for
+# `ThreadSwarmBackend._check_formation_assembly` to call it "there" - the
+# climb asymptotically approaches the target (see engine.flight_controller's
+# clamped climb step), so an exact `==` would never fire.
+ALTITUDE_ARRIVAL_M = 0.5
+
 # The node's mission vocabulary, in the terms the dashboard speaks.
 _STATUS_MAP = {
     MissionState.IDLE: DroneStatus.STANDBY,
@@ -158,6 +164,51 @@ class ThreadSwarmBackend(QObject):
         # need climbing past the ceiling. Same route for every drone in a
         # mission, so it's computed once in start_mission_path.
         self._altitudes: dict[int, list[float]] = {}
+        # Staggered-launch queue for `start_formation_mission`: sysid -> the
+        # `_elapsed_s` value at (or after) which its first NAVIGATE fires.
+        # Only ever holds the *one* drone whose turn it is - the rest wait in
+        # `_launch_pending` until the drone ahead of them has actually
+        # reached its slot, because every formation drone now lifts off from
+        # the same launch point and two of them cannot occupy it at once.
+        # Empty outside a staggered-launch mission, so `_fire_due_launches`
+        # is a no-op for every other mission kind.
+        self._launch_queue: dict[int, float] = {}
+        # Formation drones not yet launched, in apex-first launch order; the
+        # head is promoted into `_launch_queue` by `_check_formation_assembly`
+        # once the drone ahead of it is settled in its slot.
+        self._launch_pending: list[int] = []
+        # Seconds between one formation drone reaching its slot and the next
+        # one lifting off the shared launch point (settling time), and the
+        # launch point itself - both set by `start_formation_mission`.
+        self._launch_stagger_s: float = 6.0
+        self._formation_pad: Optional[LatLon] = None
+        # Formation assembly gate: sysid -> `(slot, cruise_altitude_m)` - the
+        # spot in the airborne V this drone was sent to take up after lifting
+        # off the shared pad, and the altitude it holds there while waiting
+        # for every other formation drone to take up its own. Populated by
+        # `_fire_due_launches`, cleared by `_check_formation_assembly` the
+        # instant every entry is settled in its slot - which is also the
+        # instant all of them are sent toward their real first waypoint,
+        # together, so the V departs intact instead of stringing out along
+        # the route as each drone finishes its own climb independently.
+        self._slot_wait: dict[int, tuple[LatLon, float]] = {}
+        # Subset of `_slot_wait` already confirmed to be sitting in its slot.
+        self._in_slot: set[int] = set()
+        # V-formation bookkeeping for the *landing* side of a mission -
+        # mirrors the launch side above. `_formation_launch_order` is the
+        # apex-first sysid order (set once by `start_formation_mission`,
+        # cleared by `stop`); `_land_wait` is every formation sysid that has
+        # arrived at (and is holding over) its own final point, waiting for
+        # the rest; `_land_queue` is populated - apex first, `_land_stagger_s`
+        # apart - only once *all* of them have arrived, and is what actually
+        # staggers the real MAV-level landings (see `_check_formation_landing`
+        # / `_fire_due_landings`), so the group doesn't all set down in the
+        # same small area at the same instant.
+        self._formation_launch_order: list[int] = []
+        self._land_wait: set[int] = set()
+        self._land_queue: dict[int, float] = {}
+        self._land_stagger_s: float = 6.0
+        self._landing_started = False
         self._time_scale = time_scale
         self._elapsed_s = 0.0
         self._tick = 0
@@ -302,6 +353,260 @@ class ThreadSwarmBackend(QObject):
         self._timer.start()
         return True
 
+    def start_formation_mission(
+        self,
+        assignments: list[tuple[DroneConfig, list[LatLon], float]],
+        launch_stagger_s: float = 6.0,
+        land_stagger_s: Optional[float] = None,
+        launch_point: Optional[LatLon] = None,
+    ) -> bool:
+        """Like `start_mission_paths`, but for a V-formation: every drone
+        lifts off from the *same* launch point and then climbs out to its
+        own slot in the airborne V, one drone at a time.
+
+        Each drone gets its own fixed cruise altitude (not the
+        terrain-derived one every other mission uses - a formation holds a
+        set altitude offset per slot, apex above the wings, not "whatever
+        clears the ground"). All three are spawned on the shared pad
+        (`launch_point`, defaulting to the apex route's first point - the
+        source the operator actually picked), and are launched strictly in
+        turn, in `assignments` order: the apex takes off, flies to its slot
+        and settles there, and only `launch_stagger_s` seconds *after that*
+        does the left wing leave the pad, then the right wing the same way.
+        Sequencing on the drone ahead actually arriving - rather than on a
+        fixed clock - is what keeps two of them from ever occupying the one
+        launch point at the same time. Landing is staggered `land_stagger_s`
+        apart (defaults to `launch_stagger_s`) - see
+        `_check_formation_landing`.
+
+        `assignments` is `(drone, route, altitude_m)`, already in launch
+        order (see `services.plan_service.FORMATION_DRONES`/
+        `_run_formation`) - also the landing order. Each route still *starts*
+        at that drone's own slot (`engine.pddl_problem.formation_wing_routes`
+        offsets every wing waypoint, the first included), so the climb-out
+        target is simply `route[0]`, and the real route is flown from there
+        unchanged. Every drone is spawned immediately, landed, so they all
+        appear on the map together; only the NAVIGATE that arms and launches
+        each one is sequenced, via `_launch_queue` / `_launch_pending` /
+        `_fire_due_launches` (checked every `_poll` tick).
+        """
+        self.stop()
+        if not assignments:
+            return False
+
+        self._gcs = GroundControlStation(verbose=False)
+        self._gcs.start()
+        self._fleet = DroneFleet()
+        self._destination = assignments[0][1][-1]
+
+        # The one point on the ground every drone in the formation takes off
+        # from. Defaults to the apex route's source; passed explicitly by the
+        # caller when the apex itself may have been dropped from
+        # `assignments` (e.g. grounded on battery), so the pad stays the
+        # operator's picked source rather than sliding to a wing's slot.
+        pad = launch_point if launch_point is not None else assignments[0][1][0]
+        self._formation_pad = pad
+
+        per_drone: dict[int, tuple[list[LatLon], list[float]]] = {}
+        launch_order: list[int] = []
+        for drone, waypoints, altitude_m in assignments:
+            if len(waypoints) < 2:
+                continue
+            # Every drone spawns on the shared pad, not on its own slot - the
+            # slot is where it climbs out to once airborne.
+            if not self._spawn_drone(drone, pad):
+                continue
+            per_drone[drone.sysid] = (list(waypoints), [float(altitude_m)] * len(waypoints))
+            launch_order.append(drone.sysid)
+
+        if not self._views:
+            self.stop()
+            return False
+
+        self._gcs.register_many(self._views)
+        self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
+
+        for sysid in launch_order:
+            points, altitudes = per_drone[sysid]
+            self._paths[sysid] = points
+            self._altitudes[sysid] = altitudes
+            # `_leg_index[sysid]` is deliberately NOT set here - each drone's
+            # first NAVIGATE (sent below/by `_fire_due_launches`) is a
+            # climb-out from the shared pad to its own slot, not the real
+            # leg 1; `_check_formation_assembly` sets it once the whole
+            # formation is in slot and is actually released toward that leg.
+
+        self._formation_launch_order = list(launch_order)
+        self._launch_stagger_s = launch_stagger_s
+        self._land_stagger_s = launch_stagger_s if land_stagger_s is None else land_stagger_s
+
+        self._elapsed_s = 0.0
+        self._tick = 0
+        self._paused = False
+        for flags in (self._flagged_low, self._flagged_gps, self._flagged_lost, self._emergency):
+            flags.clear()
+
+        # Only the apex is queued now, due at t=0, so `_fire_due_launches`
+        # sends it off immediately below rather than waiting for the first
+        # poll tick. Each following drone is promoted out of
+        # `_launch_pending` by `_check_formation_assembly`, once the drone
+        # ahead of it has actually reached its slot and the pad is clear.
+        self._launch_queue = {launch_order[0]: 0.0}
+        self._launch_pending = list(launch_order[1:])
+        self._fire_due_launches()
+
+        self._timer.start()
+        return True
+
+    def _fire_due_launches(self) -> None:
+        """Send the first NAVIGATE for the queued drone whose turn to leave
+        the shared pad has come - see `start_formation_mission`. A no-op
+        once the queue is empty, so it's safe to call from every `_poll`
+        tick regardless of mission kind.
+
+        That first NAVIGATE runs from the shared launch point up to this
+        drone's *own slot* in the airborne V (`route[0]`), not to its real
+        first waypoint: it climbs to the slot altitude and flies out to the
+        slot, then holds there. For the apex the slot is the pad itself, so
+        that NAVIGATE is a straight climb with no lateral movement (see
+        `engine.flight_controller.SimulatedFlightController._fly_mission` -
+        an already-arrived waypoint completes the "mission" on the same tick
+        the climb finishes). `_check_formation_assembly` watches for the
+        arrival: it both frees the pad for the next drone and, later, sends
+        the whole assembled V onward together - never each drone the moment
+        it personally settles."""
+        if not self._launch_queue or self._gcs is None:
+            return
+        due = [sysid for sysid, at in self._launch_queue.items() if self._elapsed_s >= at]
+        for sysid in due:
+            del self._launch_queue[sysid]
+            points = self._paths.get(sysid)
+            altitudes = self._altitudes.get(sysid)
+            if not points or not altitudes:
+                continue
+            pad = self._formation_pad or points[0]
+            slot = points[0]
+            altitude = altitudes[0]
+            self._gcs.navigate(
+                sysid, [pad.lat, pad.lon, 0.0], [slot.lat, slot.lon, altitude], final=False,
+            )
+            self._slot_wait[sysid] = (slot, altitude)
+
+    def _check_formation_assembly(self, snapshots: dict[int, DroneSnapshot]) -> None:
+        """Watch each launched drone climb out from the shared pad to its own
+        slot, and do the two things that arrival unblocks - see
+        `_fire_due_launches`.
+
+        First, launch sequencing: the moment the drone currently climbing out
+        settles in its slot, the pad is clear, so the next drone waiting in
+        `_launch_pending` is queued to lift off `_launch_stagger_s` seconds
+        later. Sequencing on that arrival rather than on a fixed clock is
+        what keeps the drones taking off one at a time - nobody leaves the
+        pad while somebody else is still on it or climbing away from it.
+
+        Second, the departure gate: once every formation drone is settled in
+        its own slot, all of them are released toward their real first
+        waypoint on the same tick, so the V departs intact instead of
+        stringing out. A drone that hasn't launched yet
+        (`_launch_queue`/`_launch_pending`) or hasn't reached its slot holds
+        the whole group. A no-op once `_slot_wait` is empty, so safe to call
+        every tick."""
+        if not self._slot_wait or self._gcs is None:
+            return
+
+        for sysid, (slot, target_alt) in self._slot_wait.items():
+            if sysid in self._in_slot:
+                continue
+            snap = snapshots.get(sysid)
+            if snap is None or snap.position.alt_m < target_alt - ALTITUDE_ARRIVAL_M:
+                continue  # still climbing
+            if engine_haversine(
+                snap.position, Position(lat=slot.lat, lon=slot.lon)
+            ) > ARRIVAL_RADIUS_M:
+                continue  # at altitude, still flying out to its slot
+            self._in_slot.add(sysid)
+            # Pad is clear - let the next drone go, after a settling gap.
+            if self._launch_pending:
+                nxt = self._launch_pending.pop(0)
+                self._launch_queue[nxt] = self._elapsed_s + self._launch_stagger_s
+
+        if self._launch_queue or self._launch_pending:
+            return  # somebody still has to leave the pad
+        if any(sysid not in self._in_slot for sysid in self._slot_wait):
+            return  # at least one drone is still climbing out to its slot
+
+        for sysid in list(self._slot_wait):
+            points = self._paths.get(sysid)
+            altitudes = self._altitudes.get(sysid)
+            if not points or len(points) < 2 or not altitudes:
+                continue
+            self._gcs.navigate(
+                sysid,
+                [points[0].lat, points[0].lon, altitudes[0]],
+                [points[1].lat, points[1].lon, altitudes[1]],
+                # Never land straight off this NAVIGATE, even if leg 1 is
+                # the route's last point: a formation drone always arrives
+                # and holds first (`_check_formation_landing` sends the real
+                # LAND, staggered, once every drone has arrived) - see the
+                # matching override in `_advance_legs`.
+                final=False,
+            )
+            self._leg_index[sysid] = 1
+        self._slot_wait.clear()
+        self._in_slot.clear()
+
+    def _check_formation_landing(self, snapshots: dict[int, DroneSnapshot]) -> None:
+        """The landing mirror of `_fire_due_launches`/`_check_formation_assembly`:
+        watch every still-active formation drone for arriving at (and
+        holding over - see the `final=False` overrides above) its own final
+        point, and once *all* of them have, stagger the real LAND commands
+        apex first, `_land_stagger_s` apart, via `_land_queue` /
+        `_fire_due_landings`. A no-op once landing has already started, or
+        outside a formation mission (`_formation_launch_order` empty)."""
+        if not self._formation_launch_order or self._landing_started:
+            return
+        active = [
+            sysid for sysid in self._formation_launch_order
+            if sysid in self._views and not self._views[sysid].is_done
+        ]
+        if not active:
+            return
+
+        for sysid in active:
+            if sysid in self._land_wait:
+                continue
+            path = self._paths.get(sysid)
+            leg = self._leg_index.get(sysid)
+            if not path or leg is None or leg < len(path) - 1:
+                continue  # not dispatched toward its final point yet
+            snap = snapshots.get(sysid)
+            if snap is None:
+                continue
+            final_point = Position(lat=path[-1].lat, lon=path[-1].lon)
+            if engine_haversine(snap.position, final_point) <= ARRIVAL_RADIUS_M:
+                self._land_wait.add(sysid)
+
+        if not set(active).issubset(self._land_wait):
+            return  # at least one active drone hasn't arrived yet
+
+        self._landing_started = True
+        self._land_queue = {
+            sysid: self._elapsed_s + i * self._land_stagger_s
+            for i, sysid in enumerate(s for s in self._formation_launch_order if s in active)
+        }
+
+    def _fire_due_landings(self) -> None:
+        """Send the real LAND for every queued formation drone whose
+        staggered landing time has arrived - see `_check_formation_landing`.
+        A no-op once the queue is empty, so safe to call every `_poll` tick
+        regardless of mission kind."""
+        if not self._land_queue:
+            return
+        due = [sysid for sysid, at in self._land_queue.items() if self._elapsed_s >= at]
+        for sysid in due:
+            del self._land_queue[sysid]
+            self._send(sysid, CommandName.LAND)
+
     def _spawn_drone(self, drone: DroneConfig, home: LatLon) -> bool:
         """Bind a UDP link and spawn one drone-thread node starting at
         `home`, registering it in `self._views`. Shared by
@@ -349,6 +654,15 @@ class ThreadSwarmBackend(QObject):
         self._paths.clear()
         self._leg_index.clear()
         self._altitudes.clear()
+        self._launch_queue.clear()
+        self._launch_pending = []
+        self._slot_wait.clear()
+        self._in_slot.clear()
+        self._formation_pad = None
+        self._formation_launch_order = []
+        self._land_wait.clear()
+        self._land_queue.clear()
+        self._landing_started = False
 
     def pause(self) -> None:
         """Hold every node in place while the controller decides."""
@@ -470,10 +784,15 @@ class ThreadSwarmBackend(QObject):
             return
         self._tick += 1
         self._elapsed_s += POLL_MS / 1000.0 * self._time_scale
+        self._fire_due_launches()
+        self._fire_due_landings()
 
         snapshots = self._fleet.latest()
         if not snapshots:
             return
+
+        self._check_formation_assembly(snapshots)
+        self._check_formation_landing(snapshots)
 
         drones = [self._telemetry_of(s) for s in snapshots.values()]
         self.batch_ready.emit(
@@ -507,6 +826,10 @@ class ThreadSwarmBackend(QObject):
         allowed to trigger a landing.
         """
         for sysid, snap in snapshots.items():
+            if sysid in self._launch_queue:
+                continue  # staggered launch: hasn't been sent its first NAVIGATE yet
+            if sysid in self._slot_wait:
+                continue  # climbing out to / holding in its slot, waiting for the rest
             path = self._paths.get(sysid)
             if not path:
                 continue
@@ -523,10 +846,14 @@ class ThreadSwarmBackend(QObject):
                 altitude = altitudes[leg]
             else:
                 altitude = self._views[sysid].config.cruise_altitude_m if sysid in self._views else 50.0
+            is_formation = sysid in self._formation_launch_order
             self._send(
                 sysid, CommandName.NAVIGATE,
                 destination=[path[leg].lat, path[leg].lon, altitude],
-                final=(leg >= len(path) - 1),
+                # A formation drone always arrives and holds, even on its
+                # last leg - see the matching override in
+                # `_check_formation_assembly` and `_check_formation_landing`.
+                final=(leg >= len(path) - 1) and not is_formation,
             )
 
     def _check_exceptions(self, snapshots: dict[int, DroneSnapshot]) -> None:

@@ -40,7 +40,9 @@ from gui.telemetry_dashboard import TelemetryDashboard
 from gui.theme import theme_manager
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
-from services.plan_service import PlanRunResult, PlanService, plan_kind
+from services.mavlink_swarm_flight_service import MavlinkSwarmFlightService
+from services.plan_service import FORMATION_LAUNCH_STAGGER_S, PlanRunResult, PlanService, plan_kind
+from services.search_stats_console import SearchStatsConsole
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -113,14 +115,28 @@ class MainWindow(QMainWindow):
         # swap above since it isn't a telemetry source the rest of the GUI
         # polls; it just reports progress/finished/failed while it runs.
         self.mavlink_flight = MavlinkFlightService(self)
-        # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
-        # when the panel's "Use built-in mock vehicle" box is checked - a
-        # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
-        self._mock_sitl_proc: subprocess.Popen | None = None
+        # The area-coverage counterpart: one real MAVLink mission per drone
+        # (its own lane) against one external endpoint each, instead of the
+        # single shared route `mavlink_flight` flies. Used when "Fly via real
+        # MAVLink" is checked and the plan is a forest search - see
+        # `_start_area_coverage_external_mavlink`.
+        self.mavlink_swarm = MavlinkSwarmFlightService(self)
+        # Managed by `_start_external_mavlink_mission` /
+        # `_start_area_coverage_external_mavlink` / `_stop_mock_vehicle` when
+        # the panel's "Use built-in mock vehicle" box is checked - one
+        # `scripts/mock_sitl.py` subprocess per drone this window owns the
+        # lifetime of (a point-to-point mission launches exactly one).
+        self._mock_sitl_procs: list[subprocess.Popen] = []
         # Cleared on Stop so telemetry batches already queued from a worker
         # thread when Stop was pressed can't slip through and repopulate the
         # map after everything has been torn down. Re-armed by each run start.
         self._accepting_telemetry = True
+
+        # Prints per-drone stats for a running forest-search mission to the
+        # terminal `main.py` was launched from - the same read-out
+        # `scripts/pddl_search_to_mavlink.py` gives on the command line. Fed
+        # from `_on_telemetry`; started by `_start_area_coverage_mission`.
+        self.search_stats = SearchStatsConsole()
 
         self.drone_management = DroneManagementPanel(self.store)
         self.map_viewer = MapViewer()
@@ -340,10 +356,11 @@ class MainWindow(QMainWindow):
             lambda msg: self.statusBar().showMessage(f"Drone node: {msg}", 15000)
         )
 
-        self.mavlink_flight.batch_ready.connect(self._on_telemetry)
-        self.mavlink_flight.progress.connect(self._on_mavlink_flight_progress)
-        self.mavlink_flight.finished.connect(self._on_mavlink_flight_finished)
-        self.mavlink_flight.failed.connect(self._on_mavlink_flight_failed)
+        for mavlink_source in (self.mavlink_flight, self.mavlink_swarm):
+            mavlink_source.batch_ready.connect(self._on_telemetry)
+            mavlink_source.progress.connect(self._on_mavlink_flight_progress)
+            mavlink_source.finished.connect(self._on_mavlink_flight_finished)
+            mavlink_source.failed.connect(self._on_mavlink_flight_failed)
 
     # ---- Connection ----
 
@@ -634,6 +651,8 @@ class MainWindow(QMainWindow):
         self._accepting_telemetry = False
         self.flight_sim.stop()
         self.mavlink_flight.abort()
+        self.mavlink_swarm.abort()
+        self.search_stats.stop()
         self._stop_mock_vehicle()
         self.flight_label.setText("No flight")
         # Markers are cleared below, so the points they stood for go too.
@@ -864,7 +883,16 @@ class MainWindow(QMainWindow):
 
         if result.per_drone_waypoints is not None:
             noun = "slot" if self._plan_kind == "formation" else "lane"
-            self._start_area_coverage_mission(result, drones, route_noun=noun)
+            if self._plan_kind in ("area_coverage", "formation") and self.mission_planner.use_external_mavlink():
+                # Fly each lane/slot as its own real MAVLink mission (upload
+                # handshake, ARM, AUTO, MISSION_ITEM_REACHED per leg) against
+                # one external endpoint per drone - what scripts/mock_sitl.py
+                # answers - rather than thread_sim's in-process pipeline. For
+                # a V-formation this also stages the launch apex-first (see
+                # _start_area_coverage_external_mavlink).
+                self._start_area_coverage_external_mavlink(result, drones)
+            else:
+                self._start_area_coverage_mission(result, drones, route_noun=noun)
             return
 
         if self.mission_planner.use_external_mavlink():
@@ -961,6 +989,106 @@ class MainWindow(QMainWindow):
         self._pending_plan_name = None
         self._plan_source = None
 
+    def _start_area_coverage_external_mavlink(
+        self, result: PlanRunResult, drones: list
+    ) -> None:
+        """Fly a forest-search plan's per-drone lanes - or a V-formation's
+        apex/left/right slots - as real MAVLink missions - one endpoint, one
+        MISSION_ITEM_INT upload + ARM + AUTO run per drone - instead of
+        thread_sim's in-process pipeline. The multi-drone counterpart of
+        `_start_external_mavlink_mission`.
+
+        The panel's connection string gives the *base* port; drone i connects
+        on `base_port + i` (14550, 14551, ...). With "Use built-in mock
+        vehicle" checked, one `scripts/mock_sitl.py` is launched per drone on
+        those same ports, all seeded with the shared base point. Skips the
+        internal battery-feasibility check for the same reason the
+        point-to-point external path does - that model is this app's own
+        `DroneConfig` curve, not whatever is actually listening.
+
+        For a formation (`result.per_drone_altitudes` set), each drone gets
+        its own fixed slot altitude instead of one shared value, and
+        `MavlinkSwarmFlightService` stages each connection's launch
+        `FORMATION_LAUNCH_STAGGER_S` apart, apex first - matching
+        `ThreadSwarmBackend.start_formation_mission`'s in-app behaviour, just
+        over real MAVLink connections instead of the in-process pipeline.
+        """
+        connection = self.mission_planner.mavlink_connection_string()
+        parsed = self._parse_udp_connection(connection)
+        if parsed is None:
+            message = (
+                "The real-MAVLink area search needs a udp:host:port connection string "
+                f"(the base port), got '{connection}'."
+            )
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return
+        host, base_port = parsed
+
+        routes = list(result.per_drone_waypoints.values())
+        if len(drones) < len(routes):
+            self.mission_planner.set_status(
+                f"Plan '{result.plan_name}' needs {len(routes)} drone(s), "
+                f"but only {len(drones)} are checked."
+            )
+            self.statusBar().showMessage(
+                f"Check at least {len(routes)} drones before running plan '{result.plan_name}'."
+            )
+            return
+
+        assignments = list(zip(drones, routes))  # (DroneConfig, [LatLon, ...])
+        if result.per_drone_altitudes is not None:
+            # Formation: apex above the wings, not one shared altitude - see
+            # services.plan_service.FORMATION_ALTITUDES.
+            altitudes = list(result.per_drone_altitudes.values())
+            launch_stagger_s = FORMATION_LAUNCH_STAGGER_S
+        else:
+            altitudes = [drones[0].cruise_altitude_m] * len(routes)
+            launch_stagger_s = 0.0
+        base_point = routes[0][0]  # every lane/slot launches from the shared base
+        # A formation's drones all lift off from that same point and only
+        # then climb out to their own slots, so the service needs it too -
+        # see MavlinkSwarmFlightService.run_async's `launch_point`.
+        launch_point = (base_point.lat, base_point.lon) if launch_stagger_s > 0 else None
+        connection_strings = [f"udp:{host}:{base_port + i}" for i in range(len(routes))]
+
+        if self.mission_planner.use_mock_vehicle():
+            if not self._start_mock_swarm(base_port, len(routes), base_point):
+                return  # status/console already explain why
+
+        route_noun = "slot" if result.per_drone_altitudes is not None else "lane"
+        # SearchStatsConsole's recurring per-drone stats block (wp=../..
+        # alt=.. hdg=.. gs=.. batt=..) is deliberately not started here for
+        # either plan kind: the connected vehicle's own stdout (mock_sitl.py)
+        # plus this app's own `[MAVLink] ...` progress lines below already
+        # show every command and waypoint event, and the recurring block was
+        # just noisy duplication on top of that.
+
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([cfg.sysid for cfg, _ in assignments])
+        self.map_viewer.clear_drones()
+        self.map_viewer.clear_paths()
+
+        service_assignments = [
+            (cfg.sysid, cfg.name, [(p.lat, p.lon) for p in route])
+            for cfg, route in assignments
+        ]
+        endpoints = ", ".join(connection_strings)
+        self.mission_planner.set_status(
+            f"Plan '{result.plan_name}': flying {len(routes)} {route_noun}(s) via real MAVLink ({endpoints}) ..."
+        )
+        self.statusBar().showMessage(
+            f"Flying plan '{result.plan_name}' via real MAVLink - {len(routes)} drone(s), one mission each."
+        )
+        print(
+            f"[MAVLink] Plan '{result.plan_name}': {len(routes)} {route_noun}(s) -> {endpoints}"
+        )
+        self.mavlink_swarm.run_async(
+            service_assignments, connection_strings, altitudes, launch_stagger_s, launch_point,
+        )
+        self._pending_plan_name = None
+        self._plan_source = None
+
     @staticmethod
     def _parse_udp_connection(connection: str) -> tuple[str, int] | None:
         """`"udp:host:port"` -> `(host, port)`, or None for anything else
@@ -969,22 +1097,11 @@ class MainWindow(QMainWindow):
         match = re.match(r"^udp:([^:]+):(\d+)$", connection.strip())
         return (match.group(1), int(match.group(2))) if match else None
 
-    def _start_mock_vehicle(self, connection: str, source: LatLon) -> bool:
-        """Launch `scripts/mock_sitl.py`, seeded with the plan's actual
-        source point, so no one has to hand-run it or type --home themselves.
-        Its own stdout/stderr are left un-redirected, so its prints land in
-        this same console alongside ours."""
-        parsed = self._parse_udp_connection(connection)
-        if parsed is None:
-            message = (
-                f"Mock vehicle needs a udp:host:port connection string, got '{connection}'."
-            )
-            self.mission_planner.set_status(message)
-            self.statusBar().showMessage(message, 10000)
-            return False
-        _host, port = parsed
-
-        self._stop_mock_vehicle()
+    def _launch_mock_sitl(self, port: int, source: LatLon) -> bool:
+        """Spawn one `scripts/mock_sitl.py` on `port`, seeded with `source`
+        as its `--home`, and track it in `self._mock_sitl_procs`. Its
+        stdout/stderr are left un-redirected, so its prints land in this same
+        console alongside ours."""
         script = Path(__file__).resolve().parent.parent / "scripts" / "mock_sitl.py"
         args = [
             sys.executable, str(script),
@@ -993,7 +1110,9 @@ class MainWindow(QMainWindow):
         ]
         print(f"[MAVLink] Launching mock vehicle: {' '.join(args)}")
         try:
-            self._mock_sitl_proc = subprocess.Popen(args, cwd=str(script.parent.parent))
+            self._mock_sitl_procs.append(
+                subprocess.Popen(args, cwd=str(script.parent.parent))
+            )
         except OSError as exc:
             message = f"Could not launch mock vehicle: {exc}"
             self.mission_planner.set_status(message)
@@ -1001,9 +1120,37 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def _start_mock_vehicle(self, connection: str, source: LatLon) -> bool:
+        """One mock vehicle for a point-to-point mission, on the port the
+        panel's connection string names."""
+        parsed = self._parse_udp_connection(connection)
+        if parsed is None:
+            message = (
+                f"Mock vehicle needs a udp:host:port connection string, got '{connection}'."
+            )
+            self.mission_planner.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            return False
+        self._stop_mock_vehicle()
+        return self._launch_mock_sitl(parsed[1], source)
+
+    def _start_mock_swarm(self, base_port: int, count: int, source: LatLon) -> bool:
+        """One mock vehicle per drone, on consecutive ports from `base_port`
+        (14550, 14551, ...) - the endpoints
+        `_start_area_coverage_external_mavlink` tells the swarm service to
+        connect to. All share the same `--home` base point."""
+        self._stop_mock_vehicle()
+        for i in range(count):
+            if not self._launch_mock_sitl(base_port + i, source):
+                self._stop_mock_vehicle()
+                return False
+        return True
+
     def _stop_mock_vehicle(self) -> None:
-        proc, self._mock_sitl_proc = self._mock_sitl_proc, None
-        if proc is not None and proc.poll() is None:
+        procs, self._mock_sitl_procs = self._mock_sitl_procs, []
+        for proc in procs:
+            if proc.poll() is not None:
+                continue
             print("[MAVLink] Stopping mock vehicle.")
             proc.terminate()
             try:
@@ -1020,6 +1167,7 @@ class MainWindow(QMainWindow):
 
     def _on_mavlink_flight_finished(self) -> None:
         self._stop_mock_vehicle()
+        self.search_stats.stop()
         if not self._accepting_telemetry:
             # Worker unwound because of a Stop - `_on_stop` already reported it.
             return
@@ -1029,6 +1177,7 @@ class MainWindow(QMainWindow):
         print("[MAVLink] Mission complete.")
 
     def _on_mavlink_flight_failed(self, message: str) -> None:
+        self.search_stats.stop()
         self.drone_management.set_running(False)
         self.mission_planner.set_status(f"External MAVLink mission failed: {message}")
         self.statusBar().showMessage(f"External MAVLink mission failed: {message}", 15000)
@@ -1049,6 +1198,14 @@ class MainWindow(QMainWindow):
         status line - "lane" for an area-coverage sweep, "slot" for a
         V-formation's apex/left/right tracks; the mechanism is identical."""
         routes = list(result.per_drone_waypoints.values())
+        # Set only for a formation plan (see PlanRunResult.per_drone_altitudes):
+        # each slot's fixed cruise altitude, same order as `routes` since both
+        # dicts are built from the same FORMATION_DRONES tuple.
+        altitudes = (
+            list(result.per_drone_altitudes.values())
+            if result.per_drone_altitudes is not None
+            else None
+        )
         if len(drones) < len(routes):
             self.mission_planner.set_status(
                 f"Plan '{result.plan_name}' needs {len(routes)} drone(s), "
@@ -1085,10 +1242,31 @@ class MainWindow(QMainWindow):
         self.fault_injection.update_active_sysids([d.sysid for d, _ in cleared_assignments])
         self.map_viewer.clear_paths()
 
-        if not self.thread_sim.start_mission_paths(cleared_assignments):
+        if altitudes is not None:
+            # Formation mission: every drone lifts off from the one shared
+            # launch point (the apex route's source - the point the operator
+            # picked), apex first, then each wing in turn once the one ahead
+            # has climbed out to its own slot, each holding its own fixed
+            # slot altitude - see
+            # ThreadSwarmBackend.start_formation_mission.
+            altitude_by_sysid = {d.sysid: a for (d, _r), a in zip(assignments, altitudes)}
+            formation_assignments = [
+                (d, r, altitude_by_sysid[d.sysid]) for d, r in cleared_assignments
+            ]
+            started = self.thread_sim.start_formation_mission(
+                formation_assignments, launch_point=routes[0][0],
+            )
+        else:
+            started = self.thread_sim.start_mission_paths(cleared_assignments)
+
+        if not started:
             self.drone_management.set_running(False)
             self.statusBar().showMessage("Could not start drone nodes for the planned mission - see the log.")
             return
+
+        # SearchStatsConsole's recurring per-drone stats block is deliberately
+        # not started here either - see the matching note in
+        # _start_area_coverage_external_mavlink.
 
         self.mission_planner.set_status(
             f"Flying plan '{result.plan_name}' - {len(cleared_assignments)} drone(s), "
@@ -1118,6 +1296,7 @@ class MainWindow(QMainWindow):
         self.map_viewer.update_drones(batch.drones)
         self.flight_log.log_batch(self._glide_matched_telemetry(batch.drones))
         self.fault_injection.update_active_sysids([d.sysid for d in batch.drones])
+        self.search_stats.update(batch)
 
     def _glide_matched_telemetry(self, drones: list) -> list:
         """The Flight Log reads the same glide-smoothed lat/lon/altitude the

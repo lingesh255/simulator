@@ -159,15 +159,23 @@ def main() -> None:
 
     def start_flight() -> None:
         nonlocal pos_lat, pos_lon, pos_alt, leg_index, flying
-        if args.home is not None:
-            pos_lat, pos_lon = args.home
-        elif len(mission) > 1:
-            pos_lat, pos_lon = mission[1][0], mission[1][1]
-            print("  (no --home given - starting at the first real waypoint instead of the true source)")
-        pos_alt = 0.0
+        if pos_alt <= 0.0:
+            # A genuine fresh launch from the ground.
+            if args.home is not None:
+                pos_lat, pos_lon = args.home
+            elif len(mission) > 1:
+                pos_lat, pos_lon = mission[1][0], mission[1][1]
+                print("  (no --home given - starting at the first real waypoint instead of the true source)")
+            pos_alt = 0.0
+            print(f" airborne at ({pos_lat:.6f}, {pos_lon:.6f}) - flying {len(mission)} item(s)")
+        else:
+            # Already airborne - e.g. released from a MAV_CMD_NAV_LOITER_UNLIM
+            # hold with a freshly uploaded real-route mission (see
+            # services.mavlink_swarm_flight_service's staggered V-formation
+            # launch). Pick up from here, not a fresh ground-up climb.
+            print(f" continuing from ({pos_lat:.6f}, {pos_lon:.6f}) at {pos_alt:.1f}m - flying {len(mission)} item(s)")
         leg_index = 0
         flying = True
-        print(f" airborne at ({pos_lat:.6f}, {pos_lon:.6f}) - flying {len(mission)} item(s)")
 
     while True:
         now = time.monotonic()
@@ -189,6 +197,11 @@ def main() -> None:
                     pos_alt = min(climb_target_alt, pos_alt + CLIMB_RATE_MPS * dt)
                 else:
                     leg_index = 1
+            elif leg_index >= len(mission):
+                # Mission fully consumed by a non-landing final item (see
+                # below) - just hold here, armed, streaming telemetry, until
+                # a new MISSION_COUNT/DO_SET_MODE(AUTO) picks it back up.
+                pass
             else:
                 target_lat, target_lon, target_alt, target_name = mission[leg_index]
                 remaining = _haversine_m(pos_lat, pos_lon, target_lat, target_lon)
@@ -197,9 +210,15 @@ def main() -> None:
                     print(f"  reached waypoint {leg_index}/{len(mission) - 1}  [{target_name}]")
                     leg_index += 1
                     if leg_index >= len(mission):
-                        flying = False
-                        armed = False
-                        print("  mission complete - disarmed")
+                        if target_name == "MAV_CMD_NAV_LAND":
+                            flying = False
+                            armed = False
+                            print("  mission complete - disarmed")
+                        else:
+                            # e.g. MAV_CMD_NAV_LOITER_UNLIM - hold in place,
+                            # armed, rather than disarming: this mission was
+                            # deliberately not a landing, so stay up and wait.
+                            print(f"  holding at ({pos_lat:.6f}, {pos_lon:.6f}) - {target_name}, awaiting next mission")
                 else:
                     step = CRUISE_SPEED_MPS * dt
                     fraction = min(1.0, step / remaining)

@@ -27,20 +27,32 @@ def build_mission_items(
     target_component: int,
     waypoints: list[tuple[float, float]],
     altitude_m: float,
+    *,
+    final_command: Optional[int] = None,
 ):
-    """[(lat, lon), ...] -> MISSION_ITEM_INT messages: TAKEOFF, WAYPOINT x N, LAND.
+    """[(lat, lon), ...] -> MISSION_ITEM_INT messages: TAKEOFF, WAYPOINT x N, <final>.
 
     Mirrors the shape ArduPilot expects for a normal auto mission: item 0 is
     a takeoff (climbs from wherever the vehicle currently is - lat/lon are
     unused for it), every point in between is an ordinary waypoint, and the
-    last point is a landing rather than just another waypoint. Intermediate
-    points are exactly the route the PDDL planner worked out - including any
-    detour it planned around a restricted area - so flying them in order
-    clears that area by construction; nothing here re-checks it.
+    last point carries `final_command` (default `MAV_CMD_NAV_LAND`) rather
+    than just another waypoint. Intermediate points are exactly the route
+    the PDDL planner worked out - including any detour it planned around a
+    restricted area - so flying them in order clears that area by
+    construction; nothing here re-checks it.
+
+    `final_command` other than `MAV_CMD_NAV_LAND` - e.g.
+    `MAV_CMD_NAV_LOITER_UNLIM` to hold there instead of landing - keeps
+    `altitude_m` for that item instead of the 0.0 a landing needs; see
+    `scripts/pddl_vformation_to_mavlink.py`'s staggered V-formation launch,
+    which flies a `[home, home]` "route" with this to make a drone climb
+    then hold in place over its own launch point, real MAVLink command and
+    all, rather than land there.
     """
     if len(waypoints) < 2:
         raise ValueError("need at least a source and a destination")
 
+    last_command = mav2.MAV_CMD_NAV_LAND if final_command is None else final_command
     items = [
         mav.mission_item_int_encode(
             target_system, target_component,
@@ -55,15 +67,17 @@ def build_mission_items(
     last_seq = len(waypoints) - 1
     for seq, (lat, lon) in enumerate(waypoints[1:], start=1):
         is_final = seq == last_seq
+        command = last_command if is_final else mav2.MAV_CMD_NAV_WAYPOINT
+        item_alt = 0.0 if (is_final and command == mav2.MAV_CMD_NAV_LAND) else altitude_m
         items.append(
             mav.mission_item_int_encode(
                 target_system, target_component,
                 seq,
                 mav2.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                mav2.MAV_CMD_NAV_LAND if is_final else mav2.MAV_CMD_NAV_WAYPOINT,
+                command,
                 0, 1,
                 0, 0, 0, 0,
-                int(lat * 1e7), int(lon * 1e7), 0.0 if is_final else altitude_m,
+                int(lat * 1e7), int(lon * 1e7), item_alt,
             )
         )
     return items
@@ -88,6 +102,7 @@ def upload_and_fly(
     on_progress: Optional[Callable[[str], None]] = None,
     should_abort: Optional[Callable[[], bool]] = None,
     on_message: Optional[Callable[[object], None]] = None,
+    final_command: Optional[int] = None,
 ) -> None:
     """Connect, upload the route as one mission, arm, fly it, and return once
     the final waypoint is reached.
@@ -105,6 +120,14 @@ def upload_and_fly(
     a caller (e.g. `services.mavlink_flight_service`) drives a live map
     marker from the real vehicle's own telemetry instead of just knowing
     when the mission starts and ends.
+
+    `final_command` is passed straight through to `build_mission_items` -
+    pass `MAV_CMD_NAV_LOITER_UNLIM` with a `[home, home]` "route" to climb
+    and then hold in place (this call returns once the loiter item, at the
+    same point as the takeoff, is immediately "reached") instead of landing;
+    see `services.mavlink_swarm_flight_service`'s staggered V-formation
+    launch, which calls this twice per drone - once to climb-and-hold, once
+    (after every drone in the formation has) for the real route.
     """
     report = on_progress or (lambda _msg: None)
     aborted = should_abort or (lambda: False)
@@ -118,7 +141,8 @@ def upload_and_fly(
     report(f"Heartbeat OK - system {master.target_system}, component {master.target_component}.")
 
     items = build_mission_items(
-        master.mav, master.target_system, master.target_component, waypoints, altitude_m
+        master.mav, master.target_system, master.target_component, waypoints, altitude_m,
+        final_command=final_command,
     )
 
     master.mav.mission_clear_all_send(master.target_system, master.target_component)

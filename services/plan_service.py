@@ -70,7 +70,10 @@ def _area_drone_names(count: int) -> list[str]:
     `engine.search_problem.expand_search_drones` names them."""
     return [f"drone{i}" for i in range(1, max(MIN_AREA_COVERAGE_DRONES, count) + 1)]
 
-# Drone objects the vformation problem template fixes, apex first.
+# Drone objects the vformation problem template fixes, apex first. This is
+# also the launch order the executor stages takeoff in (see
+# `services.thread_backend.ThreadSwarmBackend.start_formation_mission`): the
+# lead departs alone first, then the left wing, then the right wing.
 FORMATION_DRONES = ("drone-lead", "drone-left", "drone-right")
 # The V's shape, in metres: each wing sits this far behind its apex slot and
 # this far out to its side - together putting the leader and both wings at
@@ -83,6 +86,22 @@ FORMATION_DRONES = ("drone-lead", "drone-left", "drone-right")
 # the apex's actual flown path, not the problem's numeric fluents).
 FORMATION_BACK_M = 17.320508
 FORMATION_SIDE_M = 10.0
+
+# Per-slot cruise altitude, metres - fixed, not terrain-derived (see
+# `_run_formation`/`ThreadSwarmBackend.start_formation_mission`): the lead
+# climbs highest so the two wings, ~17 m behind and to either side, hold
+# station below and clear of its rotor wash/wake.
+FORMATION_LEAD_ALTITUDE_M = 60.0
+FORMATION_WING_ALTITUDE_M = 55.0
+FORMATION_ALTITUDES = (
+    FORMATION_LEAD_ALTITUDE_M, FORMATION_WING_ALTITUDE_M, FORMATION_WING_ALTITUDE_M
+)
+
+# Seconds between one drone's launch and the next's, apex first - a real
+# gap in flight time (scaled by the backend's own time_scale, same as every
+# other duration in the sim), not a PDDL-planned delay: see the module
+# docstring and `ThreadSwarmBackend.start_formation_mission`.
+FORMATION_LAUNCH_STAGGER_S = 6.0
 
 # Domain name (as written in `(define (domain NAME) ...)`) -> plan kind.
 # Anything not listed here defaults to "point_to_point" - the shape every
@@ -144,6 +163,11 @@ class PlanRunResult:
     # route. `None` for an ordinary point-to-point plan, where `waypoints`
     # above is the (single, shared) route every checked drone flies.
     per_drone_waypoints: Optional[dict[str, list[LatLon]]] = None
+    # Set only for a formation plan: each `FORMATION_DRONES` name mapped to
+    # its fixed cruise altitude (metres) - see `FORMATION_ALTITUDES`. `None`
+    # for every other plan kind, which derives altitude from terrain instead
+    # (see `engine.terrain.plan_terrain_profile`).
+    per_drone_altitudes: Optional[dict[str, float]] = None
 
 
 class _Worker(QObject):
@@ -314,6 +338,7 @@ class _Worker(QObject):
         per_drone_waypoints = dict(
             zip(FORMATION_DRONES, (_as_gui(lead_route), _as_gui(left_route), _as_gui(right_route)))
         )
+        per_drone_altitudes = dict(zip(FORMATION_DRONES, FORMATION_ALTITUDES))
 
         return PlanRunResult(
             plan_name=plan_name,
@@ -322,6 +347,7 @@ class _Worker(QObject):
             location_names=corridor,
             run_dir=run_dir,
             per_drone_waypoints=per_drone_waypoints,
+            per_drone_altitudes=per_drone_altitudes,
         )
 
     def _run_area(
