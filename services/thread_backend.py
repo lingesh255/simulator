@@ -27,7 +27,6 @@ from contracts.gui_orchestration import (
 from engine.drone_link import DroneLink
 from engine.drone_thread import (
     ARRIVAL_RADIUS_M,
-    CRITICAL_BATTERY_PCT,
     LOW_BATTERY_PCT,
     DroneSnapshot,
     HealthStatus,

@@ -77,6 +77,34 @@ class MapViewer(QWidget):
         self.mode_combo.addItems(
             ["View", "Set Start Point", "Set Destination Point", "Set Restricted Area", "Set Forest Area"]
         )
+        # Per-item, not a tooltip on the whole combo: only "Set Start
+        # Point" needs the caveat. engine/mavlink_mission.py's
+        # build_mission_items() never uploads this click to a real
+        # vehicle as a live in-flight command (the TAKEOFF item's lat/lon
+        # are unused, and the point itself is skipped) - a real vehicle
+        # always takes off from wherever it physically already is. For
+        # Renode specifically, MainWindow closes that gap a different
+        # way, confirmed working by a real validation flight (Canberra ->
+        # Sydney, ~250km, renode_firmware_guide.md §4.9.1): if this click
+        # doesn't match wherever Renode currently is, starting the
+        # mission relaunches Renode there FIRST (a fresh boot, not a live
+        # move - RenodeLauncher.start()'s latitude_deg/longitude_deg and
+        # MainWindow._renode_location_matches()), so the vehicle
+        # genuinely does end up here, just with that one-time cost. Real
+        # external hardware (not Renode) has no such option - a physical
+        # vehicle can't be relocated by a click at all. Destination IS
+        # always real either way - it becomes the mission's actual
+        # landing target, with no relaunch ever needed for it.
+        self.mode_combo.setItemData(
+            self.mode_combo.findText("Set Start Point"),
+            "Used for route planning. For Renode: if this differs from "
+            "Renode's current location, starting the mission relaunches "
+            "Renode there first (a fresh boot, ~75-160s) before the "
+            "vehicle can take off from here. For real external hardware "
+            "(not Renode), this has no effect - a physical vehicle can't "
+            "be relocated by a click.",
+            Qt.ToolTipRole,
+        )
 
         self.offline_check = QCheckBox("Offline mode (use cached tiles only)")
         self.offline_check.toggled.connect(self._on_offline_toggled)
@@ -143,6 +171,10 @@ class MapViewer(QWidget):
         region_layout.addWidget(self.set_region_btn)
         region_layout.addWidget(self.cache_region_btn)
 
+        self._cache_timer = QTimer(self)
+        self._cache_timer.timeout.connect(self._cache_next_tile_point)
+        self._cache_queue: list[tuple[float, float]] = []
+
         # The map gets the whole central area; the region controls are docked
         # full-width by the main window.
         layout = QVBoxLayout(self)
@@ -152,10 +184,6 @@ class MapViewer(QWidget):
     def region_panel(self) -> QGroupBox:
         """The Working Area group box, for the main window to dock full-width."""
         return self.region_group
-
-        self._cache_timer = QTimer(self)
-        self._cache_timer.timeout.connect(self._cache_next_tile_point)
-        self._cache_queue: list[tuple[float, float]] = []
 
     def eventFilter(self, watched, event):
         """Force a full repaint of the QML surface whenever it is resized, so a
@@ -261,6 +289,18 @@ class MapViewer(QWidget):
             return
         lat, lon = self._cache_queue.pop(0)
         self._root_object.panTo(lat, lon, 12)
+
+    def pan_to(self, lat: float, lon: float, zoom: float | None = None) -> None:
+        """Recenter the map on `(lat, lon)` - `zoom`, if given, also sets the
+        zoom level. Needed for any real vehicle whose actual position isn't
+        wherever the user last clicked/panned to plan a route (a real
+        Renode/ArduPilot vehicle's GPS reports its own true physical
+        location, fixed independently of whatever mission was uploaded to
+        it) - without this, its telemetry updates the drone model correctly
+        but the marker renders far outside the current viewport, silently
+        invisible rather than "not working"."""
+        if self._root_object is not None:
+            self._root_object.panTo(lat, lon, zoom)
 
     # ---- Live telemetry ----
 

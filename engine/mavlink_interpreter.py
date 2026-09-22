@@ -22,7 +22,6 @@ simulated firmware or an actual ArduPilot over UDP is not this layer's concern.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from pymavlink.dialects.v20 import ardupilotmega as mav2
 

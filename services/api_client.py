@@ -14,7 +14,6 @@ from PySide6.QtNetwork import QUdpSocket, QHostAddress
 from contracts.gui_orchestration import (
     DroneConfig,
     FlockCommand,
-    LatLon,
     SwarmTelemetryBatch,
     UdpTelemetryPayload,
     IsrCommandPayload,

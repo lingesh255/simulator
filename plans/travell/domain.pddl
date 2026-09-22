@@ -8,10 +8,7 @@
         :conditional-effects
     )
 
-    ;; ============================================================
-    ;; TYPES
-    ;; ============================================================
-
+    ;; Types used in the mission
     (:types
         drone
         location
@@ -19,11 +16,7 @@
         controller
     )
 
-
-    ;; ============================================================
-    ;; PREDICATES
-    ;; ============================================================
-
+    ;; Facts that describe the drone and mission state
     (:predicates
 
         ;; Drone position
@@ -36,16 +29,12 @@
         ;; Waypoint information
         (waypoint-location ?w - waypoint ?l - location)
 
-        ;; Route connectivity
+        ;; Route information
         (connected ?from - location ?to - location)
-
-        ;; Safe route
-        (safe-route ?from - location ?to - location) 
-
-        ;; Restricted / no-fly route
+        (safe-route ?from - location ?to - location)
         (restricted-route ?from - location ?to - location)
 
-        ;; Drone states
+        ;; Drone state
         (flying ?d - drone)
         (hovering ?d - drone)
         (mission-completed ?d - drone)
@@ -55,80 +44,68 @@
         (communication-ok ?d - drone)
         (drone-healthy ?d - drone)
 
-        ;; Fault states
+        ;; Failure states
         (gps-lost ?d - drone)
         (communication-lost ?d - drone)
         (health-failure ?d - drone)
 
-        ;; Ground-controller interaction
+        ;; Controller commands and status
         (controller-notified ?d - drone)
         (controller-return ?d - drone)
         (controller-hover ?d - drone)
         (controller-sacrifice ?d - drone)
 
-        ;; Notifications
+        ;; Warning messages
         (battery-insufficient ?d - drone)
         (health-warning ?d - drone)
         (gps-warning ?d - drone)
         (communication-warning ?d - drone)
 
-        ;; Emergency state
+        ;; Emergency states
         (emergency-return ?d - drone)
-        (sacrificed ?d - drone) 
+        (sacrificed ?d - drone)
 
-        ;; Restricted area information
+        ;; Restricted area
         (no-fly-zone ?w - waypoint)
 
-        ;; Mission validity
+        ;; Mission checks
         (route-planned ?d - drone)
         (distance-checked ?d - drone)
         (battery-checked ?d - drone)
     )
 
-
-    ;; ============================================================
-    ;; NUMERIC FUNCTIONS
-    ;; ============================================================
-
+    ;; Numeric values used by the planner
     (:functions
 
-        ;; Battery percentage
+        ;; Battery information
         (battery ?d - drone)
-
-        ;; Maximum battery capacity
         (max-battery ?d - drone)
 
-        ;; Battery required for a route
+        ;; Energy needed for a route
         (energy-required ?from - location ?to - location)
 
-        ;; Distance between locations in meters
+        ;; Distance between two locations
         (distance ?from - location ?to - location)
 
-        ;; Drone health percentage
+        ;; Drone health
         (health ?d - drone)
-
-        ;; Minimum health required for normal operation
         (minimum-health ?d - drone)
 
-        ;; Minimum battery required for emergency return
+        ;; Battery needed for emergency return
         (minimum-return-battery ?d - drone)
 
-        ;; Hover battery consumption
+        ;; Battery used while hovering
         (hover-energy ?d - drone)
 
-        ;; Current route energy consumption
+        ;; Energy used by the current route
         (route-energy ?d - drone)
 
-        ;; Latitude and longitude
+        ;; Location coordinates
         (latitude ?l - location)
         (longitude ?l - location)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 1: CHECK DISTANCE
-    ;; ============================================================
-
+    ;; Check the distance before planning the route
     (:action check-distance
 
         :parameters
@@ -146,11 +123,7 @@
             (distance-checked ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 2: CHECK BATTERY
-    ;; ============================================================
-
+    ;; Check whether the drone has enough battery
     (:action check-battery
 
         :parameters
@@ -170,11 +143,7 @@
             (battery-checked ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 3: NOTIFY INSUFFICIENT BATTERY
-    ;; ============================================================
-
+    ;; Record that the battery is not enough
     (:action notify-insufficient-battery
 
         :parameters
@@ -194,11 +163,7 @@
             (battery-insufficient ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 4: PLAN SAFE ROUTE
-    ;; ============================================================
-
+    ;; Create a route only when all safety checks pass
     (:action plan-safe-route
 
         :parameters
@@ -221,11 +186,7 @@
             (route-planned ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 5: TRAVEL
-    ;; ============================================================
-
+    ;; Move the drone and reduce its battery
     (:action travel
 
         :parameters
@@ -248,29 +209,25 @@
         :effect
             (and
 
-                ;; Move drone
+                ;; Move drone to the new location
                 (at ?d ?to)
                 (not (at ?d ?from))
 
-                ;; Drone is flying
+                ;; Drone is now flying
                 (flying ?d)
 
-                ;; Consume battery
+                ;; Reduce battery by route energy
                 (decrease
                     (battery ?d)
                     (energy-required ?from ?to)
                 )
 
-                ;; Remove old route plan
+                ;; Route must be planned again for the next move
                 (not (route-planned ?d))
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 6: REACH DESTINATION
-    ;; ============================================================
-
+    ;; Complete the mission when the destination is reached
     (:action reach-destination
 
         :parameters
@@ -290,11 +247,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 7: GPS FAILURE
-    ;; ============================================================
-
+    ;; Detect a GPS failure during flight
     (:action detect-gps-loss
 
         :parameters
@@ -314,11 +267,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 8: COMMUNICATION FAILURE
-    ;; ============================================================
-
+    ;; Detect a communication failure during flight
     (:action detect-communication-loss
 
         :parameters
@@ -338,11 +287,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 9: HEALTH FAILURE
-    ;; ============================================================
-
+    ;; Detect when drone health becomes too low
     (:action detect-health-failure
 
         :parameters
@@ -363,11 +308,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 10: NOTIFY GROUND CONTROLLER
-    ;; ============================================================
-
+    ;; Inform the ground controller about a failure
     (:action notify-ground-controller
 
         :parameters
@@ -385,11 +326,7 @@
             (controller-notified ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 11: GROUND CONTROLLER SAYS RETURN
-    ;; ============================================================
-
+    ;; Follow the controller's return command
     (:action controller-order-return
 
         :parameters
@@ -405,11 +342,7 @@
             (emergency-return ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 12: RETURN TO SOURCE
-    ;; ============================================================
-
+    ;; Return the drone safely to the source
     (:action return-to-source
 
         :parameters
@@ -440,11 +373,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 13: CONTROLLER SAYS HOVER
-    ;; ============================================================
-
+    ;; Follow the controller's hover command
     (:action controller-order-hover
 
         :parameters
@@ -460,11 +389,7 @@
             (hovering ?d)
     )
 
-
-    ;; ============================================================
-    ;; ACTION 14: HOVER
-    ;; ============================================================
-
+    ;; Keep the drone hovering while enough battery remains
     (:action hover
 
         :parameters
@@ -484,11 +409,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 15: BATTERY REACHES RETURN LEVEL
-    ;; ============================================================
-
+    ;; Start emergency return when battery becomes low
     (:action initiate-low-battery-return
 
         :parameters
@@ -508,11 +429,7 @@
             )
     )
 
-
-    ;; ============================================================
-    ;; ACTION 16: SACRIFICE / EMERGENCY LANDING
-    ;; ============================================================
-
+    ;; Emergency landing when the controller orders sacrifice
     (:action sacrifice-drone
 
         :parameters
@@ -533,4 +450,3 @@
     )
 
 )
-
