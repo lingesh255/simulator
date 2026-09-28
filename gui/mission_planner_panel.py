@@ -39,6 +39,10 @@ class MissionPlannerPanel(QWidget):
     plan_requested = Signal(str)  # plan name
     renode_launch_requested = Signal(str)  # standalone folder path
 
+    CONNECTION_PLACEHOLDER = (
+        "Empty = Renode (Plan Mission launches it), or e.g. udp:127.0.0.1:14550 for your own SITL"
+    )
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -66,8 +70,10 @@ class MissionPlannerPanel(QWidget):
             "Unchecked (default): fly using this app's own in-process drone-thread "
             "pipeline - works with no extra setup.\n"
             "Checked: instead upload the planned route as one real MAVLink mission "
-            "to the connection string below and fly it there - needs an actual "
-            "ArduPilot/PX4 (SITL or hardware) already listening, or the mission "
+            "and fly it there. With Connect left empty, Plan Mission launches "
+            "Renode at your Start point itself (a fresh boot, ~75-160s) and flies "
+            "once it's ready. With your own SITL/hardware address typed into "
+            "Connect, that vehicle must already be listening, or the mission "
             "fails immediately rather than hanging."
         )
         self.external_mavlink_check.toggled.connect(self._on_external_mavlink_toggled)
@@ -84,15 +90,15 @@ class MissionPlannerPanel(QWidget):
         # for that case - so this doesn't newly need any error handling of
         # its own, it just stops silently offering a wrong-looking default.
         self.mavlink_connection_edit = QLineEdit()
-        self.mavlink_connection_edit.setPlaceholderText(
-            "udp:127.0.0.1:14550 (SITL/mock convention - not used if launching Renode below)"
-        )
+        self.mavlink_connection_edit.setPlaceholderText(self.CONNECTION_PLACEHOLDER)
         self.mavlink_connection_edit.setEnabled(False)
         self.mavlink_connection_edit.setToolTip(
-            "pymavlink connection string. Renode always fills this in itself "
-            "(tcp:127.0.0.1:5762) once launched below - only type here "
-            "yourself for a real SITL/hardware connection instead, e.g. "
-            "udp:127.0.0.1:14550 for ArduPilot SITL's default output."
+            "pymavlink connection string. Leave it empty to fly Renode: Plan "
+            "Mission launches Renode at your Start point and fills this in "
+            "itself (tcp:127.0.0.1:5762) once it's ready. Type your own address "
+            "only for a SITL/hardware vehicle you started yourself, e.g. "
+            "udp:127.0.0.1:14550 for ArduPilot SITL's default output - that "
+            "skips the Renode launch entirely."
         )
         connection_row = QHBoxLayout()
         connection_row.addWidget(QLabel("Connect:"))
@@ -232,17 +238,36 @@ class MissionPlannerPanel(QWidget):
         self._update_mock_vehicle_gating()
         self._update_renode_launch_gating()
 
+    @property
+    def renode_ready(self) -> bool:
+        return self._renode_ready
+
+    @property
+    def renode_launch_in_progress(self) -> bool:
+        return self._renode_launch_in_progress
+
     def _update_plan_gating(self) -> None:
-        """"Plan Mission" and the plan combo require a live, ready
-        connection whenever real MAVLink is the selected path - clicking
-        Plan Mission before Renode has finished booting produced a real,
-        confusing "No heartbeat" failure previously; this prevents that at
-        the UI level instead of relying on the user to wait for a status
-        message. Enabled-state only - see set_renode_ready()'s docstring
-        for why this doesn't also set a status message."""
-        needs_renode = self.external_mavlink_check.isChecked() and not self._renode_ready
-        self.plan_btn.setEnabled(not needs_renode)
-        self.plan_combo.setEnabled(not needs_renode)
+        """"Plan Mission" and the plan combo no longer wait for Renode to be
+        ready: MainWindow launches (or relaunches) Renode at the mission's
+        Start point itself once the plan is solved - see
+        MainWindow._start_external_mavlink_mission(). Under real MAVLink they
+        are blocked only while a mission is flying (a second one would
+        collide with it or with its post-flight relaunch) or while a Renode
+        launch is already in progress (RenodeLaunchService rejects a second
+        launch until the first settles). Enabled-state and tooltip only -
+        see set_renode_ready()'s docstring for why this doesn't also set a
+        status message."""
+        if not self.external_mavlink_check.isChecked():
+            blocked_reason = ""
+        elif self._mission_active:
+            blocked_reason = "A mission is flying - wait for it to finish (or Stop it) first."
+        elif self._renode_launch_in_progress:
+            blocked_reason = "Renode is launching - wait for it to finish booting first."
+        else:
+            blocked_reason = ""
+        self.plan_btn.setEnabled(not blocked_reason)
+        self.plan_combo.setEnabled(not blocked_reason)
+        self.plan_btn.setToolTip(blocked_reason)
 
     def set_drone_selected(self, selected: bool) -> None:
         """Called by MainWindow via DroneManagementPanel.selection_changed
@@ -261,6 +286,7 @@ class MissionPlannerPanel(QWidget):
         _mission_active's own comment in __init__ for why this has to be
         a separate flag from _renode_ready rather than reusing it."""
         self._mission_active = active
+        self._update_plan_gating()
         self._update_renode_launch_gating()
 
     def _update_renode_launch_gating(self) -> None:
@@ -300,7 +326,11 @@ class MissionPlannerPanel(QWidget):
             )
         else:
             self.renode_launch_btn.setEnabled(True)
-            self.renode_launch_btn.setToolTip("")
+            self.renode_launch_btn.setToolTip(
+                "Optional pre-warm - Plan Mission launches Renode itself at your "
+                "Start point. Use this to boot it ahead of time at the current "
+                "location; a Start point more than ~100 m away still relaunches it."
+            )
 
     def _update_mock_vehicle_gating(self) -> None:
         """Mirror of _update_renode_launch_gating()'s exclusivity (Part
@@ -336,7 +366,10 @@ class MissionPlannerPanel(QWidget):
         if not checked:
             self.mock_vehicle_check.setChecked(False)
         elif not self._renode_ready:
-            self.set_status("Launch Renode below, then plan a mission once it's ready.")
+            self.set_status(
+                "Real MAVLink selected - click Plan Mission and Renode launches at your "
+                "Start point automatically (or click Launch Renode below to pre-warm it)."
+            )
 
     def _on_renode_launch_clicked(self) -> None:
         # A re-launch (e.g. after the previous instance was closed) must
@@ -353,6 +386,7 @@ class MissionPlannerPanel(QWidget):
         # actually expects to see (a busy button, not a click that
         # silently does nothing).
         self._renode_launch_in_progress = True
+        self._update_plan_gating()
         self._update_mock_vehicle_gating()
         self._update_renode_launch_gating()
         # The auto-fill on ready already sets the real text - this just
