@@ -1218,10 +1218,10 @@ class MainWindow(QMainWindow):
                     f"{len(drones) - len(routes)} checked drone(s) have no route in this plan and sit it out."
                 )
         else:
-            assignments = [
+            assignments = self._separate_spawns([
                 (drone, offset_route(result.waypoints, i * SHARED_ROUTE_SPACING_M))
                 for i, drone in enumerate(drones)
-            ]
+            ])
 
         # A single-drone Renode (ready or booting) would be killed by the
         # fleet's kill-all anyway - stop it cleanly and forget it.
@@ -1250,20 +1250,33 @@ class MainWindow(QMainWindow):
         self._plan_source = None
         self.fleet.start(assignments, panel.renode_dir_edit.text().strip())
 
-    SPAWN_MIN_SEPARATION_M = 10.0
+    # One threshold for every plan, spawns and landings alike: only points
+    # that (nearly) coincide get moved - shared endpoints such as a travell
+    # destination or the Search base (~0 m apart) - while V and grid slots
+    # keep their designed spacing. The project spec's formation row asks
+    # for at least 2 m between drones; 5 m leaves margin for the 0-2.4 m
+    # landing error seen in testing.
+    SPAWN_MIN_SEPARATION_M = 5.0
 
     def _separate_spawns(self, assignments: list) -> list:
-        """Per-drone routes (Search lanes, formation slots) can start on the
-        same spot - every Search lane starts at the shared base. A drone whose
-        start is within SPAWN_MIN_SEPARATION_M of an earlier drone's gets its
-        spawn point - and so the start of its first leg - moved east in
-        SHARED_ROUTE_SPACING_M steps until it's clear. The rest of its route
-        is unchanged."""
+        """No two drones may spawn or land within SPAWN_MIN_SEPARATION_M of
+        each other. Per-drone routes can share both ends - every Search lane
+        starts and ends at the one base - so a drone whose start is too close
+        to an earlier drone's gets its spawn (the start of its first leg)
+        moved east in SHARED_ROUTE_SPACING_M steps until it's clear, and one
+        whose landing point is too close gets its LAND point (the end of its
+        final leg) moved east by the same number of steps as its spawn, or
+        more if still needed. Everything in between is unchanged, and every
+        move is logged. Routes already apart (travell's shifted copies, V
+        wings, grid cells) are left as they are."""
         separated = []
+
+        def clear(point, index):
+            return all(haversine_m(point, route[index]) >= self.SPAWN_MIN_SEPARATION_M for _, route in separated)
+
         for drone, route in assignments:
-            start = route[0]
-            steps = 0
-            while any(haversine_m(start, s) < self.SPAWN_MIN_SEPARATION_M for _, (s, *_) in separated):
+            start, steps = route[0], 0
+            while not clear(start, 0):
                 steps += 1
                 start = offset_route([route[0]], steps * SHARED_ROUTE_SPACING_M)[0]
             if steps:
@@ -1272,7 +1285,20 @@ class MainWindow(QMainWindow):
                     f"another drone's - spawn and first leg moved {steps * SHARED_ROUTE_SPACING_M:.0f} m east "
                     f"to ({start.lat:.6f}, {start.lon:.6f})."
                 )
-            separated.append((drone, [start, *route[1:]]))
+            end = route[-1]
+            land_steps = steps if not clear(end, -1) else 0
+            if land_steps:
+                end = offset_route([route[-1]], land_steps * SHARED_ROUTE_SPACING_M)[0]
+            while not clear(end, -1):
+                land_steps += 1
+                end = offset_route([route[-1]], land_steps * SHARED_ROUTE_SPACING_M)[0]
+            if land_steps:
+                self.flight_log.log_event(
+                    f"{drone.name} (SYSID {drone.sysid}): landing point is within {self.SPAWN_MIN_SEPARATION_M:.0f} m "
+                    f"of another drone's - LAND point and final leg moved {land_steps * SHARED_ROUTE_SPACING_M:.0f} m "
+                    f"east to ({end.lat:.6f}, {end.lon:.6f})."
+                )
+            separated.append((drone, [start, *route[1:-1], end]))
         return separated
 
     def _on_fleet_progress(self, message: str) -> None:

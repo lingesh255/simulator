@@ -45,7 +45,20 @@ the window at the end. Needs a display.
 | `fleet_kill2` | 3 drones, drone 2's Renode killed (SIGKILL) once all are above 20 m |
 | `fleet_dupsysid` | adds a temporary profile sharing SYSID 1, expects the fleet to be refused, removes it |
 
-Fleet scenarios live in `fleet_scenarios.py`.
+Fleet scenarios live in `fleet_scenarios.py`. `fleet_vform3` flies a
+3-drone V-formation and `fleet_grid4` a 4-drone grid (it adds a temporary D4
+profile, SYSID 4, and removes it afterwards).
+
+To run several scenarios back to back - clearing Renode before each,
+printing the exit code and pgrep after each, and running `fleet_grid4` only
+with at least 10 GiB available:
+
+```bash
+tests/harness/regression.sh s9e baseline fleet_travell3 fleet_search3 fleet_stop3 fleet_bootfail3
+```
+
+Each scenario's log lands in `tests/harness/out/<prefix>_<scenario>.out`.
+It can run detached (`nohup setsid ... &`) so it survives the terminal.
 
 ## Headless checks
 
