@@ -43,6 +43,7 @@ from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import MIN_GRID_DRONES, PlanRunResult, PlanService, plan_kind
 from services.plan_service import PlanRunResult, PlanService, plan_kind
+from services.fleet_mission import SHARED_ROUTE_SPACING_M, FleetMission, offset_route
 from services.renode_launch_service import RenodeLaunchService
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
@@ -122,6 +123,10 @@ class MainWindow(QMainWindow):
         # existing "Fly via real MAVLink" field - mavlink_flight above then
         # consumes it completely unchanged.
         self.renode_launch = RenodeLaunchService(self)
+        # Two or more drones with Renode as the vehicle fly as a fleet: one
+        # Renode instance, MAVLink connection and mission per drone (see
+        # _start_fleet_mission). One drone keeps the single-instance path.
+        self.fleet = FleetMission(self)
         # Where the CURRENTLY booted-or-booting Renode instance's vehicle
         # actually spawns - defaults to RenodeLauncher's own confirmed
         # Canberra default, matching a manual "Launch Renode" click's
@@ -412,6 +417,11 @@ class MainWindow(QMainWindow):
         self.renode_launch.failed.connect(lambda _msg: self.mission_planner.set_renode_ready(False))
         self.renode_launch.failed.connect(self._on_renode_launch_failed)
         self.renode_launch.ready.connect(self._on_renode_ready)
+
+        self.fleet.batch_ready.connect(self._on_telemetry)
+        self.fleet.progress.connect(self._on_fleet_progress)
+        self.fleet.boot_failed.connect(self._on_fleet_boot_failed)
+        self.fleet.finished.connect(self._on_fleet_finished)
         self.drone_management.selection_changed.connect(self._on_drone_selection_changed)
         self._on_drone_selection_changed()
 
@@ -704,6 +714,7 @@ class MainWindow(QMainWindow):
         self._accepting_telemetry = False
         # A mission waiting on a Renode boot must not fly after Stop.
         self._pending_mavlink_mission = None
+        self.fleet.stop()
         self.flight_sim.stop()
         self.mavlink_flight.abort()
         self._stop_mock_vehicle()
@@ -976,6 +987,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Plan ready, but no drones are checked to fly it.")
             return
 
+        if self.mission_planner.use_external_mavlink() and len(drones) >= 2 and self._renode_is_vehicle():
+            self._start_fleet_mission(result, drones)
+            return
+
         if result.per_drone_waypoints is not None:
             if self._plan_kind in ("formation", "grid_formation"):
                 noun = "slot"
@@ -1095,9 +1110,7 @@ class MainWindow(QMainWindow):
         connection = panel.mavlink_connection_string()
         source = result.waypoints[0]  # the exact point this route was solved from
 
-        uses_renode = not panel.use_mock_vehicle() and (
-            not connection or connection == self._renode_connection
-        )
+        uses_renode = self._renode_is_vehicle()
         if not uses_renode:
             if not connection:
                 message = "Enter a MAVLink connection string first, e.g. udp:127.0.0.1:14550."
@@ -1166,6 +1179,109 @@ class MainWindow(QMainWindow):
         self._fly_external_mavlink_mission(
             result, drones, self._renode_connection or connection, uses_renode=True
         )
+
+    def _renode_is_vehicle(self) -> bool:
+        """Under real MAVLink, Renode is the vehicle unless the mock vehicle
+        is chosen or Connect holds an address the user typed themselves -
+        empty, or the address the last ready Renode reported, both mean
+        Renode."""
+        panel = self.mission_planner
+        connection = panel.mavlink_connection_string()
+        return not panel.use_mock_vehicle() and (not connection or connection == self._renode_connection)
+
+    def _start_fleet_mission(self, result: PlanRunResult, drones: list) -> None:
+        """Fly the plan with one Renode instance per checked drone (instance
+        = SYSID): each drone flies its own route from the plan
+        (per_drone_waypoints), or - for a plan with one shared route - that
+        route shifted SHARED_ROUTE_SPACING_M further east per drone, spawn
+        point included. Every instance is stopped once the fleet's flights
+        have all ended; the next Plan Mission boots a fresh fleet."""
+        panel = self.mission_planner
+        problem = FleetMission.validate(drones)
+        if problem is not None:
+            panel.set_status(f"Fleet not started: {problem}")
+            self.flight_log.log_event(f"Fleet not started: {problem}")
+            QMessageBox.information(self, "Cannot fly this fleet", problem)
+            return
+
+        if result.per_drone_waypoints is not None:
+            routes = list(result.per_drone_waypoints.values())
+            if len(drones) < len(routes):
+                message = (f"Plan '{result.plan_name}' needs {len(routes)} drone(s), "
+                           f"but only {len(drones)} are checked.")
+                panel.set_status(message)
+                self.statusBar().showMessage(message, 10000)
+                return
+            assignments = list(zip(drones, routes))
+            if len(drones) > len(routes):
+                self.flight_log.log_event(
+                    f"{len(drones) - len(routes)} checked drone(s) have no route in this plan and sit it out."
+                )
+        else:
+            assignments = [
+                (drone, offset_route(result.waypoints, i * SHARED_ROUTE_SPACING_M))
+                for i, drone in enumerate(drones)
+            ]
+
+        # A single-drone Renode (ready or booting) would be killed by the
+        # fleet's kill-all anyway - stop it cleanly and forget it.
+        self._pending_mavlink_mission = None
+        self.renode_launch.stop()
+        if panel.mavlink_connection_string() == self._renode_connection:
+            panel.mavlink_connection_edit.clear()  # that instance is gone
+        self._renode_connection = None
+        panel.set_renode_ready(False)
+        panel.set_mission_active(True)
+
+        self._accepting_telemetry = True
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([d.sysid for d, _ in assignments])
+        self.map_viewer.clear_drones()
+        self.map_viewer.clear_paths()
+        self.flight_log.log_event(
+            f"Fleet mission '{result.plan_name}': {len(assignments)} drone(s), one Renode instance each."
+        )
+        for drone, route in assignments:
+            self.flight_log.log_event(
+                f"    {drone.name} (SYSID {drone.sysid}): {len(route)} waypoint(s) from "
+                f"({route[0].lat:.6f}, {route[0].lon:.6f}) to ({route[-1].lat:.6f}, {route[-1].lon:.6f})"
+            )
+        self._pending_plan_name = None
+        self._plan_source = None
+        self.fleet.start(assignments, panel.renode_dir_edit.text().strip())
+
+    def _on_fleet_progress(self, message: str) -> None:
+        print(f"[fleet] {message}")
+        self.flight_log.log_event(message)
+        if self._accepting_telemetry:
+            self.mission_planner.set_status(message)
+
+    def _on_fleet_boot_failed(self, message: str) -> None:
+        text = f"Fleet launch failed: {message} - no mission was started."
+        print(f"[fleet] {text}")
+        self.flight_log.log_event(text)
+        self.mission_planner.set_status(text)
+        self.statusBar().showMessage(text, 15000)
+        self.mission_planner.set_mission_active(False)
+        self.drone_management.set_running(False)
+
+    def _on_fleet_finished(self, outcomes: list, fleet_ok: bool) -> None:
+        self.flight_log.log_event("Fleet mission summary:")
+        for o in outcomes:
+            self.flight_log.log_event(
+                f"    {o.name} (SYSID {o.sysid}): {o.state}" + (f" - {o.reason}" if o.reason else "")
+            )
+        completed = sum(o.state == "completed" for o in outcomes)
+        result = (
+            f"Fleet result: {'SUCCESS' if fleet_ok else 'NOT COMPLETE'} - {completed} of {len(outcomes)} "
+            "drone(s) completed. All Renode instances stopped."
+        )
+        print(f"[fleet] {result}")
+        self.flight_log.log_event(result)
+        self.mission_planner.set_status(result)
+        self.statusBar().showMessage(result, 15000)
+        self.mission_planner.set_mission_active(False)
+        self.drone_management.set_running(False)
 
     def _fly_external_mavlink_mission(
         self, result: PlanRunResult, drones: list, connection: str, *, uses_renode: bool
@@ -1515,6 +1631,7 @@ class MainWindow(QMainWindow):
         self.plan_service.shutdown()
         self.mavlink_flight.shutdown()
         self.renode_launch.stop()
+        self.fleet.shutdown()
         super().closeEvent(event)
 
     # ---- Telemetry wiring ----
