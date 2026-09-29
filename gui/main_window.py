@@ -1212,7 +1212,7 @@ class MainWindow(QMainWindow):
                 panel.set_status(message)
                 self.statusBar().showMessage(message, 10000)
                 return
-            assignments = list(zip(drones, routes))
+            assignments = self._separate_spawns(list(zip(drones, routes)))
             if len(drones) > len(routes):
                 self.flight_log.log_event(
                     f"{len(drones) - len(routes)} checked drone(s) have no route in this plan and sit it out."
@@ -1249,6 +1249,31 @@ class MainWindow(QMainWindow):
         self._pending_plan_name = None
         self._plan_source = None
         self.fleet.start(assignments, panel.renode_dir_edit.text().strip())
+
+    SPAWN_MIN_SEPARATION_M = 10.0
+
+    def _separate_spawns(self, assignments: list) -> list:
+        """Per-drone routes (Search lanes, formation slots) can start on the
+        same spot - every Search lane starts at the shared base. A drone whose
+        start is within SPAWN_MIN_SEPARATION_M of an earlier drone's gets its
+        spawn point - and so the start of its first leg - moved east in
+        SHARED_ROUTE_SPACING_M steps until it's clear. The rest of its route
+        is unchanged."""
+        separated = []
+        for drone, route in assignments:
+            start = route[0]
+            steps = 0
+            while any(haversine_m(start, s) < self.SPAWN_MIN_SEPARATION_M for _, (s, *_) in separated):
+                steps += 1
+                start = offset_route([route[0]], steps * SHARED_ROUTE_SPACING_M)[0]
+            if steps:
+                self.flight_log.log_event(
+                    f"{drone.name} (SYSID {drone.sysid}): start is within {self.SPAWN_MIN_SEPARATION_M:.0f} m of "
+                    f"another drone's - spawn and first leg moved {steps * SHARED_ROUTE_SPACING_M:.0f} m east "
+                    f"to ({start.lat:.6f}, {start.lon:.6f})."
+                )
+            separated.append((drone, [start, *route[1:]]))
+        return separated
 
     def _on_fleet_progress(self, message: str) -> None:
         print(f"[fleet] {message}")
