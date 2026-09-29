@@ -64,19 +64,22 @@ class RenodeLauncherError(Exception):
 
 
 def _renode_processes() -> list[tuple[int, list[str]]]:
-    """(pid, argv) of every running renode / renode-physics process, matched
-    on the executable's own name - not a substring of the whole command line,
-    which would also hit any shell or script whose arguments mention it."""
+    """(pid, argv) of every running renode / renode-physics process. Matched
+    on the executable itself - the kernel's process name (/proc/<pid>/comm)
+    and argv[0]'s file name must both be exactly one of the two - never on a
+    substring of the command line, which would also hit any shell, script or
+    interpreter whose arguments merely mention "renode"."""
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
+            comm = (entry / "comm").read_text().strip()
             raw = (entry / "cmdline").read_bytes()
         except OSError:
             continue
         argv = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
-        if argv and Path(argv[0]).name in _RENODE_EXECUTABLES:
+        if comm in _RENODE_EXECUTABLES and argv and Path(argv[0]).name == comm:
             found.append((int(entry.name), argv))
     return found
 

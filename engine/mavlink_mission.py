@@ -238,6 +238,11 @@ def upload_and_fly(
     report("Flying mission.")
     last_seq = len(items) - 1
     last_message_at = time.monotonic()
+    # The firmware never sends MISSION_ITEM_REACHED for the final LAND item,
+    # so landing is also detected from the vehicle's own HEARTBEATs: seen
+    # armed in this loop, then disarmed.
+    seen_armed = False
+    highest_reached = 0
     while True:
         if aborted():
             raise FlightAborted("aborted mid-flight")
@@ -256,9 +261,27 @@ def upload_and_fly(
             on_message(message)
         if kind == "MISSION_ITEM_REACHED":
             report(f"Reached waypoint {message.seq}/{last_seq}")
+            highest_reached = max(highest_reached, message.seq)
             if message.seq >= last_seq:
                 report("Mission complete.")
                 return
+        elif (
+            kind == "HEARTBEAT"
+            and message.get_srcSystem() == master.target_system
+            and message.get_srcComponent() == mav2.MAV_COMP_ID_AUTOPILOT1
+            and message.autopilot != mav2.MAV_AUTOPILOT_INVALID
+        ):
+            armed = bool(message.base_mode & mav2.MAV_MODE_FLAG_SAFETY_ARMED)
+            if armed:
+                seen_armed = True
+            elif seen_armed:
+                if highest_reached >= last_seq - 1:
+                    report("Mission complete (landed and disarmed).")
+                    return
+                raise RuntimeError(
+                    f"vehicle landed and disarmed before finishing the route - reached "
+                    f"waypoint {highest_reached}/{last_seq}, likely a failsafe landing"
+                )
         elif kind == "STATUSTEXT":
             report(f"[FC] {message.text}")
         # else: a telemetry type (see TELEMETRY_TYPES) - handed to on_message
