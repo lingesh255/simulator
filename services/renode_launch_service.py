@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from engine.renode_launcher import RenodeLauncher, RenodeLauncherError
+from engine.renode_launcher import RenodeLauncher, RenodeLauncherError, kill_all_renode_processes
 
 
 class _Worker(QObject):
@@ -27,6 +27,10 @@ class _Worker(QObject):
     def run(self, standalone_dir: str, port: int, latitude_deg: float, longitude_deg: float) -> None:
         try:
             self.progress.emit(f"Starting Renode from {standalone_dir} ...")
+            # RenodeLauncher.start() now only cleans up its own instance's
+            # leftovers; the GUI launches a fleet of one, so it clears out
+            # every stray Renode first, as start() itself used to.
+            kill_all_renode_processes()
             self._launcher = RenodeLauncher(
                 standalone_dir, port=port, latitude_deg=latitude_deg, longitude_deg=longitude_deg,
             )
