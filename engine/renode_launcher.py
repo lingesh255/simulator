@@ -60,8 +60,8 @@ DEFAULT_WORK_ROOT = Path(__file__).resolve().parent.parent / "renode_instances"
 
 _RENODE_EXECUTABLES = ("renode", "renode-physics")
 
-# Every launch, instance 0 included, boots from a fresh copy of this repaired
-# SD image. The per-instance images used to persist, and each Renode killed
+# Every launch, instance 0 included, boots from a fresh copy of this clean
+# SD image (see ensure_golden_sdcard). The per-instance images used to persist, and each Renode killed
 # while ArduPilot was logging left orphaned FAT clusters behind; one copy
 # that had lost ~400 MB that way stalled the firmware badly enough that
 # first-boot param sets went unacknowledged.
@@ -113,29 +113,59 @@ def _kill_pids(pids: list[int], timeout_s: float = 5.0) -> None:
         time.sleep(0.1)
 
 
+_TOOL_PACKAGES = {"mcopy": "mtools", "mkfs.fat": "dosfstools", "fsck.fat": "dosfstools"}
+
+
+def _run_tool(args: list[str], what: str) -> None:
+    tool = shutil.which(args[0]) or f"/usr/sbin/{args[0]}"
+    if not Path(tool).exists():
+        raise RenodeLauncherError(
+            f"{args[0]} not found - install {_TOOL_PACKAGES[args[0]]} to build the golden SD image"
+        )
+    result = subprocess.run([tool, *args[1:]], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RenodeLauncherError(f"{what} failed ({result.returncode}): {(result.stdout + result.stderr)[-500:]}")
+
+
 def ensure_golden_sdcard(original: Path, work_root: Path) -> Path:
-    """`work_root`/golden-sdcard.img: the standalone folder's SD image, copied
-    once, repaired with `fsck.fat -a`, and verified clean with `fsck.fat -n`.
-    Only the copy is ever repaired - the original is only read. Safe to call
-    from several threads and processes at once."""
+    """`work_root`/golden-sdcard.img: a freshly formatted FAT32 image, the same
+    size and cluster size (and label) as the standalone folder's SD card,
+    holding only the original card's real directories and files - none of
+    the orphaned clusters the original has built up. Built once: the
+    original is copied, the copy is read with mtools, a new image is
+    formatted with mkfs.fat and the files are copied in with mcopy, then
+    `fsck.fat -n` must pass. The original itself is only ever read (by the
+    copy). Safe to call from several threads and processes at once."""
     golden = work_root / GOLDEN_SDCARD_NAME
     work_root.mkdir(parents=True, exist_ok=True)
     with _golden_lock, open(work_root / (GOLDEN_SDCARD_NAME + ".lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if golden.exists():
             return golden
-        fsck = shutil.which("fsck.fat") or "/usr/sbin/fsck.fat"
-        if not Path(fsck).exists():
-            raise RenodeLauncherError("fsck.fat not found - install dosfstools to build the golden SD image")
-        partial = golden.with_name(golden.name + ".partial")
-        shutil.copyfile(original, partial)
-        repair = subprocess.run([fsck, "-a", str(partial)], capture_output=True, text=True)
-        if repair.returncode not in (0, 1):  # 1 = errors found and corrected
-            raise RenodeLauncherError(f"fsck.fat -a failed on the SD copy ({repair.returncode}): {repair.stdout[-500:]}")
-        verify = subprocess.run([fsck, "-n", str(partial)], capture_output=True, text=True)
-        if verify.returncode != 0:
-            raise RenodeLauncherError(f"repaired SD copy still fails fsck.fat -n: {verify.stdout[-500:]}")
-        os.replace(partial, golden)
+        build = work_root / "golden-build"
+        shutil.rmtree(build, ignore_errors=True)
+        (build / "files").mkdir(parents=True)
+        try:
+            source = build / "original-copy.img"
+            shutil.copyfile(original, source)
+            boot = source.read_bytes()[:512]
+            sectors_per_cluster = boot[13]
+            label = boot[71:82].decode("ascii", errors="replace").strip() or "NO NAME"
+            _run_tool(["mcopy", "-s", "-m", "-n", "-i", str(source), "::/*", str(build / "files")],
+                      "extracting the SD card's files")
+            partial = golden.with_name(golden.name + ".partial")
+            with open(partial, "wb") as image:
+                image.truncate(original.stat().st_size)
+            _run_tool(["mkfs.fat", "-F", "32", "-s", str(sectors_per_cluster), "-n", label, str(partial)],
+                      "formatting the golden SD image")
+            entries = sorted(str(p) for p in (build / "files").iterdir())
+            if entries:
+                _run_tool(["mcopy", "-s", "-m", "-n", "-i", str(partial), *entries, "::/"],
+                          "copying files into the golden SD image")
+            _run_tool(["fsck.fat", "-n", str(partial)], "fsck.fat -n on the golden SD image")
+            os.replace(partial, golden)
+        finally:
+            shutil.rmtree(build, ignore_errors=True)
         return golden
 
 

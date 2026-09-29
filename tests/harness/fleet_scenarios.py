@@ -4,7 +4,11 @@
     fleet_travell3 / fleet_search3 / fleet_stop3 / fleet_bootfail3   3 drones
     fleet_kill2      3 drones, drone 2's Renode killed mid-flight
     fleet_dupsysid   two checked profiles sharing a SYSID - must be refused
+    fleet_vform3     3 drones, V-formation
+    fleet_grid4      4 drones, grid formation (adds a temporary D4, SYSID 4)
 """
+import itertools
+import math
 import signal
 import subprocess
 import sys
@@ -12,12 +16,12 @@ import time
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent
-NAMES = ("D1", "D2", "D3")
+NAMES = ("D1", "D2", "D3", "D4")
 
 
 def build(scenario, d, w, log, fly, after, LOG, pts):
     mp = w.mission_planner
-    n = 3 if scenario.endswith("3") or scenario == "fleet_kill2" else 2
+    n = 3 if scenario == "fleet_kill2" else (int(scenario[-1]) if scenario[-1].isdigit() else 2)
     st = {"finished": [], "boot_failed": [], "flying": 0, "all_sysid_batch": None, "free": None,
           "max_alt": {}, "last": {}, "dummy": None, "boot_started": None}
 
@@ -79,7 +83,17 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
         for i, c in enumerate(corners):
             d.then(f"click search-area corner {i + 1}", lambda: True, lambda c=c: d.click_map(c))
 
+    def landing_spread():
+        landed = {s: p for s, p in st["last"].items() if p[2] < 1.0}
+        pairs = []
+        for (a, pa), (b, pb) in itertools.combinations(sorted(landed.items()), 2):
+            dy = (pa[0] - pb[0]) * 111320
+            dx = (pa[1] - pb[1]) * 111320 * math.cos(math.radians(pa[0]))
+            pairs.append(f"{a}-{b}: {math.hypot(dx, dy):.1f} m")
+        return ", ".join(pairs) or "-"
+
     def summary():
+        log(f"landing points pairwise: {landing_spread()}")
         log(f"SUMMARY: finished={len(st['finished'])} boot_failed={len(st['boot_failed'])} flying_signals={st['flying']} "
             f"all_sysid_batch={st['all_sysid_batch']} max_alt={ {k: round(v, 1) for k, v in st['max_alt'].items()} } "
             f"last_pos={st['last']} single-drone flights_started={d.flight_starts} single ready_count={d.ready_count}")
@@ -142,6 +156,27 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
             ).stdout.strip().replace("\n", " || ") or "(nothing)")))
         d.then("fleet finished", lambda: st["finished"], lambda: None, timeout_s=1800)
         d.then("settle 10s", after(10), summary)
+    elif scenario in ("fleet_vform3", "fleet_grid4"):
+        if scenario == "fleet_grid4":
+            from contracts.gui_orchestration import DroneConfig
+
+            def add_d4():
+                w.store.save_profile(DroneConfig(name="D4", sysid=4, mass_kg=1.5, max_velocity_mps=15.0,
+                                                 battery_capacity_mah=15200.0, cruise_altitude_m=50.0))
+                w.drone_management.reload_profiles()
+                log(f"added temporary profile D4 (SYSID 4); profiles now {[p.name for p in w.store.list_profiles()]}")
+            d.then("add temporary D4", lambda: True, add_d4)
+        common("vformation" if scenario == "fleet_vform3" else "gridformation")
+        plan_travell(short_north)
+        d.then("fleet finished", lambda: st["finished"] or st["boot_failed"], lambda: None, timeout_s=2400)
+
+        def finish():
+            summary()
+            if scenario == "fleet_grid4":
+                w.store.delete_profile("D4")
+                w.drone_management.reload_profiles()
+                log(f"removed D4; profiles now {[p.name for p in w.store.list_profiles()]}")
+        d.then("settle 10s", after(10), finish)
     elif scenario == "fleet_dupsysid":
         from contracts.gui_orchestration import DroneConfig
         store = w.store
