@@ -57,3 +57,6 @@ plans/*/runs/
 pixhawk6c_renode_standalone/
 # Per-instance RenodeLauncher work dirs (copied SD/FRAM/flash images, logs)
 renode_instances/
+
+# Test harness logs (tests/harness/README.md)
+tests/harness/out/

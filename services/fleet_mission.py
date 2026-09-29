@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from contracts.gui_orchestration import DroneConfig, LatLon, SwarmTelemetryBatch
 from engine.renode_launcher import RenodeLauncher, kill_all_renode_processes
@@ -99,9 +99,17 @@ class _BootWorker(QObject):
                     self._launchers[drone.sysid] = launcher
                 t = time.monotonic()
                 self.progress.emit(f"{drone.name} (SYSID {drone.sysid}): booting Renode instance {drone.sysid} ...")
-                connection = launcher.start()
-                launcher.provision_first_boot_params()
-                launcher.wait_until_armable()
+                # The fleet's abort cancels this launch at any stage, even
+                # before it has spawned anything for stop() to kill.
+                connection = launcher.start(cancel=self._aborted)
+                for step in (launcher.provision_first_boot_params, launcher.wait_until_armable):
+                    if self._aborted.is_set():
+                        launcher.stop()
+                        return
+                    step()
+                if self._aborted.is_set():
+                    launcher.stop()
+                    return
                 connections[drone.sysid] = connection
                 self.progress.emit(
                     f"{drone.name} (SYSID {drone.sysid}): armable on {connection} after {time.monotonic() - t:.0f}s"
@@ -137,6 +145,23 @@ class _BootWorker(QObject):
                 )
             return
         self.ready.emit(connections)
+
+    def exited_instances(self) -> dict[int, int]:
+        """{sysid: exit code} of every instance whose Renode has died."""
+        with self._lock:
+            launchers = dict(self._launchers)
+        return {
+            sysid: launcher._proc.returncode
+            for sysid, launcher in launchers.items()
+            if launcher._proc is not None and launcher._proc.poll() is not None
+        }
+
+    def stop_one(self, sysid: int) -> None:
+        """Stop one instance (its physics sidecar too) - the rest keep going."""
+        with self._lock:
+            launcher = self._launchers.pop(sysid, None)
+        if launcher is not None:
+            launcher.stop()
 
     def stop_all(self, cancelled: bool = False) -> None:
         """Stop every instance - safe from any thread, and while booting.
@@ -183,6 +208,13 @@ class FleetMission(QObject):
         self._started_at = 0.0
         self._stopping = False
         self._active = False
+        self._ended: set[int] = set()
+        # A drone's instance dying mid-flight only shows as a MAVLink link
+        # going quiet, which upload_and_fly gives up on after minutes - watch
+        # the processes themselves instead.
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._check_instances)
 
     @property
     def active(self) -> bool:
@@ -209,6 +241,7 @@ class FleetMission(QObject):
         self._plan = _FleetPlan(assignments=list(assignments), standalone_dir=standalone_dir)
         self._outcomes = {d.sysid: DroneOutcome(d.sysid, d.name) for d, _ in assignments}
         self._latest.clear()
+        self._ended = set()
         self._stopping = False
         self._active = True
         self._started_at = time.monotonic()
@@ -248,6 +281,7 @@ class FleetMission(QObject):
             self._flights[sysid] = service
             self._outcomes[sysid].state = "flying"
             service.run_async(route, connections[sysid], drone.cruise_altitude_m, sysid)
+        self._watchdog.start()
 
     # ---- flight ----
 
@@ -261,24 +295,38 @@ class FleetMission(QObject):
             drones=[self._latest[s] for s in sorted(self._latest)],
         ))
 
+    def _check_instances(self) -> None:
+        for sysid, code in self._worker.exited_instances().items():
+            outcome = self._outcomes.get(sysid)
+            if outcome is None or outcome.state != "flying":
+                continue
+            self._mark(sysid, "failed", f"its Renode instance exited mid-flight (exit code {code})")
+            self._worker.stop_one(sysid)   # its physics sidecar too
+            self._flights[sysid].abort()   # its flight then reports finished -> _on_drone_ended
+
+    def _mark(self, sysid: int, state: str, reason: str = "") -> None:
+        outcome = self._outcomes[sysid]
+        outcome.state, outcome.reason = state, reason
+        self.progress.emit(f"{outcome.name} (SYSID {sysid}): {state}" + (f" - {reason}" if reason else ""))
+
     def _on_drone_ended(self, sysid: int, error: str | None) -> None:
         outcome = self._outcomes.get(sysid)
-        if outcome is None or outcome.state != "flying":
+        if outcome is None or sysid in self._ended:
             return
-        if error is not None:
-            outcome.state, outcome.reason = "failed", error
-        elif self._stopping:
-            outcome.state, outcome.reason = "stopped", "stopped by the user"
-        else:
-            outcome.state = "completed"
-        self.progress.emit(f"{outcome.name} (SYSID {sysid}): {outcome.state}"
-                           + (f" - {outcome.reason}" if outcome.reason else ""))
-        if any(o.state == "flying" for o in self._outcomes.values()):
-            return
-        self._wrap_up()
+        self._ended.add(sysid)
+        if outcome.state == "flying":   # not already failed by the watchdog
+            if error is not None:
+                self._mark(sysid, "failed", error)
+            elif self._stopping:
+                self._mark(sysid, "stopped", "stopped by the user")
+            else:
+                self._mark(sysid, "completed")
+        if self._active and self._ended >= set(self._flights):
+            self._wrap_up()
 
     def _wrap_up(self) -> None:
         self._active = False
+        self._watchdog.stop()
         self._worker.stop_all()
         for service in self._flights.values():
             service.shutdown()
@@ -307,6 +355,7 @@ class FleetMission(QObject):
     def shutdown(self) -> None:
         """Synchronous - for closeEvent."""
         self._stopping = True
+        self._watchdog.stop()
         for service in self._flights.values():
             service.shutdown()
         self._worker.stop_all()
