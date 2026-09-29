@@ -331,6 +331,14 @@ class RenodeLauncher:
     # MAV_SYSID - the older SYSID_THISMAV name no longer exists in it.
     SYSID_PARAM = "MAV_SYSID"
 
+    # Added to Renode's own environment only (not the physics sidecar's).
+    # Measured on one instance (ps -o rss, booted+armable / during a 50 m
+    # flight): default 3484 / 3531 MB; DOTNET_GCConserveMemory=7 2276 / 2323
+    # MB with the same boot and climb times (GPS fix 72 vs 74 s, 50 m 82.5
+    # vs 82.2 s after arming). DOTNET_gcServer=0 (3548 / 3596 MB) and
+    # DOTNET_GCHeapHardLimit=0x60000000 (3413 / 3462 MB) barely moved it.
+    RENODE_ENV = {"DOTNET_GCConserveMemory": "7"}
+
     def __init__(
         self,
         standalone_dir: str,
@@ -645,6 +653,7 @@ class RenodeLauncher:
             stdin=subprocess.DEVNULL,
             stdout=self._renode_log,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **self.RENODE_ENV},
         )
 
     def _build_launch_command(self) -> str:
