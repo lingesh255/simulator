@@ -147,6 +147,9 @@ class MainWindow(QMainWindow):
         # address" (Renode is the vehicle) from a SITL/hardware address the
         # user typed in themselves (leave Renode alone).
         self._renode_connection: str | None = None
+        # Whether the external-MAVLink mission now flying (or just ended)
+        # uses Renode as its vehicle - only then does its end relaunch Renode.
+        self._mission_uses_renode = False
         # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
         # when the panel's "Use built-in mock vehicle" box is checked - a
         # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
@@ -1101,7 +1104,7 @@ class MainWindow(QMainWindow):
                 panel.set_status(message)
                 self.statusBar().showMessage(message, 10000)
                 return
-            self._fly_external_mavlink_mission(result, drones, connection)
+            self._fly_external_mavlink_mission(result, drones, connection, uses_renode=False)
             return
 
         instance_exists = panel.renode_ready or panel.renode_launch_in_progress
@@ -1160,13 +1163,19 @@ class MainWindow(QMainWindow):
 
         # Ready at this Start point. Connect may have been cleared by hand
         # since ready() filled it in, so fly Renode's own reported address.
-        self._fly_external_mavlink_mission(result, drones, self._renode_connection or connection)
+        self._fly_external_mavlink_mission(
+            result, drones, self._renode_connection or connection, uses_renode=True
+        )
 
-    def _fly_external_mavlink_mission(self, result: PlanRunResult, drones: list, connection: str) -> None:
+    def _fly_external_mavlink_mission(
+        self, result: PlanRunResult, drones: list, connection: str, *, uses_renode: bool
+    ) -> None:
         """The part of `_start_external_mavlink_mission()` that actually
         starts the flight - split out so `_on_renode_ready()` can resume
         a mission that was deferred for a location-changing relaunch
-        (`_pending_mavlink_mission`) without duplicating any of this."""
+        (`_pending_mavlink_mission`) without duplicating any of this.
+        `uses_renode` says whether Renode is this mission's vehicle, which
+        decides whether its end relaunches Renode (`_end_external_mission`)."""
         route_text = " -> ".join(result.location_names)
         altitude_m = drones[0].cruise_altitude_m
         sysid = drones[0].sysid
@@ -1176,6 +1185,7 @@ class MainWindow(QMainWindow):
             if not self._start_mock_vehicle(connection, source):
                 return  # status/console already explain why
 
+        self._mission_uses_renode = uses_renode
         self.drone_management.set_running(True)
         # Drop any marker/trail left by a previous run so this mission's first
         # fix appears straight at its own source instead of the icon gliding
@@ -1193,8 +1203,11 @@ class MainWindow(QMainWindow):
         # _on_renode_ready() fires once _restart_renode_after_mission()'s
         # post-flight relaunch completes (see that method - every flight
         # end, including this one's, already triggers a relaunch) - so
-        # there is no separate re-enable call needed here.
-        self.mission_planner.set_renode_ready(False)
+        # there is no separate re-enable call needed here. A mock/typed
+        # vehicle leaves Renode's ready state alone - _end_external_mission
+        # doesn't relaunch it for those.
+        if uses_renode:
+            self.mission_planner.set_renode_ready(False)
         # "Launch Renode" needs its OWN, separate flag rather than reusing
         # the line above - _renode_ready is False both while this mission
         # is flying AND after a genuine failure/disconnect with nothing
@@ -1275,12 +1288,22 @@ class MainWindow(QMainWindow):
         self._stop_mock_vehicle()
         if not self._accepting_telemetry:
             # Worker unwound because of a Stop - `_on_stop` already reported it.
-            self._restart_renode_after_mission("Mission stopped.")
+            self._end_external_mission("Mission stopped.")
             return
         self.drone_management.set_running(False)
         self.statusBar().showMessage("External MAVLink mission complete.", 8000)
         print("[MAVLink] Mission complete.")
-        self._restart_renode_after_mission("External MAVLink mission complete.")
+        self._end_external_mission("External MAVLink mission complete.")
+
+    def _end_external_mission(self, reason: str) -> None:
+        """Every external-MAVLink flight end (complete, failed or stopped).
+        Only a mission that flew Renode relaunches it - a mock vehicle or a
+        typed SITL/hardware address never had Renode as its vehicle."""
+        if self._mission_uses_renode:
+            self._restart_renode_after_mission(reason)
+            return
+        self.mission_planner.set_mission_active(False)
+        self.mission_planner.set_status(reason)
 
     def _restart_renode_after_mission(self, reason: str) -> None:
         """Every "Plan Mission" flight over real MAVLink - success,
@@ -1385,7 +1408,7 @@ class MainWindow(QMainWindow):
             result, drones = self._pending_mavlink_mission
             self._pending_mavlink_mission = None
             connection = self.mission_planner.mavlink_connection_string()
-            self._fly_external_mavlink_mission(result, drones, connection)
+            self._fly_external_mavlink_mission(result, drones, connection, uses_renode=True)
 
     def _on_mavlink_flight_failed(self, message: str) -> None:
         self.drone_management.set_running(False)
@@ -1399,7 +1422,7 @@ class MainWindow(QMainWindow):
         # on) AND now actually replaces the dead/corrupted instance,
         # rather than just leaving Plan Mission disabled with no way
         # forward except a manual re-launch.
-        self._restart_renode_after_mission(f"External MAVLink mission failed: {message}")
+        self._end_external_mission(f"External MAVLink mission failed: {message}")
 
     def _start_area_coverage_mission(
         self, result: PlanRunResult, drones: list, *, route_noun: str = "lane"
