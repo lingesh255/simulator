@@ -62,6 +62,7 @@ TELEMETRY_INTERVAL_S = 0.2  # ~5 Hz, a realistic autopilot stream rate
 MODE_AUTO = 3  # ArduCopter AUTO - matches engine.mavlink_interpreter.MODE_AUTO
 CRUISE_SPEED_MPS = 15.0
 CLIMB_RATE_MPS = 3.0
+DESCENT_RATE_MPS = 2.0
 ARRIVAL_RADIUS_M = 5.0
 EARTH_RADIUS_M = 6_371_000.0
 _CMD_NAMES = mav2.enums["MAV_CMD"]
@@ -161,8 +162,9 @@ def main() -> None:
         nonlocal pos_lat, pos_lon, pos_alt, leg_index, flying
         if args.home is not None:
             pos_lat, pos_lon = args.home
-        elif len(mission) > 1:
-            pos_lat, pos_lon = mission[1][0], mission[1][1]
+        elif len(mission) > 2:
+            # mission[0] is the HOME placeholder, mission[1] the TAKEOFF item.
+            pos_lat, pos_lon = mission[2][0], mission[2][1]
             print("  (no --home given - starting at the first real waypoint instead of the true source)")
         pos_alt = 0.0
         leg_index = 0
@@ -180,19 +182,31 @@ def main() -> None:
             last_telemetry = now
             ground_speed = 0.0
 
+            target_lat, target_lon, target_alt, target_name = mission[leg_index]
+            is_land = target_name == "MAV_CMD_NAV_LAND"
             if leg_index == 0:
-                # mission[0] is the TAKEOFF item: lat/lon are unused ("wherever
-                # you already are"), only its altitude means anything - climb
-                # in place, then advance straight to the first real waypoint.
-                climb_target_alt = mission[0][2]
-                if pos_alt < climb_target_alt - 0.1:
-                    pos_alt = min(climb_target_alt, pos_alt + CLIMB_RATE_MPS * dt)
+                # seq 0 is the HOME placeholder engine.mavlink_mission uploads
+                # (ArduPilot reserves it) - not a place to fly to.
+                leg_index = 1
+            elif target_name == "MAV_CMD_NAV_TAKEOFF":
+                # lat/lon unused ("wherever you already are") - climb in place.
+                if pos_alt < target_alt - 0.1:
+                    pos_alt = min(target_alt, pos_alt + CLIMB_RATE_MPS * dt)
                 else:
-                    leg_index = 1
+                    send(mav.mission_item_reached_encode(leg_index))
+                    print(f"  reached waypoint {leg_index}/{len(mission) - 1}  [{target_name}]")
+                    leg_index += 1
             else:
-                target_lat, target_lon, target_alt, target_name = mission[leg_index]
                 remaining = _haversine_m(pos_lat, pos_lon, target_lat, target_lon)
-                if remaining <= ARRIVAL_RADIUS_M:
+                if remaining <= ARRIVAL_RADIUS_M and is_land:
+                    # Like the real firmware: descend, disarm, and send no
+                    # MISSION_ITEM_REACHED for the LAND item.
+                    pos_alt = max(0.0, pos_alt - DESCENT_RATE_MPS * dt)
+                    if pos_alt <= 0.0:
+                        flying = False
+                        armed = False
+                        print("  landed - disarmed")
+                elif remaining <= ARRIVAL_RADIUS_M:
                     send(mav.mission_item_reached_encode(leg_index))
                     print(f"  reached waypoint {leg_index}/{len(mission) - 1}  [{target_name}]")
                     leg_index += 1
@@ -206,7 +220,8 @@ def main() -> None:
                     heading_deg = _bearing_deg(pos_lat, pos_lon, target_lat, target_lon)
                     pos_lat += (target_lat - pos_lat) * fraction
                     pos_lon += (target_lon - pos_lon) * fraction
-                    pos_alt += (target_alt - pos_alt) * fraction
+                    if not is_land:  # LAND's altitude is the ground - hold height until overhead
+                        pos_alt += (target_alt - pos_alt) * fraction
                     ground_speed = CRUISE_SPEED_MPS
 
             send_telemetry(pos_lat, pos_lon, pos_alt, heading_deg, ground_speed)

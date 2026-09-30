@@ -38,20 +38,146 @@ boot, not inferred) drive the sequencing and constants below:
 """
 from __future__ import annotations
 
+import fcntl
 import os
+import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as mav2
 
+# Per-instance copies of the writable images (SD card, FRAM, persistent
+# flash) and generated launch scripts live under here, one folder per
+# instance - never inside the standalone folder, whose files are never edited.
+DEFAULT_WORK_ROOT = Path(__file__).resolve().parent.parent / "renode_instances"
+
+_RENODE_EXECUTABLES = ("renode", "renode-physics")
+
+# Every launch, instance 0 included, boots from a fresh copy of this clean
+# SD image (see ensure_golden_sdcard). The per-instance images used to persist, and each Renode killed
+# while ArduPilot was logging left orphaned FAT clusters behind; one copy
+# that had lost ~400 MB that way stalled the firmware badly enough that
+# first-boot param sets went unacknowledged.
+GOLDEN_SDCARD_NAME = "golden-sdcard.img"
+_golden_lock = threading.Lock()
+
 
 class RenodeLauncherError(Exception):
     pass
+
+
+def _renode_processes() -> list[tuple[int, list[str]]]:
+    """(pid, argv) of every running renode / renode-physics process. Matched
+    on the executable itself - the kernel's process name (/proc/<pid>/comm)
+    and argv[0]'s file name must both be exactly one of the two - never on a
+    substring of the command line, which would also hit any shell, script or
+    interpreter whose arguments merely mention "renode"."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip()
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+        if comm in _RENODE_EXECUTABLES and argv and Path(argv[0]).name == comm:
+            found.append((int(entry.name), argv))
+    return found
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    return stat.rsplit(")", 1)[-1].split()[0] == "Z"  # a zombie holds no ports or files
+
+
+def _kill_pids(pids: list[int], timeout_s: float = 5.0) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline and not all(_pid_gone(pid) for pid in pids):
+        time.sleep(0.1)
+
+
+_TOOL_PACKAGES = {"mcopy": "mtools", "mkfs.fat": "dosfstools", "fsck.fat": "dosfstools"}
+
+
+def _run_tool(args: list[str], what: str) -> None:
+    tool = shutil.which(args[0]) or f"/usr/sbin/{args[0]}"
+    if not Path(tool).exists():
+        raise RenodeLauncherError(
+            f"{args[0]} not found - install {_TOOL_PACKAGES[args[0]]} to build the golden SD image"
+        )
+    result = subprocess.run([tool, *args[1:]], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RenodeLauncherError(f"{what} failed ({result.returncode}): {(result.stdout + result.stderr)[-500:]}")
+
+
+def ensure_golden_sdcard(original: Path, work_root: Path) -> Path:
+    """`work_root`/golden-sdcard.img: a freshly formatted FAT32 image, the same
+    size and cluster size (and label) as the standalone folder's SD card,
+    holding only the original card's real directories and files - none of
+    the orphaned clusters the original has built up. Built once: the
+    original is copied, the copy is read with mtools, a new image is
+    formatted with mkfs.fat and the files are copied in with mcopy, then
+    `fsck.fat -n` must pass. The original itself is only ever read (by the
+    copy). Safe to call from several threads and processes at once."""
+    golden = work_root / GOLDEN_SDCARD_NAME
+    work_root.mkdir(parents=True, exist_ok=True)
+    with _golden_lock, open(work_root / (GOLDEN_SDCARD_NAME + ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if golden.exists():
+            return golden
+        build = work_root / "golden-build"
+        shutil.rmtree(build, ignore_errors=True)
+        (build / "files").mkdir(parents=True)
+        try:
+            source = build / "original-copy.img"
+            shutil.copyfile(original, source)
+            boot = source.read_bytes()[:512]
+            sectors_per_cluster = boot[13]
+            label = boot[71:82].decode("ascii", errors="replace").strip() or "NO NAME"
+            _run_tool(["mcopy", "-s", "-m", "-n", "-i", str(source), "::/*", str(build / "files")],
+                      "extracting the SD card's files")
+            partial = golden.with_name(golden.name + ".partial")
+            with open(partial, "wb") as image:
+                image.truncate(original.stat().st_size)
+            _run_tool(["mkfs.fat", "-F", "32", "-s", str(sectors_per_cluster), "-n", label, str(partial)],
+                      "formatting the golden SD image")
+            entries = sorted(str(p) for p in (build / "files").iterdir())
+            if entries:
+                _run_tool(["mcopy", "-s", "-m", "-n", "-i", str(partial), *entries, "::/"],
+                          "copying files into the golden SD image")
+            _run_tool(["fsck.fat", "-n", str(partial)], "fsck.fat -n on the golden SD image")
+            os.replace(partial, golden)
+        finally:
+            shutil.rmtree(build, ignore_errors=True)
+        return golden
+
+
+def kill_all_renode_processes() -> list[int]:
+    """SIGKILL every renode / renode-physics process on this machine, whoever
+    started it. Call once before launching a fleet - never from inside one
+    instance's start(), which would take the rest of the fleet down with it
+    (each instance only cleans up its own leftovers, see
+    RenodeLauncher._kill_own_stale_processes)."""
+    pids = [pid for pid, _argv in _renode_processes()]
+    _kill_pids(pids)
+    return pids
 
 
 class RenodeLauncher:
@@ -76,6 +202,10 @@ class RenodeLauncher:
     #     than re-derived from hwdef.dat at runtime) because the frozen
     #     standalone folder carries no hwdef.dat to derive it from - only
     #     Tools/renode, firmware, and the already-generated board files.
+    #
+    # MAVLINK_PORT/PHYSICS_PORT are instance 0's ports; instance N adds N to
+    # both (see __init__).
+    MAVLINK_PORT = 5762
     PHYSICS_PORT = 9002
     PHYSICS_MODEL = "quad"
     PHYSICS_LATITUDE_DEG = -35.363261
@@ -262,15 +392,49 @@ class RenodeLauncher:
     # @RebootRequired - takes effect live.
     AUTO_OPTIONS = 2
 
+    # The vehicle's MAVLink system id, set for instance N >= 1 so drone N
+    # reports sysid N. This firmware (ArduCopter 4.8.0-dev) names it
+    # MAV_SYSID - the older SYSID_THISMAV name no longer exists in it.
+    SYSID_PARAM = "MAV_SYSID"
+
+    # Added to Renode's own environment only (not the physics sidecar's).
+    # Measured on one instance (ps -o rss, booted+armable / during a 50 m
+    # flight): default 3484 / 3531 MB; DOTNET_GCConserveMemory=7 2276 / 2323
+    # MB with the same boot and climb times (GPS fix 72 vs 74 s, 50 m 82.5
+    # vs 82.2 s after arming). DOTNET_gcServer=0 (3548 / 3596 MB) and
+    # DOTNET_GCHeapHardLimit=0x60000000 (3413 / 3462 MB) barely moved it.
+    RENODE_ENV = {"DOTNET_GCConserveMemory": "7"}
+
     def __init__(
         self,
         standalone_dir: str,
-        port: int = 5762,
+        port: int | None = None,
         latitude_deg: float | None = None,
         longitude_deg: float | None = None,
+        instance: int = 0,
+        work_root: str | None = None,
     ):
+        """`instance` makes several launchers safe to run at once. Instance 0
+        is exactly today's single vehicle: MAVLink on 5762, physics on 9002,
+        the standalone folder's own SD/FRAM/flash images and console log, the
+        unmodified launch command, and no sysid change. Instance N >= 1 gets
+        MAVLink on 5762+N, physics on 9002+N, sysid N, and its own copies of
+        the writable images plus its console log in `work_root`/instance-N
+        (copied once and kept, so its parameters persist across restarts
+        without leaking into any other instance). `port` overrides the
+        MAVLink port for any instance."""
+        if instance < 0:
+            raise RenodeLauncherError(f"instance must be >= 0, got {instance}")
         self.standalone_dir = Path(standalone_dir).expanduser().resolve()
-        self.port = port
+        self.instance = instance
+        self.port = self.MAVLINK_PORT + instance if port is None else port
+        self.physics_port = self.PHYSICS_PORT + instance
+        self.sysid = instance if instance >= 1 else None
+        self.work_root = Path(work_root or DEFAULT_WORK_ROOT).expanduser().resolve()
+        self.work_dir = self.work_root / f"instance-{instance}"
+        # Instance 0 keeps the standalone folder's own images; every other
+        # instance gets private copies.
+        self._own_storage = instance != 0
         # Per-instance override of where the vehicle spawns, e.g. to match
         # a real mission's own clicked Start point - defaults to the
         # confirmed-working PHYSICS_LATITUDE_DEG/LONGITUDE_DEG constants
@@ -302,10 +466,142 @@ class RenodeLauncher:
                 "renode_firmware_guide.md Part 4.4."
             )
 
+        self._read_layout()
+
         self._proc: subprocess.Popen | None = None
         self._physics_proc: subprocess.Popen | None = None
         self._renode_log = None
         self._renode_log_path: Path | None = None
+        self._cancel: threading.Event | None = None
+
+    # ---- Where each instance's files live ----
+
+    def _read_layout(self) -> None:
+        """Find, in launch.resc and the scripts it pulls in, the lines that
+        name the MAVLink port and the writable images, so a non-default
+        instance can point copies of them elsewhere. Every lookup must match
+        exactly once - a layout this doesn't recognise is an error, not a
+        guess."""
+        self._launch_lines = [
+            line for line in self.launch_script.read_text().splitlines() if line.strip()
+        ]
+        self._sdcard_line = self._single(
+            self._launch_lines, r"^\$sdcard=@(\S+)$", "launch.resc's $sdcard line")
+        self._board_line = self._single(
+            self._launch_lines, r"^include @(\S+\.resc)$", "launch.resc's board-script include")
+        self._persistent_line = self._single(
+            self._launch_lines, r"^machine LoadPlatformDescription @(\S+)$",
+            "launch.resc's persistent-memory platform line")
+
+        self.original_sdcard = Path(self._sdcard_line[1])
+        self.board_script = Path(self._board_line[1])
+        self.persistent_repl = Path(self._persistent_line[1])
+
+        board_lines = self.board_script.read_text().splitlines()
+        self._port_line = self._single(
+            board_lines, r'^emulation CreateServerSocketTerminal (\d+) "serial"',
+            f"{self.board_script.name}'s MAVLink server socket")
+        self._platform_line = self._single(
+            board_lines, r"^\$platform=@(\S+)$", f"{self.board_script.name}'s $platform line")
+        self.declared_port = int(self._port_line[1])
+        self.platform_repl = Path(self._platform_line[1])
+
+        self._fram_line = self._single(
+            self.platform_repl.read_text().splitlines(), r'^\s*fileName: "([^"]+)"$',
+            f"{self.platform_repl.name}'s FRAM fileName")
+        self._flash_line = self._single(
+            self.persistent_repl.read_text().splitlines(), r'^\s*fileName: "([^"]+)"$',
+            f"{self.persistent_repl.name}'s persistent flash fileName")
+        self.original_fram = Path(self._fram_line[1])
+        self.original_persistent_flash = Path(self._flash_line[1])
+
+    @staticmethod
+    def _single(lines: list[str], pattern: str, what: str) -> tuple[str, str]:
+        """(the one line matching `pattern`, its first group)."""
+        regex = re.compile(pattern)
+        matches = [(line.strip(), m.group(1)) for line in lines if (m := regex.match(line.strip()))]
+        if len(matches) != 1:
+            raise RenodeLauncherError(
+                f"expected exactly one {what}, found {len(matches)} - the standalone "
+                "folder's layout isn't what this launcher knows how to retarget"
+            )
+        return matches[0]
+
+    @property
+    def sdcard_path(self) -> Path:
+        # Every instance, 0 included: replaced from the golden image on each start().
+        return self.work_dir / "sdcard.img"
+
+    @property
+    def fram_path(self) -> Path:
+        return self.work_dir / "fram.img" if self._own_storage else self.original_fram
+
+    @property
+    def persistent_flash_path(self) -> Path:
+        return self.work_dir / "persistent-flash.img" if self._own_storage else self.original_persistent_flash
+
+    @property
+    def renode_log_path(self) -> Path:
+        return (self.work_dir if self._own_storage else self.standalone_dir) / "renode-console.log"
+
+    @property
+    def _own_board_script(self) -> bool:
+        # The MAVLink port and the FRAM image are both only reachable through
+        # the board script (its CreateServerSocketTerminal and $platform lines).
+        return self._own_storage or self.port != self.declared_port
+
+    def _prepare_work_dir(self) -> None:
+        """A fresh SD image from the golden copy (every start, every
+        instance), private FRAM/flash copies for instances >= 1 (made once,
+        then reused so their parameters survive a restart), and copies of
+        the scripts that name them. The standalone folder's own files are
+        only ever read."""
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        golden = ensure_golden_sdcard(self.original_sdcard, self.work_root)
+        partial = self.sdcard_path.with_name(self.sdcard_path.name + ".partial")
+        shutil.copyfile(golden, partial)
+        os.replace(partial, self.sdcard_path)
+        if self._own_storage:
+            for original, copy in (
+                (self.original_fram, self.fram_path),
+                (self.original_persistent_flash, self.persistent_flash_path),
+            ):
+                if not copy.exists():
+                    partial = copy.with_name(copy.name + ".partial")
+                    shutil.copyfile(original, partial)
+                    os.replace(partial, copy)
+            self._write_retargeted(
+                self.platform_repl, self.work_dir / self.platform_repl.name,
+                {self._fram_line[0]: self._fram_line[0].replace(str(self.original_fram), str(self.fram_path))},
+            )
+            self._write_retargeted(
+                self.persistent_repl, self.work_dir / self.persistent_repl.name,
+                {self._flash_line[0]: self._flash_line[0].replace(
+                    str(self.original_persistent_flash), str(self.persistent_flash_path))},
+            )
+        board_changes = {
+            self._port_line[0]: self._port_line[0].replace(
+                f"CreateServerSocketTerminal {self.declared_port} ",
+                f"CreateServerSocketTerminal {self.port} "),
+        }
+        if self._own_storage:
+            board_changes[self._platform_line[0]] = f"$platform=@{self.work_dir / self.platform_repl.name}"
+        if self._own_board_script:
+            self._write_retargeted(self.board_script, self.work_dir / self.board_script.name, board_changes)
+
+    @staticmethod
+    def _write_retargeted(source: Path, dest: Path, changes: dict[str, str]) -> None:
+        """Copy `source` to `dest` with each whole line (compared stripped)
+        in `changes` replaced, keeping its indentation."""
+        out = []
+        for line in source.read_text().splitlines():
+            key = line.strip()
+            if key in changes:
+                indent = line[: len(line) - len(line.lstrip())]
+                out.append(indent + changes[key].strip())
+            else:
+                out.append(line)
+        dest.write_text("\n".join(out) + "\n")
 
     @property
     def connection_string(self) -> str:
@@ -319,6 +615,7 @@ class RenodeLauncher:
         self,
         physics_ready_timeout_s: float = 30.0,
         gps_ready_timeout_s: float = 240.0,
+        cancel: threading.Event | None = None,
     ) -> str:
         """Two-stage start: renode-physics first, confirmed listening, then
         Renode itself with physics and the GPS UART wired in before `start`
@@ -349,28 +646,79 @@ class RenodeLauncher:
         if self.is_running:
             raise RenodeLauncherError("already running - call stop() first")
 
-        self._kill_any_stale_processes()
+        self._kill_own_stale_processes()
+        self._check_ports_free()
 
+        # `cancel` (e.g. a fleet's abort) reaches this launch at any stage -
+        # stop() alone can't, before this start() has spawned its processes.
+        self._cancel = cancel
         try:
+            self._check_cancel()
+            self._prepare_work_dir()
+            self._check_cancel()
             self._start_physics(physics_ready_timeout_s)
+            self._check_cancel()
             self._start_renode()
+            self._check_cancel()
             self._wait_for_gps_fix(gps_ready_timeout_s)
+            self._check_cancel()
         except Exception:
             self.stop()
             raise
 
         return self.connection_string
 
+    def _check_ports_free(self) -> None:
+        """Fail at once, rather than after the full GPS wait, if something
+        already listens on this instance's MAVLink or physics port. Bound
+        with SO_REUSEADDR like Renode's own listener, so connections still in
+        TIME_WAIT from an earlier run don't count as taken."""
+        for host, port, what in (("0.0.0.0", self.port, "MAVLink"),
+                                 ("127.0.0.1", self.physics_port, "physics")):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((host, port))
+            except OSError as exc:
+                raise RenodeLauncherError(
+                    f"{what} port {port} is already in use ({exc.strerror}) - "
+                    f"instance {self.instance} cannot start"
+                ) from exc
+            finally:
+                probe.close()
+
+    def _check_cancel(self) -> None:
+        if self._cancel is not None and self._cancel.is_set():
+            raise RenodeLauncherError(f"launch of instance {self.instance} cancelled")
+
+    def _check_renode_log(self) -> None:
+        """Renode reports a MAVLink port it couldn't bind only in its own
+        console log and then boots on regardless - catch that during boot
+        (e.g. a port taken between _check_ports_free and Renode's bind)."""
+        path = self._renode_log_path
+        if path is None or not path.exists():
+            return
+        if b"AddressAlreadyInUse" in path.read_bytes():
+            raise RenodeLauncherError(
+                f"Renode could not bind MAVLink port {self.port} (AddressAlreadyInUse in {path.name}) - "
+                f"instance {self.instance} cannot start"
+            )
+
     # ---- Stage 1: physics sidecar ----
 
     def _start_physics(self, ready_timeout_s: float) -> None:
         # New process group, same as Renode below, so stop() can reliably
-        # reach every child - not just this one PID.
+        # reach every child - not just this one PID. stdin is DEVNULL for
+        # both children: setsid() alone doesn't stop a child using the
+        # inherited terminal fd (see _start_renode for what that breaks).
+        # Instances other than 0 run it from their own work dir: the sidecar
+        # is a SITL build that keeps an eeprom.bin in its working directory.
         self._physics_proc = subprocess.Popen(
             [str(self.physics_bin), "--model", self.PHYSICS_MODEL,
-             "--physics-port", str(self.PHYSICS_PORT)],
-            cwd=self.standalone_dir,
+             "--physics-port", str(self.physics_port)],
+            cwd=self.work_dir if self._own_storage else self.standalone_dir,
             preexec_fn=os.setsid,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -413,14 +761,19 @@ class RenodeLauncher:
         # Captured to a file, not DEVNULL: an unhandled exception inside a
         # Renode peripheral crashes the whole process with no other signal
         # than an early exit code - this is the only way to see why.
-        self._renode_log_path = self.standalone_dir / "renode-console.log"
+        self._renode_log_path = self.renode_log_path
         self._renode_log = open(self._renode_log_path, "wb")
+        # stdin=DEVNULL: with the terminal inherited, `--console` switches
+        # the launching terminal to raw mode (no echo, Ctrl+C arrives as a
+        # character instead of SIGINT) and never restores it.
         self._proc = subprocess.Popen(
             [str(self.renode_bin), "--disable-xwt", "--console", "-e", command],
             cwd=self.standalone_dir,
             preexec_fn=os.setsid,
+            stdin=subprocess.DEVNULL,
             stdout=self._renode_log,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **self.RENODE_ENV},
         )
 
     def _build_launch_command(self) -> str:
@@ -428,10 +781,7 @@ class RenodeLauncher:
         `start`, with physics Connect and the GPS UART wiring inserted
         before a final `start` we issue ourselves - see the module
         docstring for why this order is load-bearing, confirmed by hand."""
-        lines = [
-            line for line in self.launch_script.read_text().splitlines()
-            if line.strip()
-        ]
+        lines = self._launch_lines
         if not lines or lines[-1].strip() != "start":
             raise RenodeLauncherError(
                 f"{self.launch_script} does not end with a bare 'start' line "
@@ -441,8 +791,20 @@ class RenodeLauncher:
             )
         boot_commands = lines[:-1]
 
+        # Instance 0 on its declared port runs launch.resc unchanged except
+        # for the fresh SD copy; any other instance also points it at the
+        # copies _prepare_work_dir() made.
+        changes = {self._sdcard_line[0]: f"$sdcard=@{self.sdcard_path}"}
+        if self._own_board_script:
+            changes[self._board_line[0]] = f"include @{self.work_dir / self.board_script.name}"
+        if self._own_storage:
+            changes[self._persistent_line[0]] = (
+                f"machine LoadPlatformDescription @{self.work_dir / self.persistent_repl.name}"
+            )
+        boot_commands = [changes.get(line.strip(), line) for line in boot_commands]
+
         physics_connect = 'physics Connect %d "%s" %.6f %.6f %.1f %.1f %d' % (
-            self.PHYSICS_PORT, self.PHYSICS_MODEL,
+            self.physics_port, self.PHYSICS_MODEL,
             self.latitude_deg, self.longitude_deg,
             self.PHYSICS_ALTITUDE_M, self.PHYSICS_HEADING_DEG,
             self.PHYSICS_RATE_HZ,
@@ -474,6 +836,8 @@ class RenodeLauncher:
                     "renode was stopped" if proc is None
                     else f"renode exited early (code {proc.returncode})"
                 )
+            self._check_cancel()
+            self._check_renode_log()
             try:
                 return mavutil.mavlink_connection(self.connection_string)
             except OSError as exc:
@@ -494,8 +858,13 @@ class RenodeLauncher:
         deadline = time.monotonic() + timeout_s
         connection = self._connect_mavlink(deadline)
         try:
-            heartbeat_timeout = max(0.0, deadline - time.monotonic())
-            heartbeat = connection.wait_heartbeat(timeout=heartbeat_timeout)
+            # In one-second slices, not one long wait: whatever answers the
+            # port may not be this Renode (see _check_renode_log).
+            heartbeat = None
+            while heartbeat is None and time.monotonic() < deadline:
+                self._check_cancel()
+                self._check_renode_log()
+                heartbeat = connection.wait_heartbeat(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
             if heartbeat is None:
                 raise TimeoutError(
                     f"no MAVLink heartbeat on {self.connection_string} "
@@ -520,6 +889,8 @@ class RenodeLauncher:
                         "renode was stopped" if proc is None
                         else f"renode exited early (code {proc.returncode})"
                     )
+                self._check_cancel()
+                self._check_renode_log()
                 message = connection.recv_match(
                     type="GPS_RAW_INT", blocking=True, timeout=2
                 )
@@ -533,8 +904,9 @@ class RenodeLauncher:
             connection.close()
 
     def provision_first_boot_params(self, timeout_s: float = 45.0) -> None:
-        """FRAME_CLASS/FRAME_TYPE/ARMING_SKIPCHK/FS_THR_ENABLE/AUTO_OPTIONS
-        (each confirmed via a real PARAM_VALUE ack), plus a real simple
+        """FRAME_CLASS/FRAME_TYPE/ARMING_SKIPCHK/FS_THR_ENABLE/AUTO_OPTIONS,
+        and MAV_SYSID for instance >= 1 (each confirmed via a real
+        PARAM_VALUE ack), plus a real simple
         accelerometer calibration, a real compass force-save, and a real
         safety-switch-off command (each confirmed via a real COMMAND_ACK) -
         not fire-and-assume for any of them. No reboot follows this - see
@@ -585,6 +957,13 @@ class RenodeLauncher:
             self._run_simple_accel_cal(connection, max(1.0, deadline - time.monotonic()))
             self._run_compass_force_save(connection, max(1.0, deadline - time.monotonic()))
             self._force_safety_off(connection, max(1.0, deadline - time.monotonic()))
+            if self.sysid is not None:
+                # Last: everything above addresses the vehicle by the sysid
+                # its first heartbeat reported, which this changes.
+                self._confirm_param_set(
+                    connection, self.SYSID_PARAM, self.sysid, mav2.MAV_PARAM_TYPE_INT16,
+                    max(1.0, deadline - time.monotonic()),
+                )
         finally:
             connection.close()
 
@@ -798,20 +1177,24 @@ class RenodeLauncher:
 
     # ---- Lifecycle ----
 
-    def _kill_any_stale_processes(self) -> None:
-        """Best-effort cleanup of any previously-leaked renode or
-        renode-physics process before starting new ones, mirroring the
-        `pkill -9 -f renode` step that turned out to matter every single
-        time tonight. One pattern covers both: "renode-physics" contains
-        "renode" as a substring."""
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-f", "renode"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            time.sleep(1.0)
-        except FileNotFoundError:
-            pass  # pkill not available on this platform; not fatal
+    def _kill_own_stale_processes(self) -> None:
+        """SIGKILL a renode / renode-physics left over from an earlier run of
+        THIS instance - the `pkill -9 -f renode` cleanup that turned out to
+        matter every time, narrowed so it can't take down other instances
+        running alongside. Both processes are identified by this instance's
+        physics port, which appears in each one's own command line (the
+        sidecar's `--physics-port N`, Renode's `physics Connect N ...`)."""
+        port = str(self.physics_port)
+        stale = []
+        for pid, argv in _renode_processes():
+            name = Path(argv[0]).name
+            if name == "renode-physics":
+                if "--physics-port" in argv[:-1] and argv[argv.index("--physics-port") + 1] == port:
+                    stale.append(pid)
+            elif f"physics Connect {port} " in " ".join(argv):
+                stale.append(pid)
+        if stale:
+            _kill_pids(stale)
 
     def stop(self) -> None:
         """Tears down both processes - neither is left orphaned if the
