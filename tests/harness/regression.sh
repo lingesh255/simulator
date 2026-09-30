@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run a list of gui_drive.py scenarios one after another, clearing Renode
-# before each and showing pgrep right after each app exits. fleet_grid4 only
-# runs with at least 10 GiB available. Progress goes to stdout; each
+# before each and showing pgrep right after each app exits. Before
+# fleet_grid4 it prints `free -m` for information. Progress goes to stdout; each
 # scenario's own log to tests/harness/out/<prefix>_<scenario>.out.
 #
 #   tests/harness/regression.sh <prefix> <scenario> [<scenario> ...]
@@ -13,10 +13,7 @@ for sc in "$@"; do
     echo "##### $sc  ($(date +%H:%M:%S))"
     $H/rclean.sh
     if [ "$sc" = fleet_grid4 ]; then
-        free -h
-        avail=$(free -m | awk '/^Mem:/{print $7}')
-        echo "available MiB: $avail"
-        if [ "$avail" -lt 10240 ]; then echo "SKIPPING fleet_grid4: under 10 GiB available"; continue; fi
+        free -m  # information only - never skips anything
     fi
     timeout 3000 .venv/bin/python $H/gui_drive.py "$sc" > "$H/out/${prefix}_$sc.out" 2>&1
     echo "exit=$?"
