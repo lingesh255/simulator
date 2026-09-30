@@ -15,6 +15,7 @@ full mission the way a real GCS does it.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable, Optional
 
@@ -101,6 +102,20 @@ def build_mission_items(
 
 class FlightAborted(RuntimeError):
     """Raised when `should_abort` reports true mid-flight."""
+
+
+# How close to the LAND item's position a disarm must be to count as having
+# completed the mission.
+LANDED_ON_TARGET_M = 10.0
+
+
+def _distance_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle distance in metres between two (lat, lon) points."""
+    lat1, lat2 = math.radians(a[0]), math.radians(b[0])
+    dlat = lat2 - lat1
+    dlon = math.radians(b[1] - a[1])
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * 6_371_000.0 * math.asin(min(1.0, math.sqrt(h)))
 
 
 TELEMETRY_TYPES = ("GLOBAL_POSITION_INT", "SYS_STATUS", "GPS_RAW_INT", "HEARTBEAT")
@@ -238,6 +253,15 @@ def upload_and_fly(
     report("Flying mission.")
     last_seq = len(items) - 1
     last_message_at = time.monotonic()
+    # The firmware never sends MISSION_ITEM_REACHED for the final LAND item,
+    # so landing is also detected from the vehicle's own HEARTBEATs: seen
+    # armed in this loop, then disarmed - and it only counts as completing
+    # the mission if the vehicle's last reported position is on the LAND
+    # point (a failsafe landing anywhere else is not success).
+    seen_armed = False
+    highest_reached = 0
+    last_position = None
+    land_lat, land_lon = waypoints[-1]
     while True:
         if aborted():
             raise FlightAborted("aborted mid-flight")
@@ -254,11 +278,37 @@ def upload_and_fly(
         kind = message.get_type()
         if on_message is not None:
             on_message(message)
-        if kind == "MISSION_ITEM_REACHED":
+        if kind == "GLOBAL_POSITION_INT" and message.get_srcSystem() == master.target_system:
+            last_position = (message.lat / 1e7, message.lon / 1e7)
+        elif kind == "MISSION_ITEM_REACHED":
             report(f"Reached waypoint {message.seq}/{last_seq}")
+            highest_reached = max(highest_reached, message.seq)
             if message.seq >= last_seq:
                 report("Mission complete.")
                 return
+        elif (
+            kind == "HEARTBEAT"
+            and message.get_srcSystem() == master.target_system
+            and message.get_srcComponent() == mav2.MAV_COMP_ID_AUTOPILOT1
+            and message.autopilot != mav2.MAV_AUTOPILOT_INVALID
+        ):
+            armed = bool(message.base_mode & mav2.MAV_MODE_FLAG_SAFETY_ARMED)
+            if armed:
+                seen_armed = True
+            elif seen_armed:
+                if last_position is None:
+                    raise RuntimeError(
+                        f"vehicle landed and disarmed with no position report - can't tell whether "
+                        f"it reached the LAND point (reached waypoint {highest_reached}/{last_seq})"
+                    )
+                distance = _distance_m(last_position, (land_lat, land_lon))
+                if distance <= LANDED_ON_TARGET_M:
+                    report("Mission complete (landed and disarmed).")
+                    return
+                raise RuntimeError(
+                    f"vehicle landed and disarmed {distance:.0f} m from the LAND point - reached "
+                    f"waypoint {highest_reached}/{last_seq}, likely a failsafe landing"
+                )
         elif kind == "STATUSTEXT":
             report(f"[FC] {message.text}")
         # else: a telemetry type (see TELEMETRY_TYPES) - handed to on_message

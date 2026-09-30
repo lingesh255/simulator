@@ -43,6 +43,7 @@ from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import MIN_GRID_DRONES, PlanRunResult, PlanService, plan_kind
 from services.plan_service import PlanRunResult, PlanService, plan_kind
+from services.fleet_mission import SHARED_ROUTE_SPACING_M, FleetMission, offset_route
 from services.renode_launch_service import RenodeLaunchService
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
@@ -122,6 +123,10 @@ class MainWindow(QMainWindow):
         # existing "Fly via real MAVLink" field - mavlink_flight above then
         # consumes it completely unchanged.
         self.renode_launch = RenodeLaunchService(self)
+        # Two or more drones with Renode as the vehicle fly as a fleet: one
+        # Renode instance, MAVLink connection and mission per drone (see
+        # _start_fleet_mission). One drone keeps the single-instance path.
+        self.fleet = FleetMission(self)
         # Where the CURRENTLY booted-or-booting Renode instance's vehicle
         # actually spawns - defaults to RenodeLauncher's own confirmed
         # Canberra default, matching a manual "Launch Renode" click's
@@ -142,6 +147,14 @@ class MainWindow(QMainWindow):
         # before it can actually start flying - (PlanRunResult, drones)
         # or None. Consumed by _on_renode_ready().
         self._pending_mavlink_mission: tuple[object, list] | None = None
+        # Connection string the last ready Renode reported - lets
+        # _start_external_mavlink_mission tell "Connect holds Renode's own
+        # address" (Renode is the vehicle) from a SITL/hardware address the
+        # user typed in themselves (leave Renode alone).
+        self._renode_connection: str | None = None
+        # Whether the external-MAVLink mission now flying (or just ended)
+        # uses Renode as its vehicle - only then does its end relaunch Renode.
+        self._mission_uses_renode = False
         # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
         # when the panel's "Use built-in mock vehicle" box is checked - a
         # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
@@ -391,7 +404,7 @@ class MainWindow(QMainWindow):
         )
         self.renode_launch.failed.connect(
             lambda _msg: self.mission_planner.mavlink_connection_edit.setPlaceholderText(
-                "udp:127.0.0.1:14550 (SITL/mock convention - not used if launching Renode below)"
+                MissionPlannerPanel.CONNECTION_PLACEHOLDER
             )
         )
         # set_renode_ready(False) also clears _renode_launch_in_progress and
@@ -402,7 +415,13 @@ class MainWindow(QMainWindow):
         # earlier connection above (set_renode_ready only touches
         # enabled-state, not status text).
         self.renode_launch.failed.connect(lambda _msg: self.mission_planner.set_renode_ready(False))
+        self.renode_launch.failed.connect(self._on_renode_launch_failed)
         self.renode_launch.ready.connect(self._on_renode_ready)
+
+        self.fleet.batch_ready.connect(self._on_telemetry)
+        self.fleet.progress.connect(self._on_fleet_progress)
+        self.fleet.boot_failed.connect(self._on_fleet_boot_failed)
+        self.fleet.finished.connect(self._on_fleet_finished)
         self.drone_management.selection_changed.connect(self._on_drone_selection_changed)
         self._on_drone_selection_changed()
 
@@ -693,6 +712,9 @@ class MainWindow(QMainWindow):
 
     def _on_stop(self) -> None:
         self._accepting_telemetry = False
+        # A mission waiting on a Renode boot must not fly after Stop.
+        self._pending_mavlink_mission = None
+        self.fleet.stop()
         self.flight_sim.stop()
         self.mavlink_flight.abort()
         self._stop_mock_vehicle()
@@ -965,6 +987,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Plan ready, but no drones are checked to fly it.")
             return
 
+        if self.mission_planner.use_external_mavlink() and len(drones) >= 2 and self._renode_is_vehicle():
+            self._start_fleet_mission(result, drones)
+            return
+
         if result.per_drone_waypoints is not None:
             if self._plan_kind in ("formation", "grid_formation"):
                 noun = "slot"
@@ -1068,24 +1094,67 @@ class MainWindow(QMainWindow):
         bind/connect, producing an infinite "EOF on TCP socket" loop that
         never reached ready(). Mirrors _restart_renode_after_mission()'s
         already-validated stop()-then-relaunch order exactly.
-        """
-        connection = self.mission_planner.mavlink_connection_string()
-        if not connection:
-            message = "Enter a MAVLink connection string first, e.g. udp:127.0.0.1:14550."
-            self.mission_planner.set_status(message)
-            self.statusBar().showMessage(message, 10000)
-            return
 
+        Plan Mission no longer waits for a manual "Launch Renode": Renode is
+        the vehicle whenever the mock vehicle isn't selected and Connect is
+        empty or holds the address the last ready Renode reported. Then:
+        ready at this Start point -> fly now; ready elsewhere, or not
+        launched at all -> stash the mission and (re)launch here; still
+        booting here -> stash and fly once ready; still booting elsewhere
+        -> ask the user to wait and plan again (a booting launch can't be
+        redirected - RenodeLaunchService rejects a second one).
+        `_renode_target_lat/lon` only describes a real instance while one
+        is ready or booting; before any launch it is just the default.
+        """
+        panel = self.mission_planner
+        connection = panel.mavlink_connection_string()
         source = result.waypoints[0]  # the exact point this route was solved from
 
-        if not self.mission_planner.use_mock_vehicle() and not self._renode_location_matches(source):
+        uses_renode = self._renode_is_vehicle()
+        if not uses_renode:
+            if not connection:
+                message = "Enter a MAVLink connection string first, e.g. udp:127.0.0.1:14550."
+                panel.set_status(message)
+                self.statusBar().showMessage(message, 10000)
+                return
+            self._fly_external_mavlink_mission(result, drones, connection, uses_renode=False)
+            return
+
+        instance_exists = panel.renode_ready or panel.renode_launch_in_progress
+        at_start = instance_exists and self._renode_location_matches(source)
+
+        if panel.renode_launch_in_progress:
+            if at_start:
+                self._pending_mavlink_mission = (result, drones)
+                message = (
+                    "Renode is still booting at this Start point - the mission starts "
+                    "as soon as it's ready."
+                )
+            else:
+                message = (
+                    "Renode is still booting at a different location - wait for it to "
+                    "finish, then click Plan Mission again."
+                )
+            panel.set_status(message)
+            self.statusBar().showMessage(message, 10000)
+            self.flight_log.log_event(message)
+            return
+
+        if not at_start:
             self._pending_mavlink_mission = (result, drones)
             self._renode_target_lat = source.lat
             self._renode_target_lon = source.lon
-            message = (
-                f"Start point changed - relaunching Renode at ({source.lat:.5f}, "
-                f"{source.lon:.5f}) before this mission can fly (a fresh boot, ~75-160s)..."
-            )
+            if panel.renode_ready:
+                message = (
+                    f"Start point changed - relaunching Renode at ({source.lat:.5f}, "
+                    f"{source.lon:.5f}) before this mission can fly (a fresh boot, ~75-160s)..."
+                )
+            else:
+                message = (
+                    f"Launching Renode at this mission's Start point ({source.lat:.5f}, "
+                    f"{source.lon:.5f}) - a fresh boot, ~75-160s; the mission starts "
+                    "automatically once it's ready..."
+                )
             self.mission_planner.set_status(message)
             self.statusBar().showMessage(message, 10000)
             # Permanent record, not just the transient status label -
@@ -1105,13 +1174,175 @@ class MainWindow(QMainWindow):
             self.mission_planner._on_renode_launch_clicked()
             return
 
-        self._fly_external_mavlink_mission(result, drones, connection)
+        # Ready at this Start point. Connect may have been cleared by hand
+        # since ready() filled it in, so fly Renode's own reported address.
+        self._fly_external_mavlink_mission(
+            result, drones, self._renode_connection or connection, uses_renode=True
+        )
 
-    def _fly_external_mavlink_mission(self, result: PlanRunResult, drones: list, connection: str) -> None:
+    def _renode_is_vehicle(self) -> bool:
+        """Under real MAVLink, Renode is the vehicle unless the mock vehicle
+        is chosen or Connect holds an address the user typed themselves -
+        empty, or the address the last ready Renode reported, both mean
+        Renode."""
+        panel = self.mission_planner
+        connection = panel.mavlink_connection_string()
+        return not panel.use_mock_vehicle() and (not connection or connection == self._renode_connection)
+
+    def _start_fleet_mission(self, result: PlanRunResult, drones: list) -> None:
+        """Fly the plan with one Renode instance per checked drone (instance
+        = SYSID): each drone flies its own route from the plan
+        (per_drone_waypoints), or - for a plan with one shared route - that
+        route shifted SHARED_ROUTE_SPACING_M further east per drone, spawn
+        point included. Every instance is stopped once the fleet's flights
+        have all ended; the next Plan Mission boots a fresh fleet."""
+        panel = self.mission_planner
+        problem = FleetMission.validate(drones)
+        if problem is not None:
+            panel.set_status(f"Fleet not started: {problem}")
+            self.flight_log.log_event(f"Fleet not started: {problem}")
+            QMessageBox.information(self, "Cannot fly this fleet", problem)
+            return
+
+        if result.per_drone_waypoints is not None:
+            routes = list(result.per_drone_waypoints.values())
+            if len(drones) < len(routes):
+                message = (f"Plan '{result.plan_name}' needs {len(routes)} drone(s), "
+                           f"but only {len(drones)} are checked.")
+                panel.set_status(message)
+                self.statusBar().showMessage(message, 10000)
+                return
+            assignments = self._separate_spawns(list(zip(drones, routes)))
+            if len(drones) > len(routes):
+                self.flight_log.log_event(
+                    f"{len(drones) - len(routes)} checked drone(s) have no route in this plan and sit it out."
+                )
+        else:
+            assignments = self._separate_spawns([
+                (drone, offset_route(result.waypoints, i * SHARED_ROUTE_SPACING_M))
+                for i, drone in enumerate(drones)
+            ])
+
+        # A single-drone Renode (ready or booting) would be killed by the
+        # fleet's kill-all anyway - stop it cleanly and forget it.
+        self._pending_mavlink_mission = None
+        self.renode_launch.stop()
+        if panel.mavlink_connection_string() == self._renode_connection:
+            panel.mavlink_connection_edit.clear()  # that instance is gone
+        self._renode_connection = None
+        panel.set_renode_ready(False)
+        panel.set_mission_active(True)
+
+        self._accepting_telemetry = True
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([d.sysid for d, _ in assignments])
+        self.map_viewer.clear_drones()
+        self.map_viewer.clear_paths()
+        self.flight_log.log_event(
+            f"Fleet mission '{result.plan_name}': {len(assignments)} drone(s), one Renode instance each."
+        )
+        for drone, route in assignments:
+            self.flight_log.log_event(
+                f"    {drone.name} (SYSID {drone.sysid}): {len(route)} waypoint(s) from "
+                f"({route[0].lat:.6f}, {route[0].lon:.6f}) to ({route[-1].lat:.6f}, {route[-1].lon:.6f})"
+            )
+        self._pending_plan_name = None
+        self._plan_source = None
+        self.fleet.start(assignments, panel.renode_dir_edit.text().strip())
+
+    # One threshold for every plan, spawns and landings alike: only points
+    # that (nearly) coincide get moved - shared endpoints such as a travell
+    # destination or the Search base (~0 m apart) - while V and grid slots
+    # keep their designed spacing. The project spec's formation row asks
+    # for at least 2 m between drones; 5 m leaves margin for the 0-2.4 m
+    # landing error seen in testing.
+    SPAWN_MIN_SEPARATION_M = 5.0
+
+    def _separate_spawns(self, assignments: list) -> list:
+        """No two drones may spawn or land within SPAWN_MIN_SEPARATION_M of
+        each other. Per-drone routes can share both ends - every Search lane
+        starts and ends at the one base - so a drone whose start is too close
+        to an earlier drone's gets its spawn (the start of its first leg)
+        moved east in SHARED_ROUTE_SPACING_M steps until it's clear, and one
+        whose landing point is too close gets its LAND point (the end of its
+        final leg) moved east by the same number of steps as its spawn, or
+        more if still needed. Everything in between is unchanged, and every
+        move is logged. Routes already apart (travell's shifted copies, V
+        wings, grid cells) are left as they are."""
+        separated = []
+
+        def clear(point, index):
+            return all(haversine_m(point, route[index]) >= self.SPAWN_MIN_SEPARATION_M for _, route in separated)
+
+        for drone, route in assignments:
+            start, steps = route[0], 0
+            while not clear(start, 0):
+                steps += 1
+                start = offset_route([route[0]], steps * SHARED_ROUTE_SPACING_M)[0]
+            if steps:
+                self.flight_log.log_event(
+                    f"{drone.name} (SYSID {drone.sysid}): start is within {self.SPAWN_MIN_SEPARATION_M:.0f} m of "
+                    f"another drone's - spawn and first leg moved {steps * SHARED_ROUTE_SPACING_M:.0f} m east "
+                    f"to ({start.lat:.6f}, {start.lon:.6f})."
+                )
+            end = route[-1]
+            land_steps = steps if not clear(end, -1) else 0
+            if land_steps:
+                end = offset_route([route[-1]], land_steps * SHARED_ROUTE_SPACING_M)[0]
+            while not clear(end, -1):
+                land_steps += 1
+                end = offset_route([route[-1]], land_steps * SHARED_ROUTE_SPACING_M)[0]
+            if land_steps:
+                self.flight_log.log_event(
+                    f"{drone.name} (SYSID {drone.sysid}): landing point is within {self.SPAWN_MIN_SEPARATION_M:.0f} m "
+                    f"of another drone's - LAND point and final leg moved {land_steps * SHARED_ROUTE_SPACING_M:.0f} m "
+                    f"east to ({end.lat:.6f}, {end.lon:.6f})."
+                )
+            separated.append((drone, [start, *route[1:-1], end]))
+        return separated
+
+    def _on_fleet_progress(self, message: str) -> None:
+        print(f"[fleet] {message}")
+        self.flight_log.log_event(message)
+        if self._accepting_telemetry:
+            self.mission_planner.set_status(message)
+
+    def _on_fleet_boot_failed(self, message: str) -> None:
+        text = f"Fleet launch failed: {message} - no mission was started."
+        print(f"[fleet] {text}")
+        self.flight_log.log_event(text)
+        self.mission_planner.set_status(text)
+        self.statusBar().showMessage(text, 15000)
+        self.mission_planner.set_mission_active(False)
+        self.drone_management.set_running(False)
+
+    def _on_fleet_finished(self, outcomes: list, fleet_ok: bool) -> None:
+        self.flight_log.log_event("Fleet mission summary:")
+        for o in outcomes:
+            self.flight_log.log_event(
+                f"    {o.name} (SYSID {o.sysid}): {o.state}" + (f" - {o.reason}" if o.reason else "")
+            )
+        completed = sum(o.state == "completed" for o in outcomes)
+        result = (
+            f"Fleet result: {'SUCCESS' if fleet_ok else 'NOT COMPLETE'} - {completed} of {len(outcomes)} "
+            "drone(s) completed. All Renode instances stopped."
+        )
+        print(f"[fleet] {result}")
+        self.flight_log.log_event(result)
+        self.mission_planner.set_status(result)
+        self.statusBar().showMessage(result, 15000)
+        self.mission_planner.set_mission_active(False)
+        self.drone_management.set_running(False)
+
+    def _fly_external_mavlink_mission(
+        self, result: PlanRunResult, drones: list, connection: str, *, uses_renode: bool
+    ) -> None:
         """The part of `_start_external_mavlink_mission()` that actually
         starts the flight - split out so `_on_renode_ready()` can resume
         a mission that was deferred for a location-changing relaunch
-        (`_pending_mavlink_mission`) without duplicating any of this."""
+        (`_pending_mavlink_mission`) without duplicating any of this.
+        `uses_renode` says whether Renode is this mission's vehicle, which
+        decides whether its end relaunches Renode (`_end_external_mission`)."""
         route_text = " -> ".join(result.location_names)
         altitude_m = drones[0].cruise_altitude_m
         sysid = drones[0].sysid
@@ -1121,6 +1352,7 @@ class MainWindow(QMainWindow):
             if not self._start_mock_vehicle(connection, source):
                 return  # status/console already explain why
 
+        self._mission_uses_renode = uses_renode
         self.drone_management.set_running(True)
         # Drop any marker/trail left by a previous run so this mission's first
         # fix appears straight at its own source instead of the icon gliding
@@ -1138,8 +1370,11 @@ class MainWindow(QMainWindow):
         # _on_renode_ready() fires once _restart_renode_after_mission()'s
         # post-flight relaunch completes (see that method - every flight
         # end, including this one's, already triggers a relaunch) - so
-        # there is no separate re-enable call needed here.
-        self.mission_planner.set_renode_ready(False)
+        # there is no separate re-enable call needed here. A mock/typed
+        # vehicle leaves Renode's ready state alone - _end_external_mission
+        # doesn't relaunch it for those.
+        if uses_renode:
+            self.mission_planner.set_renode_ready(False)
         # "Launch Renode" needs its OWN, separate flag rather than reusing
         # the line above - _renode_ready is False both while this mission
         # is flying AND after a genuine failure/disconnect with nothing
@@ -1220,12 +1455,22 @@ class MainWindow(QMainWindow):
         self._stop_mock_vehicle()
         if not self._accepting_telemetry:
             # Worker unwound because of a Stop - `_on_stop` already reported it.
-            self._restart_renode_after_mission("Mission stopped.")
+            self._end_external_mission("Mission stopped.")
             return
         self.drone_management.set_running(False)
         self.statusBar().showMessage("External MAVLink mission complete.", 8000)
         print("[MAVLink] Mission complete.")
-        self._restart_renode_after_mission("External MAVLink mission complete.")
+        self._end_external_mission("External MAVLink mission complete.")
+
+    def _end_external_mission(self, reason: str) -> None:
+        """Every external-MAVLink flight end (complete, failed or stopped).
+        Only a mission that flew Renode relaunches it - a mock vehicle or a
+        typed SITL/hardware address never had Renode as its vehicle."""
+        if self._mission_uses_renode:
+            self._restart_renode_after_mission(reason)
+            return
+        self.mission_planner.set_mission_active(False)
+        self.mission_planner.set_status(reason)
 
     def _restart_renode_after_mission(self, reason: str) -> None:
         """Every "Plan Mission" flight over real MAVLink - success,
@@ -1286,7 +1531,18 @@ class MainWindow(QMainWindow):
         # disabled, not just after the first checkbox click.
         self.mission_planner.set_drone_selected(bool(self.drone_management.checked_sysids()))
 
+    def _on_renode_launch_failed(self, message: str) -> None:
+        """Drop a mission stashed for this launch, so it can't fire on some
+        later, unrelated ready()."""
+        if self._pending_mavlink_mission is None:
+            return
+        self._pending_mavlink_mission = None
+        text = f"Renode launch failed: {message} - the planned mission was not started"
+        self.mission_planner.set_status(text)
+        self.flight_log.log_event(text)
+
     def _on_renode_ready(self, connection_string: str) -> None:
+        self._renode_connection = connection_string
         self.mission_planner.mavlink_connection_edit.setText(connection_string)
         # set_renode_ready() enables "Plan Mission"/the plan combo and
         # "Launch Renode" (once a drone is selected) and sets its own
@@ -1319,7 +1575,7 @@ class MainWindow(QMainWindow):
             result, drones = self._pending_mavlink_mission
             self._pending_mavlink_mission = None
             connection = self.mission_planner.mavlink_connection_string()
-            self._fly_external_mavlink_mission(result, drones, connection)
+            self._fly_external_mavlink_mission(result, drones, connection, uses_renode=True)
 
     def _on_mavlink_flight_failed(self, message: str) -> None:
         self.drone_management.set_running(False)
@@ -1333,7 +1589,7 @@ class MainWindow(QMainWindow):
         # on) AND now actually replaces the dead/corrupted instance,
         # rather than just leaving Plan Mission disabled with no way
         # forward except a manual re-launch.
-        self._restart_renode_after_mission(f"External MAVLink mission failed: {message}")
+        self._end_external_mission(f"External MAVLink mission failed: {message}")
 
     def _start_area_coverage_mission(
         self, result: PlanRunResult, drones: list, *, route_noun: str = "lane"
@@ -1426,6 +1682,7 @@ class MainWindow(QMainWindow):
         self.plan_service.shutdown()
         self.mavlink_flight.shutdown()
         self.renode_launch.stop()
+        self.fleet.shutdown()
         super().closeEvent(event)
 
     # ---- Telemetry wiring ----
