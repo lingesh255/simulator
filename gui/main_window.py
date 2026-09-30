@@ -155,6 +155,9 @@ class MainWindow(QMainWindow):
         # Whether the external-MAVLink mission now flying (or just ended)
         # uses Renode as its vehicle - only then does its end relaunch Renode.
         self._mission_uses_renode = False
+        # SYSID of the drone flying the current single external-MAVLink
+        # mission, for its row in the Flight Log table.
+        self._external_sysid: int | None = None
         # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
         # when the panel's "Use built-in mock vehicle" box is checked - a
         # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
@@ -422,6 +425,7 @@ class MainWindow(QMainWindow):
         self.fleet.progress.connect(self._on_fleet_progress)
         self.fleet.boot_failed.connect(self._on_fleet_boot_failed)
         self.fleet.finished.connect(self._on_fleet_finished)
+        self.fleet.drone_phase.connect(self.flight_log.set_mission_text)
         self.drone_management.selection_changed.connect(self._on_drone_selection_changed)
         self._on_drone_selection_changed()
 
@@ -486,8 +490,15 @@ class MainWindow(QMainWindow):
             f"{distance_km:.1f} km {label} and will not take off:\n\n{detail}",
         )
 
+    def _start_drone_table(self, drones: list) -> None:
+        """A new run or mission is starting: the Flight Log's drone table
+        drops the previous run's rows and names the new run's drones."""
+        self.flight_log.reset_table({d.sysid: d.name for d in drones})
+        self.flight_log.set_run_active(True)
+
     def _on_emulate(self, drones: list) -> None:
         self._accepting_telemetry = True
+        self._start_drone_table(drones)
         self.flight_log.log_event(
             f"Emulate started - {len(drones)} drone(s): "
             f"{', '.join(f'SYSID {d.sysid}' for d in drones)}"
@@ -700,6 +711,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_flight_finished(self, total_s: float) -> None:
+        self.flight_log.set_run_active(False)
         lost = [f.config.sysid for f in self.flight_sim.flights if f.is_lost]
         landed = [f.config.sysid for f in self.flight_sim.flights if not f.is_lost]
         self.flight_label.setText(f"Flight complete - {format_duration(total_s)}")
@@ -712,6 +724,7 @@ class MainWindow(QMainWindow):
 
     def _on_stop(self) -> None:
         self._accepting_telemetry = False
+        self.flight_log.set_run_active(False)
         # A mission waiting on a Renode boot must not fly after Stop.
         self._pending_mavlink_mission = None
         self.fleet.stop()
@@ -973,6 +986,7 @@ class MainWindow(QMainWindow):
 
     def _on_plan_ready(self, result: PlanRunResult) -> None:
         self._accepting_telemetry = True
+        self._start_drone_table(self.drone_management.checked_drones())
         self.mission_planner.set_plan_steps(result.plan_name, result.steps)
 
         # Mirror ENHSP's solved action sequence into the log alongside the
@@ -1308,6 +1322,7 @@ class MainWindow(QMainWindow):
             self.mission_planner.set_status(message)
 
     def _on_fleet_boot_failed(self, message: str) -> None:
+        self.flight_log.set_run_active(False)
         text = f"Fleet launch failed: {message} - no mission was started."
         print(f"[fleet] {text}")
         self.flight_log.log_event(text)
@@ -1317,6 +1332,7 @@ class MainWindow(QMainWindow):
         self.drone_management.set_running(False)
 
     def _on_fleet_finished(self, outcomes: list, fleet_ok: bool) -> None:
+        self.flight_log.set_run_active(False)
         self.flight_log.log_event("Fleet mission summary:")
         for o in outcomes:
             self.flight_log.log_event(
@@ -1347,6 +1363,7 @@ class MainWindow(QMainWindow):
         altitude_m = drones[0].cruise_altitude_m
         sysid = drones[0].sysid
         source = result.waypoints[0]
+        self._external_sysid = sysid  # the Flight Log table row its progress text goes to
 
         if self.mission_planner.use_mock_vehicle():
             if not self._start_mock_vehicle(connection, source):
@@ -1446,6 +1463,8 @@ class MainWindow(QMainWindow):
 
     def _on_mavlink_flight_progress(self, message: str) -> None:
         print(f"[MAVLink] {message}")
+        if self._external_sysid is not None:
+            self.flight_log.set_mission_text(self._external_sysid, message.removeprefix("[FC] "))
         if not self._accepting_telemetry:
             return  # the run was stopped; don't clobber the "stopped" status
         self.mission_planner.set_status(message)
@@ -1453,6 +1472,10 @@ class MainWindow(QMainWindow):
 
     def _on_mavlink_flight_finished(self) -> None:
         self._stop_mock_vehicle()
+        self.flight_log.set_run_active(False)
+        if self._external_sysid is not None:
+            self.flight_log.set_mission_text(
+                self._external_sysid, "Completed" if self._accepting_telemetry else "Stopped")
         if not self._accepting_telemetry:
             # Worker unwound because of a Stop - `_on_stop` already reported it.
             self._end_external_mission("Mission stopped.")
@@ -1579,6 +1602,9 @@ class MainWindow(QMainWindow):
 
     def _on_mavlink_flight_failed(self, message: str) -> None:
         self.drone_management.set_running(False)
+        self.flight_log.set_run_active(False)
+        if self._external_sysid is not None:
+            self.flight_log.set_mission_text(self._external_sysid, f"Failed - {message}")
         self.statusBar().showMessage(f"External MAVLink mission failed: {message}", 15000)
         print(f"[MAVLink] FAILED: {message}")
         self._stop_mock_vehicle()

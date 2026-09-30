@@ -11,6 +11,8 @@ import itertools
 import math
 import signal
 import subprocess
+
+from PySide6.QtCore import QTimer
 import sys
 import time
 from pathlib import Path
@@ -60,7 +62,15 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
             st["free"] = subprocess.run(["free", "-h"], capture_output=True, text=True).stdout
             log(f"free -h while all {n} drones are airborne:\n" + st["free"])
             resident_sets()
+            QTimer.singleShot(3000, lambda: (d.grab(f"{scenario}_table_midflight.png"), log_table("mid-flight")))
     w.fleet.batch_ready.connect(on_fleet_batch)
+
+    def log_table(when):
+        rows = d.table_rows()
+        log(f"Flight Log table ({when}):\n  " + "\n  ".join(
+            f"{r[0]} | {r[1]} | {r[2]} | alt {r[5]} | bat {r[8]} | upd {r[10]}" for r in rows))
+    w.fleet.finished.connect(lambda *_: QTimer.singleShot(
+        1500, lambda: (d.grab(f"{scenario}_table_final.png"), log_table("after the finish"))))
 
     def common(plan, names=NAMES[:n]):
         d.then(f"check {', '.join(names)}", lambda: True, lambda: d.check_drones(names))
