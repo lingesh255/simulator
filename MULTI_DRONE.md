@@ -45,6 +45,8 @@ What happens with two or more drones (`services/fleet_mission.py`):
 - **End**: once every drone has ended, a per-drone summary and a fleet
   result are logged and every instance is stopped. **Stop** stops every
   drone. The next Plan Mission boots a fresh fleet.
+- **Flight Log**: the Table view shows one row per drone (State, current
+  mission step, position, battery, link); **Logs** switches to the text log.
 
 Plan minimums: Search needs 2 drones, V-formation an odd number from 3, grid
 formation 4.
@@ -116,9 +118,10 @@ failsafe or an early landing.
 
 ## Known limits
 
-- **Memory**: ~2.2 GB per drone. On a 14 GiB machine, 3 drones fit
-  comfortably; 4 need about 10 GiB available before launching; more than
-  4 won't fit.
+- **Memory**: each Renode instance uses 1.8-2.3 GB, so 4 drones use about
+  8-9 GB. In testing on this 14 GiB machine, 3 flying left about 2-3 GiB
+  available; 4 flying left 2.2 GiB available with 2.9 GiB of swap in use.
+  With other apps open, expect heavier swapping.
 - **Grid formation needs 4 drones**; V-formation needs an odd number from 3.
 - **SYSIDs 1-32** only (keeps the port ranges clear of VNC's 5900 and X11's
   6000); two checked profiles may not share one.
