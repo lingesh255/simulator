@@ -109,6 +109,44 @@ class Driver:
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
         self.timer.start(250)
+        # GUI responsiveness: how late a 100 ms timer fires (event-loop lag),
+        # and the process's CPU time over the run.
+        self.lags_ms: list[float] = []
+        self._probe_last = time.monotonic()
+        self._probe = QTimer()
+        self._probe.timeout.connect(self._probe_tick)
+        self._probe.start(100)
+        self._cpu0 = os.times()
+        self._wall0 = time.monotonic()
+
+    def _probe_tick(self):
+        now = time.monotonic()
+        self.lags_ms.append(max(0.0, (now - self._probe_last) * 1000 - 100))
+        self._probe_last = now
+
+    def responsiveness(self) -> str:
+        lags = sorted(self.lags_ms) or [0.0]
+        cpu = os.times()
+        cpu_s = (cpu.user - self._cpu0.user) + (cpu.system - self._cpu0.system)
+        wall = time.monotonic() - self._wall0
+        fl = self.w.flight_log
+        per = fl.table_update_s / fl.table_updates * 1000 if fl.table_updates else 0.0
+        return (f"GUI event-loop lag on a 100 ms timer: median {lags[len(lags) // 2]:.1f} ms, "
+                f"p99 {lags[int(len(lags) * 0.99)]:.1f} ms, max {lags[-1]:.1f} ms over {len(lags)} ticks; "
+                f"GUI process CPU {cpu_s:.1f} s over {wall:.0f} s wall ({100 * cpu_s / max(wall, 1):.0f}% of one core); "
+                f"table refreshes {fl.table_updates}, {fl.table_update_s * 1000:.0f} ms total, {per:.2f} ms each")
+
+    def grab(self, name: str) -> str:
+        OUT.mkdir(exist_ok=True)
+        path = OUT / name
+        self.w.flight_log.grab().save(str(path))
+        log(f"SCREENSHOT {path.name} ({self.w.flight_log.width()}x{self.w.flight_log.height()}, "
+            f"{theme_manager.current_theme()} theme)")
+        return path.name
+
+    def table_rows(self) -> list[list[str]]:
+        m = self.w.flight_log.model
+        return [[m.data(m.index(r, c)) or "" for c in range(m.columnCount())] for r in range(m.rowCount())]
 
     # ---- event capture ----
     def _on_ready(self, conn):
@@ -201,6 +239,7 @@ class Driver:
                 f"armed={rel('armed')} alt_reached={rel('alt_reached')} disarmed/landed={rel('disarmed')} "
                 f"end={rel('end')} ({f['how']}) max_alt={f.get('max_alt', 0):.1f} last_pos={f.get('last_pos')}")
         log(f"ready_count={self.ready_count} launch_fail_count={self.launch_fail_count} flights_started={self.flight_starts}")
+        log(f"RESPONSIVENESS: {self.responsiveness()}")
 
     # ---- UI helpers ----
     def check_drones(self, names=("D1",)):
@@ -260,11 +299,77 @@ def fly(d: Driver, start, dest, label, press_stop_after_landing=True):
     d.then(f"{label}: flight ended", ended_or_landed, lambda: None, timeout_s=1200)
 
 
+def table_demo(d: Driver, w: MainWindow) -> None:
+    """Task 12: three drones on the local preview (the fastest flight), checking
+    the Flight Log table, the Table/Logs toggle, the Logs badge and the log."""
+    fl = w.flight_log
+    st = {}
+
+    def row_summary():
+        return [f"{r[0]} | {r[1]} | {r[2]} | alt {r[5]} | spd {r[6]} | bat {r[8]} | upd {r[10]}" for r in d.table_rows()]
+
+    d.then("dark theme", lambda: True, lambda: theme_manager.set_theme("dark"))
+    d.then("check D1, D2, D3", lambda: True, lambda: d.check_drones(("D1", "D2", "D3")))
+    d.then("empty state", lambda: True, lambda: (
+        log(f"table page shown: {fl.pages.currentIndex() == fl.TABLE}; placeholder visible: "
+            f"{fl._table_stack.currentWidget() is fl.placeholder}; rows {fl.model.rowCount()}"),
+        d.grab("s12_empty_dark.png")))
+    d.then("click Start", lambda: True, lambda: (w.map_viewer.mode_combo.setCurrentText("Set Start Point"),
+                                                 d.click_map(CANBERRA)))
+    d.then("click Destination", lambda: True, lambda: (w.map_viewer.mode_combo.setCurrentText("Set Destination Point"),
+                                                       d.click_map(NORTH)))
+    d.then("click Emulate", lambda: True, lambda: (log(f"Logs button before: {fl.logs_btn.text()!r}"),
+                                                   w.drone_management.emulate_btn.click()))
+    d.then("3 rows, all above 20 m", lambda: fl.model.rowCount() == 3 and all(
+        float(r[5] or 0) > 20 for r in d.table_rows()), lambda: (
+        st.__setitem__("first", d.table_rows()), log("table (t1):\n  " + "\n  ".join(row_summary()))),
+        timeout_s=120)
+    d.then("2 s later", after(2), lambda: (
+        st.__setitem__("second", d.table_rows()), log("table (t2):\n  " + "\n  ".join(row_summary())),
+        log(f"values changed between t1 and t2: {[a[3:8] != b[3:8] for a, b in zip(st['first'], st['second'])]}")))
+    d.then("screenshot table dark", lambda: True, lambda: d.grab("s12_table_dark.png"))
+    d.then("light theme", lambda: True, lambda: theme_manager.set_theme("light"))
+    d.then("screenshot table light", after(0.5), lambda: d.grab("s12_table_light.png"))
+    d.then("dark theme again", lambda: True, lambda: theme_manager.set_theme("dark"))
+
+    def before_logs():
+        st["badge"] = fl.logs_btn.text()
+        st["log_lines_before"] = fl.view.blockCount()
+        log(f"Logs button while on Table: {st['badge']!r}; Clear visible: {fl.clear_btn.isVisible()}")
+        fl.logs_btn.click()
+    d.then("click Logs", after(0.5), before_logs)
+
+    def in_logs():
+        text = fl.view.toPlainText()
+        log(f"after clicking Logs: page={'Logs' if fl.pages.currentIndex() == fl.LOGS else 'Table'}, "
+            f"button {fl.logs_btn.text()!r}, Clear visible: {fl.clear_btn.isVisible()}; log has "
+            f"{text.count(' SYSID ')} telemetry lines and {text.count(' === ')} events")
+        fl.log_event("(harness) an event while Logs is open")
+        log(f"after an event while on Logs: button {fl.logs_btn.text()!r}")
+        d.grab("s12_logs_dark.png")
+    d.then("logs view", after(0.5), in_logs)
+
+    def back_to_table():
+        fl.table_btn.click()
+        n0 = fl.view.blockCount()
+        fl.log_event("(harness) an event while Table is showing")
+        fl.log_event("(harness) another")
+        log(f"back on Table: page={'Table' if fl.pages.currentIndex() == fl.TABLE else 'Logs'}, "
+            f"Clear visible: {fl.clear_btn.isVisible()}, button after 2 events {fl.logs_btn.text()!r}; "
+            f"log grew by {fl.view.blockCount() - n0} lines")
+    d.then("back to Table", after(1), back_to_table)
+    d.then("flight finished", lambda: not w.flight_sim.is_active(), lambda: None, timeout_s=180)
+    d.then("1 s later (last refresh landed)", after(1.0), lambda: (
+        log("table (final):\n  " + "\n  ".join(row_summary())), d.grab("s12_table_final_dark.png")))
+
+
 def main():
     scenario = sys.argv[1]
     app = QApplication(sys.argv)
     theme_manager.set_theme("dark")
     app.setStyleSheet(build_stylesheet(theme_manager.palette()))
+    # As main.py does: the app-wide stylesheet follows the theme.
+    theme_manager.theme_changed.connect(lambda _n: app.setStyleSheet(build_stylesheet(theme_manager.palette())))
     w = MainWindow()
     w.show()
     d = Driver(w)
@@ -289,6 +394,8 @@ def main():
         d.then("settle 20s", after(20),
                lambda: log(f"after 20s: ready_count={d.ready_count} launch_in_progress={mp.renode_launch_in_progress} "
                            f"renode.progress lines={sum('renode.progress' in l for l in LOG)} {d.plan_btn_state()}"))
+    elif scenario == "table_demo":
+        table_demo(d, w)
     else:
         import fleet_scenarios  # noqa: E402  (Step 6 scenarios, next to this file)
         fleet_scenarios.build(scenario, d, w, log, fly, after, LOG, {"CANBERRA": CANBERRA, "NORTH": NORTH,
