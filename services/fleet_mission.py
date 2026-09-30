@@ -68,6 +68,7 @@ class _BootWorker(QObject):
     ready = Signal(object)    # {sysid: connection_string}
     failed = Signal(str)
     progress = Signal(str)
+    phase = Signal(int, str)  # (sysid, short boot phase) - see FleetMission.drone_phase
 
     def __init__(self):
         super().__init__()
@@ -99,9 +100,11 @@ class _BootWorker(QObject):
                     self._launchers[drone.sysid] = launcher
                 t = time.monotonic()
                 self.progress.emit(f"{drone.name} (SYSID {drone.sysid}): booting Renode instance {drone.sysid} ...")
+                self.phase.emit(drone.sysid, "Booting Renode")
                 # The fleet's abort cancels this launch at any stage, even
                 # before it has spawned anything for stop() to kill.
                 connection = launcher.start(cancel=self._aborted)
+                self.phase.emit(drone.sysid, "GPS fix - waiting for armable")
                 for step in (launcher.provision_first_boot_params, launcher.wait_until_armable):
                     if self._aborted.is_set():
                         launcher.stop()
@@ -111,6 +114,7 @@ class _BootWorker(QObject):
                     launcher.stop()
                     return
                 connections[drone.sysid] = connection
+                self.phase.emit(drone.sysid, "Armable - waiting for the fleet")
                 self.progress.emit(
                     f"{drone.name} (SYSID {drone.sysid}): armable on {connection} after {time.monotonic() - t:.0f}s"
                 )
@@ -184,6 +188,11 @@ class FleetMission(QObject):
 
     batch_ready = Signal(object)
     progress = Signal(str)
+    # (sysid, short text) for each drone's current phase: boot steps, each
+    # line of its flight's progress ("[FC] " prefix stripped), and its final
+    # outcome ("Completed" / "Failed - <reason>" / "Stopped"). Additive to
+    # `progress`, whose texts are unchanged.
+    drone_phase = Signal(int, str)
     boot_failed = Signal(str)
     flying = Signal()
     finished = Signal(object, bool)
@@ -198,6 +207,7 @@ class FleetMission(QObject):
         self._worker.ready.connect(self._on_booted)
         self._worker.failed.connect(self._on_boot_failed)
         self._worker.progress.connect(self.progress)
+        self._worker.phase.connect(self.drone_phase)
         self._boot_requested.connect(self._worker.boot)
         self._thread.start()
         self._plan: _FleetPlan | None = None
@@ -260,6 +270,7 @@ class FleetMission(QObject):
         self._active = False
         for outcome in self._outcomes.values():
             outcome.state, outcome.reason = "failed", "fleet did not boot"
+            self.drone_phase.emit(outcome.sysid, f"Not flown - fleet did not boot: {message}")
         self.boot_failed.emit(message)
 
     def _on_booted(self, connections: dict) -> None:
@@ -276,6 +287,7 @@ class FleetMission(QObject):
             sysid = drone.sysid
             service.batch_ready.connect(lambda batch, s=sysid: self._on_drone_batch(s, batch))
             service.progress.connect(lambda text, d=drone: self.progress.emit(f"[{d.name}] {text}"))
+            service.progress.connect(lambda text, s=sysid: self.drone_phase.emit(s, text.removeprefix("[FC] ")))
             service.finished.connect(lambda s=sysid: self._on_drone_ended(s, None))
             service.failed.connect(lambda text, s=sysid: self._on_drone_ended(s, text))
             self._flights[sysid] = service
@@ -308,6 +320,7 @@ class FleetMission(QObject):
         outcome = self._outcomes[sysid]
         outcome.state, outcome.reason = state, reason
         self.progress.emit(f"{outcome.name} (SYSID {sysid}): {state}" + (f" - {reason}" if reason else ""))
+        self.drone_phase.emit(sysid, {"completed": "Completed", "stopped": "Stopped"}.get(state, f"Failed - {reason}"))
 
     def _on_drone_ended(self, sysid: int, error: str | None) -> None:
         outcome = self._outcomes.get(sysid)

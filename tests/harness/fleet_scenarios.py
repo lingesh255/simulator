@@ -5,18 +5,23 @@
     fleet_kill2      3 drones, drone 2's Renode killed mid-flight
     fleet_dupsysid   two checked profiles sharing a SYSID - must be refused
     fleet_vform3     3 drones, V-formation
-    fleet_grid4      4 drones, grid formation (adds a temporary D4, SYSID 4)
+    fleet_grid4      4 drones, grid formation (adds a temporary harness_grid_d4, SYSID 4)
 """
 import itertools
 import math
 import signal
 import subprocess
+
+from PySide6.QtCore import QTimer
 import sys
 import time
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent
 NAMES = ("D1", "D2", "D3", "D4")
+# fleet_grid4's temporary fourth drone. Its own name - and so its own file,
+# data/profiles/harness_grid_d4.json - so a real D4.json is never touched.
+GRID_D4 = "harness_grid_d4"
 
 
 def build(scenario, d, w, log, fly, after, LOG, pts):
@@ -60,7 +65,15 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
             st["free"] = subprocess.run(["free", "-h"], capture_output=True, text=True).stdout
             log(f"free -h while all {n} drones are airborne:\n" + st["free"])
             resident_sets()
+            QTimer.singleShot(3000, lambda: (d.grab(f"{scenario}_table_midflight.png"), log_table("mid-flight")))
     w.fleet.batch_ready.connect(on_fleet_batch)
+
+    def log_table(when):
+        rows = d.table_rows()
+        log(f"Flight Log table ({when}):\n  " + "\n  ".join(
+            f"{r[0]} | {r[1]} | {r[2]} | alt {r[5]} | bat {r[8]} | upd {r[10]}" for r in rows))
+    w.fleet.finished.connect(lambda *_: QTimer.singleShot(
+        1500, lambda: (d.grab(f"{scenario}_table_final.png"), log_table("after the finish"))))
 
     def common(plan, names=NAMES[:n]):
         d.then(f"check {', '.join(names)}", lambda: True, lambda: d.check_drones(names))
@@ -159,23 +172,30 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
     elif scenario in ("fleet_vform3", "fleet_grid4"):
         if scenario == "fleet_grid4":
             from contracts.gui_orchestration import DroneConfig
+            grid_path = w.store.profiles_dir / f"{GRID_D4}.json"
+            if grid_path.exists():
+                raise SystemExit(f"fleet_grid4: {grid_path} already exists (left over from an earlier run?) - "
+                                 "not touching it; remove it by hand and rerun")
 
             def add_d4():
-                w.store.save_profile(DroneConfig(name="D4", sysid=4, mass_kg=1.5, max_velocity_mps=15.0,
+                w.store.save_profile(DroneConfig(name=GRID_D4, sysid=4, mass_kg=1.5, max_velocity_mps=15.0,
                                                  battery_capacity_mah=15200.0, cruise_altitude_m=50.0))
                 w.drone_management.reload_profiles()
-                log(f"added temporary profile D4 (SYSID 4); profiles now {[p.name for p in w.store.list_profiles()]}")
-            d.then("add temporary D4", lambda: True, add_d4)
-        common("vformation" if scenario == "fleet_vform3" else "gridformation")
+                log(f"added temporary profile {GRID_D4} (SYSID 4) as {grid_path.name}; "
+                    f"profile files now {sorted(p.name for p in w.store.profiles_dir.glob('*.json'))}")
+            d.then(f"add temporary {GRID_D4}", lambda: True, add_d4)
+        common("vformation" if scenario == "fleet_vform3" else "gridformation",
+               names=NAMES[:3] if scenario == "fleet_vform3" else (*NAMES[:3], GRID_D4))
         plan_travell(short_north)
         d.then("fleet finished", lambda: st["finished"] or st["boot_failed"], lambda: None, timeout_s=2400)
 
         def finish():
             summary()
             if scenario == "fleet_grid4":
-                w.store.delete_profile("D4")
+                grid_path.unlink()
                 w.drone_management.reload_profiles()
-                log(f"removed D4; profiles now {[p.name for p in w.store.list_profiles()]}")
+                log(f"removed {grid_path.name}; profile files now "
+                    f"{sorted(p.name for p in w.store.profiles_dir.glob('*.json'))}")
         d.then("settle 10s", after(10), finish)
     elif scenario == "fleet_dupsysid":
         from contracts.gui_orchestration import DroneConfig
