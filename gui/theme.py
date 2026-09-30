@@ -54,6 +54,15 @@ class Palette:
     critical: str
     fault_row_bg: str  # table-row highlight for an active fault - see telemetry_dashboard.py
 
+    # The same meanings as *text* on the panel/window backgrounds (the Flight
+    # Log table). The fills above stay as they are for markers and badges;
+    # these are darkened where needed to reach WCAG AA (>= 4.5:1) against both
+    # panel_bg and window_bg.
+    nominal_text: str
+    warning_text: str
+    critical_text: str
+    accent_text_on_bg: str  # accent-coloured text on the panel background (not text *on* accent)
+
     # Artificial horizon (gui/artificial_horizon.py) - QPainter, not QSS.
     horizon_sky: str
     horizon_ground: str
@@ -74,6 +83,12 @@ LIGHT = Palette(
     warning="#f39c12",
     critical="#e74c3c",
     fault_row_bg="#f8d7da",
+    # Light-theme fills are too pale for text (2-3.8:1): darker shades of the
+    # same hues, 4.8-5.6:1 on #ffffff / #f2f3f5.
+    nominal_text="#1d7a42",
+    warning_text="#9c5700",
+    critical_text="#c0392b",
+    accent_text_on_bg="#9a5b08",
     horizon_sky="#3d85c6",
     horizon_ground="#7f4a26",
     horizon_line="#ffffff",
@@ -93,6 +108,11 @@ DARK = Palette(
     warning="#f39c12",
     critical="#ff6b5b",
     fault_row_bg="#5c2020",
+    # Dark-theme fills already reach 4.9-9.9:1 as text - unchanged.
+    nominal_text="#2ecc71",
+    warning_text="#f39c12",
+    critical_text="#ff6b5b",
+    accent_text_on_bg="#f1c40f",
     horizon_sky="#25415a",
     horizon_ground="#513017",
     horizon_line="#e8e6e3",

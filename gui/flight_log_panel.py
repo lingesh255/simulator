@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from contracts.gui_orchestration import DroneTelemetry
+from gui.mission_steps import mission_step_label
 from gui.theme import theme_manager
 
 MAX_LOG_LINES = 5000
@@ -60,6 +61,11 @@ class _Row:
     # The last telemetry can still say IN_FLIGHT: a flight ends on the disarm
     # heartbeat and its instance is stopped before another position report.
     final_state: str | None = None
+    # Progress lines that aren't mission steps (see gui.mission_steps) don't
+    # change `mission`; the latest one is kept for the Mission tooltip.
+    last_fc: tuple[str, str] | None = None     # (text, HH:MM:SS)
+    trouble: str | None = None                 # "warning" / "critical" while the flight lasts
+    trouble_text: tuple[str, str] | None = None
 
 
 def _final_state(mission: str) -> str | None:
@@ -77,16 +83,16 @@ def _final_state(mission: str) -> str | None:
 def _state_colour(row: _Row, palette) -> str:
     t = row.telemetry
     if row.final_state is not None:
-        return palette.critical if row.final_state == "FAILSAFE" else palette.text_secondary
+        return palette.critical_text if row.final_state == "FAILSAFE" else palette.text_secondary
     if t is None:
         return palette.text_secondary
     status = getattr(t.status, "value", t.status)
     if status == "FAILSAFE" or t.active_faults:
-        return palette.critical
+        return palette.critical_text
     if status == "IN_FLIGHT":
-        return palette.nominal
+        return palette.nominal_text
     if status in ("TAKING_OFF", "LANDING", "ARMED"):
-        return palette.accent
+        return palette.accent_text_on_bg
     return palette.text_secondary  # LANDED, STANDBY
 
 
@@ -156,11 +162,25 @@ class DroneTableModel(QAbstractTableModel):
             self.dataChanged.emit(self.index(min(touched), 0), self.index(max(touched), len(COLUMNS) - 1))
 
     def set_mission(self, sysid: int, text: str) -> None:
+        """One line of this drone's progress: a mission step updates the
+        Mission cell; anything else only lands in its tooltip, and trouble
+        (see gui.mission_steps) adds a warning marker to the current step."""
         i = self._row_for(sysid)
-        if self._rows[i].mission != text:
-            self._rows[i].mission = text
-            self._rows[i].final_state = _final_state(text)
-            self.dataChanged.emit(self.index(i, COL_STATE), self.index(i, COL_MISSION))
+        row = self._rows[i]
+        label, level = mission_step_label(text, previous=row.mission or None)
+        stamp = time.strftime("%H:%M:%S")
+        if level is not None:
+            row.trouble_text = (text.removeprefix("[FC] "), stamp)
+            if row.trouble != "critical":
+                row.trouble = level
+        if label is None:
+            row.last_fc = (text.removeprefix("[FC] "), stamp)
+        else:
+            row.mission = label
+            row.final_state = _final_state(label)
+            if row.final_state is not None:
+                row.trouble = None  # the outcome says it; the tooltip keeps the text
+        self.dataChanged.emit(self.index(i, COL_STATE), self.index(i, COL_MISSION))
 
     def tick(self) -> None:
         """Refresh only the "Updated" column (ages grow without new data)."""
@@ -194,13 +214,15 @@ class DroneTableModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             if col == COL_STATE:
                 return QColor(_state_colour(row, palette))
+            if col == COL_MISSION and row.trouble is not None:
+                return QColor(palette.critical_text if row.trouble == "critical" else palette.warning_text)
             if col == COL_BATTERY and t is not None:
                 if t.battery_pct < 15:
-                    return QColor(palette.critical)
+                    return QColor(palette.critical_text)
                 if t.battery_pct < 30:
-                    return QColor(palette.warning)
+                    return QColor(palette.warning_text)
             if col == COL_UPDATED and self._stale(row):
-                return QColor(palette.warning)
+                return QColor(palette.warning_text)
             if t is None:
                 return QColor(palette.text_secondary)
             return None
@@ -209,13 +231,24 @@ class DroneTableModel(QAbstractTableModel):
                 return QColor(palette.fault_row_bg)
             return None
         if role == Qt.ToolTipRole:
-            if col == COL_MISSION and row.mission:
-                return row.mission
+            if col == COL_MISSION and (row.mission or row.last_fc or row.trouble_text):
+                lines = [row.mission or "(no mission step yet)"]
+                if row.trouble_text is not None:
+                    lines.append(f"Warning: {row.trouble_text[0]} ({row.trouble_text[1]})")
+                if row.last_fc is not None:
+                    lines.append(f"Last FC message: {row.last_fc[0]} ({row.last_fc[1]})")
+                return "\n".join(lines)
             if col == COL_STATE and t is not None and t.active_faults:
                 faults = ", ".join(getattr(f, "value", str(f)) for f in t.active_faults)
                 return f"Active faults: {faults}"
             return None
         return None
+
+    @staticmethod
+    def _mission_text(row: _Row) -> str:
+        if not row.mission and row.trouble is None:
+            return ""
+        return (row.mission or "-") + (" ⚠" if row.trouble is not None else "")
 
     def _stale(self, row: _Row) -> bool:
         return (self.run_active and row.updated_at is not None
@@ -229,13 +262,13 @@ class DroneTableModel(QAbstractTableModel):
             if col == COL_STATE:
                 return row.final_state or ""
             if col == COL_MISSION:
-                return row.mission or "Waiting for telemetry"
+                return self._mission_text(row) or "Waiting for telemetry"
             return ""
         status = getattr(t.status, "value", t.status)
         if col == COL_STATE:
             return row.final_state or status
         if col == COL_MISSION:
-            return row.mission or status  # no mission text for this source: show the state
+            return self._mission_text(row) or status  # no mission steps from this source: show the state
         if col == COL_LAT:
             return f"{t.lat:.6f}"
         if col == COL_LON:
