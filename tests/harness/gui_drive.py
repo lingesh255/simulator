@@ -299,6 +299,10 @@ def fly(d: Driver, start, dest, label, press_stop_after_landing=True):
     d.then(f"{label}: flight ended", ended_or_landed, lambda: None, timeout_s=1200)
 
 
+# Screenshot name prefix for table_demo (TABLE_DEMO_PREFIX=s12 reproduces Task 12's names).
+SHOT_PREFIX = os.environ.get("TABLE_DEMO_PREFIX", "s13")
+
+
 def table_demo(d: Driver, w: MainWindow) -> None:
     """Task 12: three drones on the local preview (the fastest flight), checking
     the Flight Log table, the Table/Logs toggle, the Logs badge and the log."""
@@ -313,7 +317,7 @@ def table_demo(d: Driver, w: MainWindow) -> None:
     d.then("empty state", lambda: True, lambda: (
         log(f"table page shown: {fl.pages.currentIndex() == fl.TABLE}; placeholder visible: "
             f"{fl._table_stack.currentWidget() is fl.placeholder}; rows {fl.model.rowCount()}"),
-        d.grab("s12_empty_dark.png")))
+        d.grab(f"{SHOT_PREFIX}_empty_dark.png")))
     d.then("click Start", lambda: True, lambda: (w.map_viewer.mode_combo.setCurrentText("Set Start Point"),
                                                  d.click_map(CANBERRA)))
     d.then("click Destination", lambda: True, lambda: (w.map_viewer.mode_combo.setCurrentText("Set Destination Point"),
@@ -327,9 +331,9 @@ def table_demo(d: Driver, w: MainWindow) -> None:
     d.then("2 s later", after(2), lambda: (
         st.__setitem__("second", d.table_rows()), log("table (t2):\n  " + "\n  ".join(row_summary())),
         log(f"values changed between t1 and t2: {[a[3:8] != b[3:8] for a, b in zip(st['first'], st['second'])]}")))
-    d.then("screenshot table dark", lambda: True, lambda: d.grab("s12_table_dark.png"))
+    d.then("screenshot table dark", lambda: True, lambda: d.grab(f"{SHOT_PREFIX}_table_dark.png"))
     d.then("light theme", lambda: True, lambda: theme_manager.set_theme("light"))
-    d.then("screenshot table light", after(0.5), lambda: d.grab("s12_table_light.png"))
+    d.then("screenshot table light", after(0.5), lambda: d.grab(f"{SHOT_PREFIX}_table_light.png"))
     d.then("dark theme again", lambda: True, lambda: theme_manager.set_theme("dark"))
 
     def before_logs():
@@ -346,7 +350,7 @@ def table_demo(d: Driver, w: MainWindow) -> None:
             f"{text.count(' SYSID ')} telemetry lines and {text.count(' === ')} events")
         fl.log_event("(harness) an event while Logs is open")
         log(f"after an event while on Logs: button {fl.logs_btn.text()!r}")
-        d.grab("s12_logs_dark.png")
+        d.grab(f"{SHOT_PREFIX}_logs_dark.png")
     d.then("logs view", after(0.5), in_logs)
 
     def back_to_table():
@@ -360,7 +364,7 @@ def table_demo(d: Driver, w: MainWindow) -> None:
     d.then("back to Table", after(1), back_to_table)
     d.then("flight finished", lambda: not w.flight_sim.is_active(), lambda: None, timeout_s=180)
     d.then("1 s later (last refresh landed)", after(1.0), lambda: (
-        log("table (final):\n  " + "\n  ".join(row_summary())), d.grab("s12_table_final_dark.png")))
+        log("table (final):\n  " + "\n  ".join(row_summary())), d.grab(f"{SHOT_PREFIX}_table_final_dark.png")))
 
 
 def main():
