@@ -47,8 +47,10 @@ the window at the end. Needs a display.
 | `table_demo` | D1-D3 on the local preview: the Flight Log table, Table/Logs toggle and Logs badge, with screenshots (prefix from `TABLE_DEMO_PREFIX`, default `s13`) |
 
 Fleet scenarios live in `fleet_scenarios.py`. `fleet_vform3` flies a
-3-drone V-formation and `fleet_grid4` a 4-drone grid (it adds a temporary D4
-profile, SYSID 4, and removes it afterwards).
+3-drone V-formation and `fleet_grid4` a 4-drone grid. For the fourth drone
+it adds a temporary profile, `data/profiles/harness_grid_d4.json` (SYSID 4),
+checks only that one plus D1-D3, and removes only that file afterwards; it
+refuses to start if the file already exists, and never touches a real D4.
 
 To run several scenarios back to back - clearing Renode before each,
 printing the exit code and pgrep after each (and `free -m` before
