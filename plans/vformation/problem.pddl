@@ -68,10 +68,10 @@
         ;; V-formation slot offsets
         (= (slot-along-offset drone-lead)    0)
         (= (slot-cross-offset drone-lead)    0)
-        (= (slot-along-offset drone-left)   -17.320508)
-        (= (slot-cross-offset drone-left)   -10)
-        (= (slot-along-offset drone-right)  -17.320508)
-        (= (slot-cross-offset drone-right)   10)
+        (= (slot-along-offset drone-left)   -25)
+        (= (slot-cross-offset drone-left)   -25)
+        (= (slot-along-offset drone-right)  -25)
+        (= (slot-cross-offset drone-right)   25)
 
 
         ;; Neighbor communication - each drone talks to its own left/right

@@ -90,39 +90,31 @@ def _area_drone_names(count: int) -> list[str]:
     `engine.search_problem.expand_search_drones` names them."""
     return [f"drone{i}" for i in range(1, max(MIN_AREA_COVERAGE_DRONES, count) + 1)]
 
-<<<<<<< HEAD
 # Drone objects the vformation problem template fixes, apex first. This is
 # also the launch order the executor stages takeoff in (see
 # `services.thread_backend.ThreadSwarmBackend.start_formation_mission`): the
 # lead departs alone first, then the left wing, then the right wing.
 FORMATION_DRONES = ("drone-lead", "drone-left", "drone-right")
-# The V's shape, in metres: each wing sits this far behind its apex slot and
-# this far out to its side - together putting the leader and both wings at
-# the corners of an equilateral triangle with 20 m sides (every drone
-# exactly 20 m from both of the others, at every point along the route -
-# source and destination alike, see `formation_wing_routes`). Must be kept
-# in sync with the `slot-along-offset`/`slot-cross-offset` numbers in
-=======
 # The V's shape, in metres: rank 1 of each wing sits this far behind its
-# apex slot and this far out to its side - together putting the leader and
-# both rank-1 wings at the corners of an equilateral triangle with 20 m
-# sides (every drone exactly 20 m from both of the others, at every point
-# along the route - source and destination alike, see
-# `formation_wing_routes`). A further rank sits that same 20 m past the
-# previous one (`formation_wing_routes` called again with `back_m`/`side_m`
-# scaled by the rank number). Must be kept in sync with the
+# apex slot and this far out to its side. Equal back/side puts each wing on
+# a 45 degree line off the leader's track - flying north that is exactly
+# south-west and south-east of the leader - and ~35.4 m from it (wing to
+# wing: 50 m), so the V is clearly visible on the map rather than the
+# drones' icons overlapping into a line. Held at every point along the
+# route - source and destination alike, see `formation_wing_routes`. A
+# further rank sits that same offset past the previous one
+# (`formation_wing_routes` called again with `back_m`/`side_m` scaled by the
+# rank number). Must be kept in sync with the
 # `slot-along-offset`/`slot-cross-offset` numbers in
->>>>>>> origin/main
 # plans/vformation/problem.pddl - they describe the same geometry, but
 # aren't read from the PDDL file directly (formation_wing_routes works from
 # the apex's actual flown path, not the problem's numeric fluents).
-FORMATION_BACK_M = 17.320508
-FORMATION_SIDE_M = 10.0
+FORMATION_BACK_M = 25.0
+FORMATION_SIDE_M = 25.0
 
-<<<<<<< HEAD
 # Per-slot cruise altitude, metres - fixed, not terrain-derived (see
 # `_run_formation`/`ThreadSwarmBackend.start_formation_mission`): the lead
-# climbs highest so the two wings, ~17 m behind and to either side, hold
+# climbs highest so the two wings, 25 m behind and to either side, hold
 # station below and clear of its rotor wash/wake.
 FORMATION_LEAD_ALTITUDE_M = 60.0
 FORMATION_WING_ALTITUDE_M = 55.0
@@ -135,7 +127,13 @@ FORMATION_ALTITUDES = (
 # other duration in the sim), not a PDDL-planned delay: see the module
 # docstring and `ThreadSwarmBackend.start_formation_mission`.
 FORMATION_LAUNCH_STAGGER_S = 6.0
-=======
+
+# After climbing to its altitude the lead moves this far forward from the
+# source (along the first leg's heading) and holds there while the wings
+# climb out and take up their slots - the wings' slots are offset from that
+# held position, not from the source itself.
+FORMATION_LEAD_FORWARD_M = 10.0
+
 
 def _formation_drone_names(ranks: int) -> list[str]:
     """`["drone-lead", "drone-left", "drone-right", "drone-left2", ...]` -
@@ -169,7 +167,6 @@ def _grid_drone_names(drone_count: int) -> list[str]:
 
     ordered_cells = sorted(cell_name, key=manhattan)
     return [cell_name[cell] for cell in ordered_cells]
->>>>>>> origin/main
 
 # Domain name (as written in `(define (domain NAME) ...)`) -> plan kind.
 # Anything not listed here defaults to "point_to_point" - the shape every
@@ -440,7 +437,21 @@ class _Worker(QObject):
             )
             routes.append(left_route)
             routes.append(right_route)
-        per_drone_waypoints = dict(zip(_formation_drone_names(ranks), (_as_gui(r) for r in routes)))
+        formation_names = _formation_drone_names(ranks)
+        per_drone_waypoints = dict(zip(formation_names, (_as_gui(r) for r in routes)))
+        # Setting this is what marks the result as a *formation* for the
+        # executors (gui/main_window.py's `_start_area_coverage_external_mavlink`
+        # and `_start_area_coverage_mission` both branch on
+        # `per_drone_altitudes is not None`): without it a V is flown as
+        # plain search lanes - every drone launches at once from the pad
+        # straight toward its own offset destination, so nothing ever climbs
+        # out to its slot, the launch isn't staggered, and the wings never
+        # form the V (they fan out from the pad instead). Lead climbs
+        # highest, every wing (any rank) holds the wing altitude.
+        per_drone_altitudes = {
+            name: (FORMATION_LEAD_ALTITUDE_M if name == "drone-lead" else FORMATION_WING_ALTITUDE_M)
+            for name in formation_names
+        }
 
         return PlanRunResult(
             plan_name=plan_name,
@@ -449,6 +460,7 @@ class _Worker(QObject):
             location_names=corridor,
             run_dir=run_dir,
             per_drone_waypoints=per_drone_waypoints,
+            per_drone_altitudes=per_drone_altitudes,
         )
 
     def _run_grid_formation(
@@ -536,12 +548,6 @@ class _Worker(QObject):
         def _as_gui(route: list[PddlLatLon]) -> list[LatLon]:
             return [LatLon(lat=p.lat, lon=p.lon) for p in route]
 
-<<<<<<< HEAD
-        per_drone_waypoints = dict(
-            zip(FORMATION_DRONES, (_as_gui(lead_route), _as_gui(left_route), _as_gui(right_route)))
-        )
-        per_drone_altitudes = dict(zip(FORMATION_DRONES, FORMATION_ALTITUDES))
-=======
         cell_name = grid_cell_names(rows, cols)
         leader_cell = next(cell for cell, name in cell_name.items() if name == "drone-lead")
         routes: dict[str, list[LatLon]] = {"drone-lead": _as_gui(lead_route)}
@@ -559,8 +565,15 @@ class _Worker(QObject):
                 cross_m=(col - leader_cell[1]) * GRID_SPACING_M,
             )
             routes[name] = _as_gui(member_route)
-        per_drone_waypoints = {name: routes[name] for name in _grid_drone_names(rows * cols)}
->>>>>>> origin/main
+        grid_names = _grid_drone_names(rows * cols)
+        per_drone_waypoints = {name: routes[name] for name in grid_names}
+        # Same rationale as `FORMATION_LEAD_ALTITUDE_M`/`FORMATION_WING_ALTITUDE_M`
+        # for a V: the leader climbs highest so every other member, level
+        # with/behind it, clears its rotor wash/wake.
+        per_drone_altitudes = {
+            name: (FORMATION_LEAD_ALTITUDE_M if name == "drone-lead" else FORMATION_WING_ALTITUDE_M)
+            for name in grid_names
+        }
 
         return PlanRunResult(
             plan_name=plan_name,

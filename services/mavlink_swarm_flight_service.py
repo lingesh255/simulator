@@ -75,7 +75,7 @@ class _SwarmWorker(QObject):
     def request_abort(self) -> None:
         self._abort = True
 
-    @Slot(list, list, list, float, object)
+    @Slot(list, list, list, float, object, list, list)
     def run(
         self,
         assignments: list,
@@ -83,8 +83,19 @@ class _SwarmWorker(QObject):
         altitudes: list,
         launch_stagger_s: float = 0.0,
         launch_point: object = None,
+        speeds: list | None = None,
+        slots: list | None = None,
     ) -> None:
-        """`assignments` is `[(sysid, name, [(lat, lon), ...]), ...]`,
+        """`slots[i]` (formation only) is assignment i's `(lat, lon)` holding
+        spot after its climb-out - for the lead, its advance point a few
+        metres forward of the source; for a wing, its slot offset from that.
+        Defaults to each route's first point.
+
+        `speeds[i]` is assignment i's cruise speed in m/s - that drone's own
+        configured speed (its profile's `max_velocity_mps`); `None` leaves
+        every vehicle at `engine.mavlink_mission.DEFAULT_CRUISE_SPEED_MPS`.
+
+        `assignments` is `[(sysid, name, [(lat, lon), ...]), ...]`,
         `connection_strings[i]`/`altitudes[i]` are that assignment's pymavlink
         connection and cruise altitude (metres).
 
@@ -105,6 +116,8 @@ class _SwarmWorker(QObject):
         launches every drone together, straight onto its own route, exactly
         as before this parameter existed.
         """
+        speeds = speeds or None
+        slots = slots or None
         self._abort = False
         self._tick = 0
         self._start_time = time.monotonic()
@@ -170,8 +183,13 @@ class _SwarmWorker(QObject):
                 time.sleep(0.2)
                 waited += 0.2
 
-        def fly(sysid: int, name: str, pts: list, conn: str, altitude_m: float, index: int) -> None:
+        def fly(
+            sysid: int, name: str, pts: list, conn: str, altitude_m: float, index: int,
+            speed_mps: float | None,
+        ) -> None:
             master = None
+            # Only passed when given, so upload_and_fly's own default applies otherwise.
+            speed_kwargs = {} if speed_mps is None else {"cruise_speed_mps": float(speed_mps)}
             try:
                 from pymavlink import mavutil
 
@@ -210,7 +228,7 @@ class _SwarmWorker(QObject):
                     # strings out along the route instead of departing intact
                     # - see services.thread_backend's equivalent gate for the
                     # in-app (non-MAVLink) execution path.
-                    slot = pts[0]
+                    slot = tuple(slots[index]) if slots else pts[0]
                     upload_and_fly(
                         master, [pad, slot], altitude_m,
                         heartbeat_timeout_s=30.0,
@@ -218,9 +236,17 @@ class _SwarmWorker(QObject):
                         should_abort=lambda: self._abort,
                         on_message=lambda msg, s=sysid: self._on_message(s, msg),
                         final_command=mav2.MAV_CMD_NAV_LOITER_UNLIM,
+                        **speed_kwargs,
                     )
                     self.progress.emit(f"{name}: in slot at {altitude_m:g}m - launch point clear.")
                     in_slot_events[index].set()
+                    if index + 1 < len(assignments):
+                        # The hand-off itself is `in_slot_events[index]`, which
+                        # the next drone's thread is blocked on (see above).
+                        self.progress.emit(
+                            f"{name}: signalling {assignments[index + 1][1]} to take off "
+                            f"(after a {launch_stagger_s:g}s settle)."
+                        )
                     wait_for_formation(sysid, name)
                     self.progress.emit(f"{name}: formation assembled - proceeding to the real route.")
 
@@ -230,6 +256,7 @@ class _SwarmWorker(QObject):
                     on_progress=lambda m, n=name: self.progress.emit(f"{n}: {m}"),
                     should_abort=lambda: self._abort,
                     on_message=lambda msg, s=sysid: self._on_message(s, msg),
+                    **speed_kwargs,
                 )
             except FlightAborted:
                 self.progress.emit(f"{name}: stopped.")
@@ -258,9 +285,9 @@ class _SwarmWorker(QObject):
         # of it reports in slot (see `in_slot_events`) rather than on a blind
         # sleep here that could not tell whether the pad was actually clear.
         threads = [
-            threading.Thread(target=fly, args=(sysid, name, pts, conn, alt, i), daemon=True)
-            for i, ((sysid, name, pts), conn, alt) in enumerate(
-                zip(assignments, connection_strings, altitudes)
+            threading.Thread(target=fly, args=(sysid, name, pts, conn, alt, i, spd), daemon=True)
+            for i, ((sysid, name, pts), conn, alt, spd) in enumerate(
+                zip(assignments, connection_strings, altitudes, speeds or [None] * len(assignments))
             )
         ]
         for t in threads:
@@ -340,7 +367,7 @@ class MavlinkSwarmFlightService(QObject):
     finished = Signal()
     failed = Signal(str)
 
-    _run_requested = Signal(list, list, list, float, object)
+    _run_requested = Signal(list, list, list, float, object, list, list)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -361,8 +388,12 @@ class MavlinkSwarmFlightService(QObject):
         altitudes: list,
         launch_stagger_s: float = 0.0,
         launch_point: object = None,
+        speeds: list | None = None,
+        slots: list | None = None,
     ) -> None:
-        """`assignments`: `[(sysid, name, [(lat, lon), ...]), ...]`.
+        """`slots`: formation holding spot per assignment, `(lat, lon)` (see
+        `_SwarmWorker.run`). `speeds`: one cruise speed (m/s) per assignment - each drone's own
+        configured speed - or None for the default. `assignments`: `[(sysid, name, [(lat, lon), ...]), ...]`.
         `connection_strings`/`altitudes`: one pymavlink connection string and
         cruise altitude (metres) per assignment. `launch_stagger_s` > 0 makes
         it a V-formation: every drone takes off from the shared
@@ -371,6 +402,8 @@ class MavlinkSwarmFlightService(QObject):
         it reaches its slot - see `_SwarmWorker.run`."""
         self._run_requested.emit(
             assignments, connection_strings, altitudes, launch_stagger_s, launch_point,
+            list(speeds) if speeds is not None else [],
+            [list(x) for x in slots] if slots is not None else [],
         )
 
     def abort(self) -> None:

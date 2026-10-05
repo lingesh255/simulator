@@ -108,7 +108,30 @@ def main() -> None:
         "--no-fake-flight", action="store_true",
         help="don't actually fly the mission after upload - just verify the upload itself",
     )
+    parser.add_argument(
+        "--reject-arm", type=int, default=0, metavar="N",
+        help="reject the first N arm attempts with MAV_RESULT_TEMPORARILY_REJECTED "
+             "(and stay disarmed), then accept - how a real autopilot behaves while "
+             "EKF/GPS are still converging right after boot. Used to verify the GUI's "
+             "flight code retries arming instead of giving up after one attempt; a "
+             "real vehicle that isn't ready yet looks exactly like this. Default 0 "
+             "(always accept), same as before this option existed.",
+    )
+    parser.add_argument(
+        "--time-scale", type=float, default=1.0,
+        help="simulated-time multiplier for climb/cruise movement, matching "
+             "services.thread_backend.ThreadSwarmBackend's own time_scale (the "
+             "in-process 'Local preview'/thread simulator runs 20x real time "
+             "by default) - a real SITL/hardware flies at true speed "
+             "regardless, so without this the mock vehicle looked far slower "
+             "than what testing normally shows. 1.0 (default) is true "
+             "real-time speed; reported ground_speed_mps stays at the real "
+             "CRUISE_SPEED_MPS either way, same as the in-process simulator's "
+             "own telemetry - only how fast simulated position advances "
+             "against the wall clock changes.",
+    )
     args = parser.parse_args()
+    args.time_scale = max(1.0, args.time_scale)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
@@ -156,6 +179,15 @@ def main() -> None:
     heading_deg = 0.0
     leg_index = 0  # index into `mission` of the waypoint currently headed for
     flying = False
+    # Mutable, not the module constant directly - a real GCS mission (see
+    # engine.mavlink_mission.upload_and_fly's cruise_speed_mps) sends a real
+    # MAV_CMD_DO_CHANGE_SPEED once AUTO is confirmed, and this fake autopilot
+    # should actually fly at whatever speed it was told, the same way a real
+    # ArduPilot vehicle's WPNAV_SPEED would change - not silently keep
+    # cruising at the fixed default while just acking the command like any
+    # other unhandled COMMAND_LONG.
+    cruise_speed_mps = CRUISE_SPEED_MPS
+    arm_rejections_left = args.reject_arm
 
     def start_flight() -> None:
         nonlocal pos_lat, pos_lon, pos_alt, leg_index, flying
@@ -163,8 +195,8 @@ def main() -> None:
             # A genuine fresh launch from the ground.
             if args.home is not None:
                 pos_lat, pos_lon = args.home
-            elif len(mission) > 1:
-                pos_lat, pos_lon = mission[1][0], mission[1][1]
+            elif len(mission) > 2:
+                pos_lat, pos_lon = mission[2][0], mission[2][1]
                 print("  (no --home given - starting at the first real waypoint instead of the true source)")
             pos_alt = 0.0
             print(f" airborne at ({pos_lat:.6f}, {pos_lon:.6f}) - flying {len(mission)} item(s)")
@@ -184,19 +216,32 @@ def main() -> None:
             last_heartbeat = now
 
         if flying and now - last_telemetry >= TELEMETRY_INTERVAL_S:
-            dt = now - last_telemetry
+            dt = (now - last_telemetry) * args.time_scale
             last_telemetry = now
             ground_speed = 0.0
 
             if leg_index == 0:
-                # mission[0] is the TAKEOFF item: lat/lon are unused ("wherever
-                # you already are"), only its altitude means anything - climb
-                # in place, then advance straight to the first real waypoint.
-                climb_target_alt = mission[0][2]
+                # mission[0] is an unused HOME placeholder (seq 0 is
+                # unconditionally reserved for home by a real autopilot's
+                # mission storage - see engine.mavlink_mission.
+                # build_mission_items's docstring; its lat/lon/alt are all
+                # zero and mean nothing) - skip it outright rather than
+                # reading anything from it.
+                leg_index = 1
+            elif leg_index == 1:
+                # mission[1] is the real TAKEOFF item: lat/lon are unused
+                # ("wherever you already are"), only its altitude means
+                # anything - climb in place, then advance to the first real
+                # waypoint. Previously this read mission[0]'s (always-zero)
+                # altitude and then navigated toward mission[1]'s (0, 0) -
+                # unused - lat/lon as if it were a real waypoint, sending the
+                # vehicle off toward Null Island instead of climbing and
+                # heading for the actual route.
+                climb_target_alt = mission[1][2]
                 if pos_alt < climb_target_alt - 0.1:
                     pos_alt = min(climb_target_alt, pos_alt + CLIMB_RATE_MPS * dt)
                 else:
-                    leg_index = 1
+                    leg_index = 2
             elif leg_index >= len(mission):
                 # Mission fully consumed by a non-landing final item (see
                 # below) - just hold here, armed, streaming telemetry, until
@@ -220,13 +265,13 @@ def main() -> None:
                             # deliberately not a landing, so stay up and wait.
                             print(f"  holding at ({pos_lat:.6f}, {pos_lon:.6f}) - {target_name}, awaiting next mission")
                 else:
-                    step = CRUISE_SPEED_MPS * dt
+                    step = cruise_speed_mps * dt
                     fraction = min(1.0, step / remaining)
                     heading_deg = _bearing_deg(pos_lat, pos_lon, target_lat, target_lon)
                     pos_lat += (target_lat - pos_lat) * fraction
                     pos_lon += (target_lon - pos_lon) * fraction
                     pos_alt += (target_alt - pos_alt) * fraction
-                    ground_speed = CRUISE_SPEED_MPS
+                    ground_speed = cruise_speed_mps
 
             send_telemetry(pos_lat, pos_lon, pos_alt, heading_deg, ground_speed)
 
@@ -245,15 +290,24 @@ def main() -> None:
             elif kind == "COMMAND_LONG":
                 name = _cmd_name(message.command)
                 print(f"COMMAND_LONG: {name}  (param1={message.param1}, param2={message.param2})")
+                result = mav2.MAV_RESULT_ACCEPTED
                 if message.command == mav2.MAV_CMD_COMPONENT_ARM_DISARM:
-                    armed = bool(message.param1)
-                    print(f"  -> {'ARMED' if armed else 'DISARMED'}")
+                    if message.param1 and arm_rejections_left > 0:
+                        arm_rejections_left -= 1
+                        result = mav2.MAV_RESULT_TEMPORARILY_REJECTED
+                        print(f"  -> ARM REJECTED (not ready yet; {arm_rejections_left} more rejection(s) queued)")
+                    else:
+                        armed = bool(message.param1)
+                        print(f"  -> {'ARMED' if armed else 'DISARMED'}")
                 elif message.command == mav2.MAV_CMD_DO_SET_MODE:
                     mode = int(message.param2)
                     print(f"  -> mode set to {mode}")
                     if not args.no_fake_flight and mode == MODE_AUTO and armed and mission_uploaded and not flying:
                         start_flight()
-                send(mav.command_ack_encode(message.command, mav2.MAV_RESULT_ACCEPTED))
+                elif message.command == mav2.MAV_CMD_DO_CHANGE_SPEED:
+                    cruise_speed_mps = message.param2
+                    print(f"  -> cruise speed set to {cruise_speed_mps:g} m/s")
+                send(mav.command_ack_encode(message.command, result))
 
             elif kind == "MISSION_COUNT":
                 expecting_count = message.count

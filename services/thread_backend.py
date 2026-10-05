@@ -38,10 +38,15 @@ from engine.flight_controller import SimulatedFlightController
 from engine.fleet import DroneFleet
 from engine.gcs import GroundControlStation
 from engine.protocol import CommandName
+from engine.pddl_problem import advance_along_first_leg
 from engine.terrain import plan_terrain_profile
 from services.local_flight import EmergencyLanding, nearest_point, plan_flights
 
 POLL_MS = 100
+
+# See services.plan_service.FORMATION_LEAD_FORWARD_M (kept here, not imported:
+# plan_service imports this module's siblings).
+FORMATION_LEAD_FORWARD_M = 10.0
 
 # How close (metres) a drone's altitude must be to its target for
 # `ThreadSwarmBackend._check_formation_assembly` to call it "there" - the
@@ -275,14 +280,10 @@ class ThreadSwarmBackend(QObject):
         self._gcs.register_many(self._views)
         self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
 
-        source = [waypoints[0].lat, waypoints[0].lon, 0.0]
-        target = [waypoints[1].lat, waypoints[1].lon, altitudes[1]]
-        is_final = 1 >= len(waypoints) - 1
         for sysid in self._views:
             self._paths[sysid] = list(waypoints)
             self._altitudes[sysid] = list(altitudes)
-            self._leg_index[sysid] = 1
-            self._gcs.navigate(sysid, source, target, final=is_final)
+            self._navigate_route(sysid, list(waypoints), list(altitudes), 1, final=True)
 
         self._elapsed_s = 0.0
         self._tick = 0
@@ -336,13 +337,9 @@ class ThreadSwarmBackend(QObject):
 
         for sysid in self._views:
             points, altitudes = per_drone[sysid]
-            source = [points[0].lat, points[0].lon, 0.0]
-            target = [points[1].lat, points[1].lon, altitudes[1]]
-            is_final = 1 >= len(points) - 1
             self._paths[sysid] = list(points)
             self._altitudes[sysid] = list(altitudes)
-            self._leg_index[sysid] = 1
-            self._gcs.navigate(sysid, source, target, final=is_final)
+            self._navigate_route(sysid, list(points), list(altitudes), 1, final=True)
 
         self._elapsed_s = 0.0
         self._tick = 0
@@ -484,7 +481,13 @@ class ThreadSwarmBackend(QObject):
             if not points or not altitudes:
                 continue
             pad = self._formation_pad or points[0]
-            slot = points[0]
+            # Slot = the drone's route start shifted forward by the lead's
+            # 10 m advance (see FORMATION_LEAD_FORWARD_M): the lead climbs
+            # then moves forward and holds, the wings take up their places
+            # relative to that.
+            lead_route = self._paths.get(self._formation_launch_order[0], points)
+            slot_lat, slot_lon = advance_along_first_leg(points[0], lead_route, FORMATION_LEAD_FORWARD_M)
+            slot = LatLon(lat=slot_lat, lon=slot_lon)
             altitude = altitudes[0]
             self._gcs.navigate(
                 sysid, [pad.lat, pad.lon, 0.0], [slot.lat, slot.lon, altitude], final=False,
@@ -539,18 +542,11 @@ class ThreadSwarmBackend(QObject):
             altitudes = self._altitudes.get(sysid)
             if not points or len(points) < 2 or not altitudes:
                 continue
-            self._gcs.navigate(
-                sysid,
-                [points[0].lat, points[0].lon, altitudes[0]],
-                [points[1].lat, points[1].lon, altitudes[1]],
-                # Never land straight off this NAVIGATE, even if leg 1 is
-                # the route's last point: a formation drone always arrives
-                # and holds first (`_check_formation_landing` sends the real
-                # LAND, staggered, once every drone has arrived) - see the
-                # matching override in `_advance_legs`.
-                final=False,
-            )
-            self._leg_index[sysid] = 1
+            # The whole real route goes out as one mission. Never land at its
+            # end (`final=False`): a formation drone always arrives and holds
+            # first (`_check_formation_landing` sends the real LAND,
+            # staggered, once every drone has arrived).
+            self._navigate_route(sysid, points, altitudes, 1, final=False)
         self._slot_wait.clear()
         self._in_slot.clear()
 
@@ -640,6 +636,39 @@ class ThreadSwarmBackend(QObject):
         )
         self._views[drone.sysid] = _FlightView(drone, thread, link, home)
         return True
+
+    def _navigate_route(
+        self, sysid: int, points: list[LatLon], altitudes: list[float], first: int, final: bool,
+    ) -> None:
+        """Send `sysid` the route `points[first:]` (each at its own
+        `altitudes[i]`) - the WHOLE of it in one command with a firmware
+        attached, so the drone's flight controller holds the entire
+        TAKEOFF / WAYPOINT ... / LAND mission from the start and flies it
+        end to end by itself; `_advance_legs` has nothing left to chain
+        (`_leg_index` is parked on the last point, which it skips).
+
+        Without firmware the drone's own kinematics only fly one destination
+        at a time, so this falls back to the older leg-by-leg chaining:
+        send the first leg now, `_advance_legs` sends each next one on
+        arrival.
+        """
+        if self.use_firmware and len(points) - first >= 1:
+            self._leg_index[sysid] = len(points) - 1
+            self._gcs.navigate(
+                sysid,
+                [points[first - 1].lat, points[first - 1].lon, 0.0],
+                [points[-1].lat, points[-1].lon, altitudes[-1]],
+                final=final,
+                route=[[p.lat, p.lon, altitudes[i]] for i, p in enumerate(points) if i >= first],
+            )
+            return
+        self._leg_index[sysid] = first
+        self._gcs.navigate(
+            sysid,
+            [points[first - 1].lat, points[first - 1].lon, 0.0],
+            [points[first].lat, points[first].lon, altitudes[first]],
+            final=final and first >= len(points) - 1,
+        )
 
     def stop(self) -> None:
         self._timer.stop()

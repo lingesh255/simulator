@@ -101,8 +101,8 @@ _CLI_SOLVE_DIR_NAME = "cli"  # where a fresh --source/--dest solve writes its pr
 # Kept in sync with services.plan_service.FORMATION_DRONES/FORMATION_ALTITUDES/
 # FORMATION_LAUNCH_STAGGER_S, which the GUI's in-app formation mission uses.
 FORMATION_DRONES = ("drone-lead", "drone-left", "drone-right")
-FORMATION_BACK_M = 17.320508
-FORMATION_SIDE_M = 10.0
+FORMATION_BACK_M = 25.0
+FORMATION_SIDE_M = 25.0
 FORMATION_ALTITUDES = {"drone-lead": 60.0, "drone-left": 55.0, "drone-right": 55.0}
 FORMATION_LAUNCH_STAGGER_S = 6.0
 # How close (metres) a drone's altitude must be to its target to count as

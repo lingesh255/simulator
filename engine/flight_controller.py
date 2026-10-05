@@ -308,6 +308,17 @@ class SimulatedFlightController(FlightController):
             return
 
         st.vertical_speed_mps = 0.0
+        if st.mission_seq < len(self._mission):
+            # Every item of an uploaded route carries its own altitude, so
+            # head for the one being flown now: heading for waypoint k means
+            # flying at waypoint k's altitude (the climb/descent block above
+            # picks it up on the next step - the vehicle settles at it before
+            # moving on, same as it always has between legs). Items with no
+            # altitude (0) leave the current target alone.
+            item_alt = self._mission[st.mission_seq][2]
+            if item_alt > 0 and abs(item_alt - self._target_alt_m) > 0.1:
+                self._target_alt_m = item_alt
+                return
         if st.mission_seq >= len(self._mission):
             st.mission_complete = True
             if st.mode == MODE_RTL:
@@ -330,11 +341,11 @@ class SimulatedFlightController(FlightController):
                 st.ground_speed_mps = 0.0
                 if self._mission_lands_at_end:
                     st.mode = MODE_LAND  # ArduPilot's land-at-end behaviour
-                # else: just the next leg of a chained route - hold here.
-                # ThreadSwarmBackend._advance_legs sends the next leg's own
-                # NAVIGATE the moment it notices the same arrival, which
-                # re-uploads a fresh mission and this waypoint is forgotten;
-                # nothing lands here.
+                # else: the mission's last item was an ordinary waypoint (a
+                # formation drone's hold, or - for the older leg-by-leg
+                # chaining, still used when no firmware is attached - the
+                # next leg arriving as a fresh mission): hold here, nothing
+                # lands.
             return
 
         step = self.cruise_speed_mps * dt

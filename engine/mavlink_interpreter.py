@@ -122,6 +122,10 @@ class CommandInterpreter:
                 mav2.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, altitude)]
 
         if kind is CommandType.GOTO:
+            route = payload.get("route")
+            if route:
+                # A whole multi-waypoint route: one mission, uploaded once.
+                return self.build_route_mission(route, final=bool(payload.get("final", True)))
             destination = payload.get("destination")
             if destination is None:
                 return []
@@ -198,6 +202,60 @@ class CommandInterpreter:
             ),
         ]
         return frames
+
+    def build_route_mission(self, route: list[Position], final: bool = True) -> list[bytes]:
+        """A whole route as ONE mission, uploaded in a single conversation:
+
+            seq 0   NAV_TAKEOFF   (the first waypoint's altitude)
+            seq 1   NAV_WAYPOINT  route[0]
+            ...
+            seq N   NAV_WAYPOINT  route[N-1]      (NAV_LAND if `final`)
+
+        - the same shape `engine.mavlink_mission.build_mission_items` uploads
+        to an external autopilot, instead of `build_waypoint_mission`'s
+        two-item mission per leg that the caller then had to chain by
+        re-uploading every time a leg finished. Each item carries its own
+        altitude (a terrain-following route changes it from waypoint to
+        waypoint); the flight controller works through them on its own, so
+        nothing further needs sending until the route is over. `final`
+        False makes the last item an ordinary waypoint, so the vehicle
+        holds there instead of landing (a formation drone waits for its
+        staggered landing command).
+        """
+        if not route:
+            return []
+        takeoff = self._mav.mission_item_int_encode(
+            self.target_system, self.target_component,
+            0,                                        # seq
+            mav2.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            mav2.MAV_CMD_NAV_TAKEOFF,
+            0, 1,                                     # current, autocontinue
+            0, 0, 0, 0,
+            0, 0, float(route[0].alt_m or 50.0),
+        )
+        items = [takeoff]
+        for index, point in enumerate(route):
+            last = index == len(route) - 1
+            items.append(self._mav.mission_item_int_encode(
+                self.target_system, self.target_component,
+                index + 1,
+                mav2.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                mav2.MAV_CMD_NAV_LAND if (last and final) else mav2.MAV_CMD_NAV_WAYPOINT,
+                0, 1,
+                0, 0, 0, 0,
+                int(point.lat * 1e7), int(point.lon * 1e7), float(point.alt_m or 50.0),
+            ))
+        self.pending_mission = MissionPlan(items=items, uploading=True)
+        return [
+            self._set_mode(MODE_GUIDED),
+            self._command(mav2.MAV_CMD_COMPONENT_ARM_DISARM, 1),
+            self._frame(
+                self._mav.mission_count_encode(
+                    self.target_system, self.target_component,
+                    self.pending_mission.count, mav2.MAV_MISSION_TYPE_MISSION,
+                )
+            ),
+        ]
 
     # ---- Uplink handling (the mission protocol is a conversation) ----
 

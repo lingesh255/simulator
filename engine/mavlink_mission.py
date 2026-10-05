@@ -30,22 +30,18 @@ def build_mission_items(
     *,
     final_command: Optional[int] = None,
 ):
-<<<<<<< HEAD
-    """[(lat, lon), ...] -> MISSION_ITEM_INT messages: TAKEOFF, WAYPOINT x N, <final>.
-=======
     """[(lat, lon), ...] -> MISSION_ITEM_INT messages: HOME placeholder,
-    TAKEOFF, WAYPOINT x N, LAND.
->>>>>>> origin/main
+    TAKEOFF, WAYPOINT x N, <final>.
 
     Mirrors the shape ArduPilot expects for a normal auto mission: item 0 is
-    a takeoff (climbs from wherever the vehicle currently is - lat/lon are
-    unused for it), every point in between is an ordinary waypoint, and the
-<<<<<<< HEAD
-    last point carries `final_command` (default `MAV_CMD_NAV_LAND`) rather
-    than just another waypoint. Intermediate points are exactly the route
-    the PDDL planner worked out - including any detour it planned around a
-    restricted area - so flying them in order clears that area by
-    construction; nothing here re-checks it.
+    a placeholder (see below), item 1 is the takeoff (climbs from wherever
+    the vehicle currently is - lat/lon are unused for it), every point in
+    between is an ordinary waypoint, and the last point carries
+    `final_command` (default `MAV_CMD_NAV_LAND`) rather than just another
+    waypoint. Intermediate points are exactly the route the PDDL planner
+    worked out - including any detour it planned around a restricted area -
+    so flying them in order clears that area by construction; nothing here
+    re-checks it.
 
     `final_command` other than `MAV_CMD_NAV_LAND` - e.g.
     `MAV_CMD_NAV_LOITER_UNLIM` to hold there instead of landing - keeps
@@ -54,11 +50,6 @@ def build_mission_items(
     which flies a `[home, home]` "route" with this to make a drone climb
     then hold in place over its own launch point, real MAVLink command and
     all, rather than land there.
-=======
-    last point is a landing rather than just another waypoint. Intermediate
-    points are exactly the route the PDDL planner worked out - including any
-    detour it planned around a restricted area - so flying them in order
-    clears that area by construction; nothing here re-checks it.
 
     Item 0 in the list this returns is NOT the takeoff, though - it's an
     unused placeholder. Confirmed by direct empirical test (uploading a
@@ -78,7 +69,6 @@ def build_mission_items(
     implementations (QGroundControl, Mission Planner) always upload an
     explicit, effectively-unused item at seq 0 for exactly this reason -
     this mirrors that, not a Renode-specific workaround.
->>>>>>> origin/main
     """
     if len(waypoints) < 2:
         raise ValueError("need at least a source and a destination")
@@ -132,6 +122,9 @@ TELEMETRY_TYPES = ("GLOBAL_POSITION_INT", "SYS_STATUS", "GPS_RAW_INT", "HEARTBEA
 _TRACKED_TYPES = ("MISSION_ITEM_REACHED", "STATUSTEXT") + TELEMETRY_TYPES
 
 
+DEFAULT_CRUISE_SPEED_MPS = 5.0
+
+
 def upload_and_fly(
     master,
     waypoints: list[tuple[float, float]],
@@ -144,6 +137,7 @@ def upload_and_fly(
     should_abort: Optional[Callable[[], bool]] = None,
     on_message: Optional[Callable[[object], None]] = None,
     final_command: Optional[int] = None,
+    cruise_speed_mps: Optional[float] = DEFAULT_CRUISE_SPEED_MPS,
 ) -> None:
     """Connect, upload the route as one mission, arm, fly it, and return once
     the final waypoint is reached.
@@ -169,6 +163,21 @@ def upload_and_fly(
     see `services.mavlink_swarm_flight_service`'s staggered V-formation
     launch, which calls this twice per drone - once to climb-and-hold, once
     (after every drone in the formation has) for the real route.
+
+    `cruise_speed_mps`, once AUTO is confirmed, is sent as a real
+    `MAV_CMD_DO_CHANGE_SPEED` (ground speed) - without this, a real
+    ArduPilot vehicle just flies at whatever its own `WPNAV_SPEED` default
+    already is, and `scripts/mock_sitl.py`'s fake autopilot flies at a much
+    faster fixed 15 m/s, both of which made a mission look like it was
+    racing across the map rather than a deliberate, watchable flight.
+    `DEFAULT_CRUISE_SPEED_MPS` (5 m/s) is a real decrease for the mock
+    vehicle and matches ArduCopter's own stock default for a real vehicle -
+    pass a different value, or `None` to skip sending it entirely and leave
+    the vehicle's own configured speed alone. Best-effort: a missing/
+    rejected ack is reported, not raised - `scripts/mock_sitl.py` acks any
+    COMMAND_LONG generically, but a real autopilot that genuinely rejects
+    the change shouldn't abort an otherwise-flyable mission over its cruise
+    speed alone.
     """
     report = on_progress or (lambda _msg: None)
     aborted = should_abort or (lambda: False)
@@ -216,13 +225,62 @@ def upload_and_fly(
             mav2.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id, 0, 0, 0, 0, 0,
         )
 
+    def wait_for_command_ack(command: int, timeout_s: float):
+        """Drain COMMAND_ACKs until one for `command` specifically arrives,
+        instead of trusting "whichever COMMAND_ACK turns up first" - a real,
+        confirmed bug (see `wait_until_armable`'s docstring in
+        engine/renode_launcher.py): DO_SET_MODE(GUIDED) is sent immediately
+        before COMPONENT_ARM_DISARM, and a fast-answering autopilot can have
+        GUIDED's own ack (command=176) still sitting in the socket buffer
+        when the code goes looking for the arm ack, reading it as if it were
+        one. Mismatched acks (e.g. a late MISSION_ITEM_REACHED-adjacent
+        STATUSTEXT) are silently skipped rather than treated as failure -
+        only a genuine timeout with nothing matching counts as "no ack"."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            message = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=remaining)
+            if message is None:
+                return None
+            if message.command == command:
+                return message
+
     set_mode("GUIDED")
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mav2.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0,
-    )
-    ack = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=item_timeout_s)
-    report(f"Arm ack: {ack}")
+    # Arming is retried, not a single blind attempt: a real vehicle can
+    # genuinely reject an early arm attempt (e.g. EKF/GPS still converging
+    # moments after boot - exactly the situation a just-launched formation
+    # wing is in) with a real COMMAND_ACK carrying a non-ACCEPTED result, and
+    # the previous single-attempt version treated that ack as informational
+    # only, never checked its result, and never tried again - leaving that
+    # vehicle disarmed and stationary for the rest of the flight while any
+    # sibling drone whose one attempt happened to land after the vehicle was
+    # ready flew on normally (see renode_launcher.py's `wait_until_armable`
+    # docstring, which diagnosed this exact sequencing bug from real
+    # evidence). A missing ack is retried the same as an explicit rejection -
+    # both are "not armed yet", not proof the vehicle never will be.
+    armed_ack = None
+    max_arm_attempts = 5
+    for attempt in range(1, max_arm_attempts + 1):
+        master.mav.command_long_send(
+            master.target_system, master.target_component,
+            mav2.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0,
+        )
+        armed_ack = wait_for_command_ack(mav2.MAV_CMD_COMPONENT_ARM_DISARM, item_timeout_s)
+        if armed_ack is not None and armed_ack.result == mav2.MAV_RESULT_ACCEPTED:
+            break
+        report(
+            f"Arm not confirmed yet (attempt {attempt}/{max_arm_attempts}, "
+            f"ack: {armed_ack}), retrying."
+        )
+        armed_ack = None
+        time.sleep(0.5)
+    report(f"Arm ack: {armed_ack}")
+    if armed_ack is None:
+        raise RuntimeError(
+            f"arm never accepted via COMMAND_ACK after {max_arm_attempts} attempts"
+        )
 
     # DO_SET_MODE's own COMMAND_ACK does not guarantee the mode actually
     # took - AUTO mode's init() can reject the switch internally (e.g. a
@@ -269,6 +327,16 @@ def upload_and_fly(
             f"AUTO mode never confirmed via HEARTBEAT.custom_mode after "
             f"{max_attempts} attempts"
         )
+
+    if cruise_speed_mps is not None:
+        master.mav.command_long_send(
+            master.target_system, master.target_component,
+            mav2.MAV_CMD_DO_CHANGE_SPEED, 0,
+            0,  # param1: speed type - 0 = airspeed, but Copter treats both as ground speed
+            float(cruise_speed_mps), -1, 0, 0, 0, 0,  # param3 -1 = leave throttle unchanged
+        )
+        ack = wait_for_command_ack(mav2.MAV_CMD_DO_CHANGE_SPEED, item_timeout_s)
+        report(f"Cruise speed set to {cruise_speed_mps:g} m/s (ack: {ack}).")
 
     report("Flying mission.")
     last_seq = len(items) - 1

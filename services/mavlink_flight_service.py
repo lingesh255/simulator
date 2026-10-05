@@ -68,9 +68,10 @@ class _Worker(QObject):
     def request_abort(self) -> None:
         self._abort = True
 
-    @Slot(list, str, float, int)
+    @Slot(list, str, float, int, float)
     def run(
-        self, waypoints: list[LatLon], connection_string: str, altitude_m: float, sysid: int
+        self, waypoints: list[LatLon], connection_string: str, altitude_m: float, sysid: int,
+        cruise_speed_mps: float,
     ) -> None:
         self._abort = False
         state = _VehicleState(lat=waypoints[0].lat, lon=waypoints[0].lon)
@@ -131,6 +132,7 @@ class _Worker(QObject):
                 on_progress=self.progress.emit,
                 should_abort=lambda: self._abort,
                 on_message=handle_message,
+                cruise_speed_mps=cruise_speed_mps,
             )
         except FlightAborted:
             # A deliberate Stop, not a failure - the GUI has already torn the
@@ -159,7 +161,7 @@ class MavlinkFlightService(QObject):
     finished = Signal()
     failed = Signal(str)
 
-    _run_requested = Signal(list, str, float, int)
+    _run_requested = Signal(list, str, float, int, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -174,9 +176,14 @@ class MavlinkFlightService(QObject):
         self._thread.start()
 
     def run_async(
-        self, waypoints: list[LatLon], connection_string: str, altitude_m: float, sysid: int
+        self, waypoints: list[LatLon], connection_string: str, altitude_m: float, sysid: int,
+        cruise_speed_mps: float,
     ) -> None:
-        self._run_requested.emit(waypoints, connection_string, altitude_m, sysid)
+        """`cruise_speed_mps` is the drone's own configured speed (its
+        profile's `max_velocity_mps`), sent to the vehicle as a
+        MAV_CMD_DO_CHANGE_SPEED once AUTO is confirmed - see
+        engine.mavlink_mission.upload_and_fly."""
+        self._run_requested.emit(waypoints, connection_string, altitude_m, sysid, cruise_speed_mps)
 
     def abort(self) -> None:
         self._worker.request_abort()

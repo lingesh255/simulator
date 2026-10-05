@@ -41,15 +41,17 @@ from gui.telemetry_dashboard import TelemetryDashboard
 from gui.theme import theme_manager
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
-<<<<<<< HEAD
 from services.mavlink_swarm_flight_service import MavlinkSwarmFlightService
-from services.plan_service import FORMATION_LAUNCH_STAGGER_S, PlanRunResult, PlanService, plan_kind
-from services.search_stats_console import SearchStatsConsole
-=======
-from services.plan_service import MIN_GRID_DRONES, PlanRunResult, PlanService, plan_kind
-from services.plan_service import PlanRunResult, PlanService, plan_kind
+from services.plan_service import (
+    FORMATION_LAUNCH_STAGGER_S,
+    FORMATION_LEAD_FORWARD_M,
+    MIN_GRID_DRONES,
+    PlanRunResult,
+    PlanService,
+    plan_kind,
+)
 from services.renode_launch_service import RenodeLaunchService
->>>>>>> origin/main
+from services.search_stats_console import SearchStatsConsole
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -61,10 +63,15 @@ from services.local_flight import (
     plan_route_flights,
     plan_route_flights_by_drone,
 )
+from engine.pddl_problem import advance_along_first_leg
 from services.storage import ProfileStore
 
 NFZ_CORNER_COUNT = 4  # a restricted area is a quadrilateral, click order = winding order
 FOREST_CORNER_COUNT = 4  # a search area is a quadrilateral too - "dynamic dimensions"
+# Simulated-time multiplier for the built-in mock vehicle (scripts/mock_sitl.py
+# --time-scale). 1.0 = real time, so the commanded cruise speed is the speed
+# actually seen on the map.
+MOCK_VEHICLE_TIME_SCALE = 1.0
 
 
 class MainWindow(QMainWindow):
@@ -122,20 +129,12 @@ class MainWindow(QMainWindow):
         # swap above since it isn't a telemetry source the rest of the GUI
         # polls; it just reports progress/finished/failed while it runs.
         self.mavlink_flight = MavlinkFlightService(self)
-<<<<<<< HEAD
         # The area-coverage counterpart: one real MAVLink mission per drone
         # (its own lane) against one external endpoint each, instead of the
         # single shared route `mavlink_flight` flies. Used when "Fly via real
         # MAVLink" is checked and the plan is a forest search - see
         # `_start_area_coverage_external_mavlink`.
         self.mavlink_swarm = MavlinkSwarmFlightService(self)
-        # Managed by `_start_external_mavlink_mission` /
-        # `_start_area_coverage_external_mavlink` / `_stop_mock_vehicle` when
-        # the panel's "Use built-in mock vehicle" box is checked - one
-        # `scripts/mock_sitl.py` subprocess per drone this window owns the
-        # lifetime of (a point-to-point mission launches exactly one).
-        self._mock_sitl_procs: list[subprocess.Popen] = []
-=======
         # Opt-in fourth flight source: launches the standalone Renode +
         # Pixhawk6C/6X package and, once its MAVLink port is live, hands the
         # resulting connection string to the Mission Planner panel's
@@ -162,11 +161,12 @@ class MainWindow(QMainWindow):
         # before it can actually start flying - (PlanRunResult, drones)
         # or None. Consumed by _on_renode_ready().
         self._pending_mavlink_mission: tuple[object, list] | None = None
-        # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
-        # when the panel's "Use built-in mock vehicle" box is checked - a
-        # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
-        self._mock_sitl_proc: subprocess.Popen | None = None
->>>>>>> origin/main
+        # Managed by `_start_external_mavlink_mission` /
+        # `_start_area_coverage_external_mavlink` / `_stop_mock_vehicle` when
+        # the panel's "Use built-in mock vehicle" box is checked - one
+        # `scripts/mock_sitl.py` subprocess per drone this window owns the
+        # lifetime of (a point-to-point mission launches exactly one).
+        self._mock_sitl_procs: list[subprocess.Popen] = []
         # Cleared on Stop so telemetry batches already queued from a worker
         # thread when Stop was pressed can't slip through and repopulate the
         # map after everything has been torn down. Re-armed by each run start.
@@ -430,6 +430,10 @@ class MainWindow(QMainWindow):
         # earlier connection above (set_renode_ready only touches
         # enabled-state, not status text).
         self.renode_launch.failed.connect(lambda _msg: self.mission_planner.set_renode_ready(False))
+        # No Renode instance exists after a failed launch, so neither the
+        # location-change relaunch nor the post-mission reset applies until
+        # the user launches one again (which sets this back to True).
+        self.renode_launch.failed.connect(lambda _msg: self.mission_planner.set_renode_in_use(False))
         self.renode_launch.ready.connect(self._on_renode_ready)
         self.drone_management.selection_changed.connect(self._on_drone_selection_changed)
         self._on_drone_selection_changed()
@@ -996,25 +1000,20 @@ class MainWindow(QMainWindow):
             return
 
         if result.per_drone_waypoints is not None:
-<<<<<<< HEAD
-            noun = "slot" if self._plan_kind == "formation" else "lane"
-            if self._plan_kind in ("area_coverage", "formation") and self.mission_planner.use_external_mavlink():
+            noun = "slot" if self._plan_kind in ("formation", "grid_formation") else "lane"
+            if (
+                self._plan_kind in ("area_coverage", "formation", "grid_formation")
+                and self.mission_planner.use_external_mavlink()
+            ):
                 # Fly each lane/slot as its own real MAVLink mission (upload
                 # handshake, ARM, AUTO, MISSION_ITEM_REACHED per leg) against
                 # one external endpoint per drone - what scripts/mock_sitl.py
                 # answers - rather than thread_sim's in-process pipeline. For
-                # a V-formation this also stages the launch apex-first (see
+                # a formation this also stages the launch leader-first (see
                 # _start_area_coverage_external_mavlink).
                 self._start_area_coverage_external_mavlink(result, drones)
             else:
                 self._start_area_coverage_mission(result, drones, route_noun=noun)
-=======
-            if self._plan_kind in ("formation", "grid_formation"):
-                noun = "slot"
-            else:
-                noun = "lane"
-            self._start_area_coverage_mission(result, drones, route_noun=noun)
->>>>>>> origin/main
             return
 
         if self.mission_planner.use_external_mavlink():
@@ -1122,7 +1121,13 @@ class MainWindow(QMainWindow):
 
         source = result.waypoints[0]  # the exact point this route was solved from
 
-        if not self.mission_planner.use_mock_vehicle() and not self._renode_location_matches(source):
+        # Only when Renode is what's being flown - with a user-supplied
+        # SITL/hardware Connect string there's nothing to relaunch.
+        if (
+            self.mission_planner.renode_in_use()
+            and not self.mission_planner.use_mock_vehicle()
+            and not self._renode_location_matches(source)
+        ):
             self._pending_mavlink_mission = (result, drones)
             self._renode_target_lat = source.lat
             self._renode_target_lon = source.lon
@@ -1199,7 +1204,12 @@ class MainWindow(QMainWindow):
             f"Flying plan '{result.plan_name}' via real MAVLink at {connection}."
         )
         print(f"[MAVLink] Plan '{result.plan_name}' ({route_text}): connecting to {connection} ...")
-        self.mavlink_flight.run_async(result.waypoints, connection, altitude_m, sysid)
+        # The drone's own configured speed (its profile's max_velocity_mps) -
+        # the same figure the in-app simulator flies it at - not a fixed
+        # value for every vehicle.
+        self.mavlink_flight.run_async(
+            result.waypoints, connection, altitude_m, sysid, drones[0].max_velocity_mps
+        )
         self._pending_plan_name = None
         self._plan_source = None
 
@@ -1299,6 +1309,16 @@ class MainWindow(QMainWindow):
         )
         self.mavlink_swarm.run_async(
             service_assignments, connection_strings, altitudes, launch_stagger_s, launch_point,
+            # One speed per lane/slot: each drone's own configured speed
+            # (profile max_velocity_mps), in the same order as `assignments`.
+            speeds=[cfg.max_velocity_mps for cfg, _ in assignments],
+            # A formation drone's holding spot: the lead climbs, moves
+            # FORMATION_LEAD_FORWARD_M forward of the source and holds; each
+            # wing takes up its slot offset from that spot.
+            slots=(
+                [advance_along_first_leg(r[0], routes[0], FORMATION_LEAD_FORWARD_M) for r in routes]
+                if launch_stagger_s > 0 else None
+            ),
         )
         self._pending_plan_name = None
         self._plan_source = None
@@ -1321,6 +1341,14 @@ class MainWindow(QMainWindow):
             sys.executable, str(script),
             "--port", str(port),
             "--home", f"{source.lat},{source.lon}",
+            # Real time, NOT thread_sim's 20x time_scale: that used to be
+            # passed here so the mock matched the in-process simulator's
+            # pace, but it multiplied the cruise speed engine.mavlink_mission
+            # commands (DEFAULT_CRUISE_SPEED_MPS) by 20 on screen - 5 m/s
+            # became 100 m/s - and squeezed a V-formation's one-at-a-time
+            # launch (climb + stagger) into a second or two, so the drones
+            # looked like they left together. See mock_sitl.py's --time-scale.
+            "--time-scale", str(MOCK_VEHICLE_TIME_SCALE),
         ]
         print(f"[MAVLink] Launching mock vehicle: {' '.join(args)}")
         try:
@@ -1437,6 +1465,11 @@ class MainWindow(QMainWindow):
         # "mission active") for the disabled state the in-progress launch
         # itself is about to set for a different, now-correct reason.
         self.mission_planner.set_mission_active(False)
+        if not self.mission_planner.renode_in_use():
+            # Flew against the user's own SITL/hardware (or the mock
+            # vehicle) - no Renode instance exists to reset.
+            self.mission_planner.set_status(reason)
+            return
         self.renode_launch.stop()
         self.mission_planner._on_renode_launch_clicked()
 

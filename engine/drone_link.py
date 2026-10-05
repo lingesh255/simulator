@@ -153,6 +153,21 @@ class DroneLink:
             # The one mission operation: fly source -> destination. Expands to
             # arm, take off, and route, which the drone's state machine already
             # sequences correctly regardless of its current phase.
+            #
+            # `params["route"]` (a list of [lat, lon, alt]) carries a whole
+            # multi-waypoint route in this ONE command: the drone gets the
+            # entire mission at once (see CommandInterpreter.
+            # build_route_mission) instead of one waypoint per NAVIGATE.
+            # `destination` is then the route's last point.
+            route = [p for p in (_to_position(t) for t in message.params.get("route") or []) if p]
+            if route:
+                final = bool(message.params.get("final", True))
+                payload = {"altitude_m": route[0].alt_m} if route[0].alt_m else {}
+                return [
+                    Command(CommandType.ARM),
+                    Command(CommandType.TAKEOFF, payload),
+                    Command(CommandType.GOTO, {"destination": route[-1], "final": final, "route": route}),
+                ]
             destination = _to_position(message.destination)
             if destination is None:
                 return []

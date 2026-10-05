@@ -783,7 +783,7 @@ def expand_formation_drones(
 
     Each new rank sits exactly as far again past the previous one as rank 1
     sits past the apex, so every consecutive pair along an arm (apex ->
-    rank 1 -> rank 2 -> ...) is the same 20 m apart and the arm reads as a
+    rank 1 -> rank 2 -> ...) is the same distance apart and the arm reads as a
     straight line running out from the apex - the two arms together the
     "V". A rank's `slot-direction` doesn't need a fresh value: it only
     depends on the along/cross *ratio* (see `_wing_slot_direction`), which
@@ -1056,6 +1056,24 @@ def formation_member_route(
         back = (-fwd[0] * along_m, -fwd[1] * along_m)
         route.append(_from_local((back[0] + port[0] * cross_m, back[1] + port[1] * cross_m), here))
     return route
+
+
+def advance_along_first_leg(point, lead_route, metres: float) -> tuple[float, float]:
+    """`point` moved `metres` forward along the heading of `lead_route`'s
+    first leg (source -> next point), as `(lat, lon)`. A V-formation uses it
+    to turn each drone's slot at the source into its real holding spot: the
+    lead climbs, then moves `metres` forward from the source and holds
+    there, and each wing takes up the slot offset from THAT spot - every
+    slot shifts by the same vector, so the V's shape is untouched. Returns
+    `point` unchanged if the route has no usable first leg.
+    """
+    if len(lead_route) < 2:
+        return (point.lat, point.lon)
+    fwd = _unit(_to_local(lead_route[1], lead_route[0]))
+    if fwd is None:
+        return (point.lat, point.lon)
+    moved = _from_local((fwd[0] * metres, fwd[1] * metres), point)
+    return (moved.lat, moved.lon)
 
 
 def formation_wing_routes(
