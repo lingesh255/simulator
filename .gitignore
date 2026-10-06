@@ -55,3 +55,8 @@ plans/*/runs/
 # images), not build output - never commit it. If it's ever missing, see
 # renode_firmware_guide.md for how to regenerate it.
 pixhawk6c_renode_standalone/
+# Per-instance RenodeLauncher work dirs (copied SD/FRAM/flash images, logs)
+renode_instances/
+
+# Test harness logs (tests/harness/README.md)
+tests/harness/out/
