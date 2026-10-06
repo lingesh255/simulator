@@ -110,14 +110,16 @@ FORMATION_LAUNCH_STAGGER_S = 6.0
 ALTITUDE_ARRIVAL_M = 0.5
 
 
-def formation_launch_point(routes: dict[str, list[tuple[float, float]]]) -> tuple[float, float]:
+def formation_launch_point(
+    routes: dict[str, list[tuple[float, float]]], lead: str = FORMATION_DRONES[0]
+) -> tuple[float, float]:
     """The single point on the ground every drone in the formation takes off
     from: the apex route's source, which is the source the plan was solved
     for. The wings' routes start at their own slots instead (see
     `engine.pddl_problem.formation_wing_routes`, which offsets every wing
     waypoint including the first), and those slots are where each wing flies
     to *after* lifting off this point - they are not where it starts."""
-    return routes[FORMATION_DRONES[0]][0]
+    return routes[lead][0]
 
 
 # ---- MAVLink enum -> readable name, for printing the exact command instead
@@ -284,10 +286,20 @@ def validate_locally(
     cruise_speed_mps: float = 15.0,
     tick_s: float = 0.2,
     timeout_s: float = 900.0,
+    *,
+    drone_names: tuple[str, ...] | list[str] = FORMATION_DRONES,
+    slots: dict[str, tuple[float, float]] | None = None,
+    label: str = "V-formation",
 ) -> bool:
     """Run the real MAVLink upload handshake for every drone against its own
-    `SimulatedFlightController`, all three homed on the *same* launch point
+    `SimulatedFlightController`, all homed on the *same* launch point
     and leaving it one at a time.
+
+    `drone_names` is the launch order (first = the one that leaves the pad
+    first; defaults to the V's apex-left-right) and `slots[name]` the
+    `(lat, lon)` each drone climbs out to and holds at (defaults to its
+    route's first point) - which is what lets
+    `scripts/pddl_gridformation_to_mavlink.py` reuse this for an N-drone grid.
 
     Each drone's *first* mission is TAKEOFF + a `MAV_CMD_NAV_LOITER_UNLIM`
     item at its own slot in the airborne V - a real "go there and hold
@@ -310,13 +322,14 @@ def validate_locally(
     """
     from engine.flight_controller import SimulatedFlightController
 
-    pad = formation_launch_point(routes)
+    names = list(drone_names)
+    pad = formation_launch_point(routes, names[0])
 
     drones: dict[str, dict] = {}
-    for name in FORMATION_DRONES:
+    for name in names:
         waypoints = routes[name]
         altitude_m = altitudes[name]
-        slot = waypoints[0]  # this drone's place in the airborne V
+        slot = tuple(slots[name]) if slots else waypoints[0]  # this drone's place in the airborne formation
         mav = mav2.MAVLink(None, srcSystem=255, srcComponent=190)
         mav.robust_parsing = True
         # Climb off the shared pad and go take up the slot, then hold there.
@@ -341,8 +354,8 @@ def validate_locally(
     # Only the apex is due now; each following drone is queued by
     # `check_slot_arrivals` once the one ahead of it has reached its slot and
     # the shared launch point is clear again.
-    launch_times: dict[str, float] = {FORMATION_DRONES[0]: 0.0}
-    launch_pending: list[str] = list(FORMATION_DRONES[1:])
+    launch_times: dict[str, float] = {names[0]: 0.0}
+    launch_pending: list[str] = list(names[1:])
 
     def _upload(name: str, d: dict, items: list, t: float) -> None:
         """One MISSION_COUNT/MISSION_ITEM_INT.../MISSION_ACK conversation,
@@ -415,15 +428,15 @@ def validate_locally(
         each one's real route - no re-arm or mode change needed,
         `SimulatedFlightController` picks up a freshly uploaded mission on its
         very next tick while already armed and in AUTO."""
-        launched = [n for n in FORMATION_DRONES if drones[n]["launched"]]
-        if len(launched) < len(FORMATION_DRONES):
+        launched = [n for n in names if drones[n]["launched"]]
+        if len(launched) < len(names):
             return  # a later drone is still waiting on the launch point
         if any(not drones[n]["in_slot"] for n in launched):
             return  # at least one is still climbing out to its slot
         if all(drones[n]["released"] for n in launched):
             return  # already released - nothing new to do
         print(f"[{t:6.1f}s] formation assembled - releasing all {len(launched)} drone(s) together.")
-        for name in FORMATION_DRONES:
+        for name in names:
             d = drones[name]
             _upload(name, d, d["real_items"], t)
             d["released"] = True
@@ -432,7 +445,7 @@ def validate_locally(
         """Mark every drone that has finished climbing out to its slot, and
         release the next one from the launch point once the drone ahead is
         settled there - the shared pad only ever has one drone on it."""
-        for name in FORMATION_DRONES:
+        for name in names:
             d = drones[name]
             if not d["launched"] or d["in_slot"] or d["released"]:
                 continue
@@ -455,8 +468,8 @@ def validate_locally(
                 print(f"[{t:6.1f}s] {nxt}: due to take off from the launch point at t={launch_times[nxt]:.1f}s.")
 
     print(
-        f"Flying V-formation mission - all three drones take off from "
-        f"({pad[0]:.6f},{pad[1]:.6f}), apex first, each one leaving {launch_stagger_s:g}s after "
+        f"Flying {label} mission - all {len(names)} drones take off from "
+        f"({pad[0]:.6f},{pad[1]:.6f}), {names[0]} first, each one leaving {launch_stagger_s:g}s after "
         f"the drone ahead of it has reached its slot;"
     )
     print("each holds its slot (MAV_CMD_NAV_LOITER_UNLIM) until every one of them is up.")
@@ -476,7 +489,7 @@ def validate_locally(
         release_formation(t)
 
         if t >= next_report:
-            for name in FORMATION_DRONES:
+            for name in names:
                 d = drones[name]
                 if not d["launched"]:
                     due = launch_times.get(name)
@@ -513,7 +526,7 @@ def validate_locally(
             f"missions did not all complete within {timeout_s:.0f}s "
             f"(finished: {', '.join(sorted(done)) or 'none'})"
         )
-    print(f"[{t:6.1f}s] all {len(drones)} drones complete - V-formation mission done.")
+    print(f"[{t:6.1f}s] all {len(drones)} drones complete - {label} mission done.")
     return True
 
 
@@ -526,6 +539,9 @@ def fly_on_connections(
     altitudes: dict[str, float],
     launch_stagger_s: float = FORMATION_LAUNCH_STAGGER_S,
     timeout_s: float = 900.0,
+    *,
+    drone_names: tuple[str, ...] | list[str] = FORMATION_DRONES,
+    slots: dict[str, tuple[float, float]] | None = None,
 ) -> None:
     """One `upload_and_fly` per drone, each on its own thread (it blocks on
     network I/O for the whole flight). Every vehicle is expected to be parked
@@ -547,14 +563,14 @@ def fly_on_connections(
     GLOBAL_POSITION_INT/SYS_STATUS telemetry."""
     from pymavlink import mavutil
 
-    names = list(FORMATION_DRONES)
+    names = list(drone_names)
     if len(connection_strings) != len(names):
         raise SystemExit(
             f"got {len(connection_strings)} connection string(s) for {len(names)} drones - "
-            f"pass one per drone (apex first), comma-separated"
+            f"pass one per drone ({names[0]} first), comma-separated"
         )
 
-    pad = formation_launch_point(routes)
+    pad = formation_launch_point(routes, names[0])
 
     stats: dict[str, dict] = {n: {} for n in names}
     stats_lock = threading.Lock()
@@ -629,7 +645,7 @@ def fly_on_connections(
                 print(f"{name}: launch point clear - connecting to {conn} ...")
 
             master = mavutil.mavlink_connection(conn)
-            slot = routes[name][0]
+            slot = tuple(slots[name]) if slots else routes[name][0]
             # Take off from the shared launch point and go take up the slot.
             upload_and_fly(
                 master, [pad, slot], altitudes[name],
@@ -676,7 +692,7 @@ def fly_on_connections(
                     )
 
     print(
-        f"All {len(names)} vehicles take off from ({pad[0]:.6f},{pad[1]:.6f}), apex first; "
+        f"All {len(names)} vehicles take off from ({pad[0]:.6f},{pad[1]:.6f}), {names[0]} first; "
         f"each waits {launch_stagger_s:g}s after the drone ahead of it reaches its slot."
     )
     workers: list[threading.Thread] = []
