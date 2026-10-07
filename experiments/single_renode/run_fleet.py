@@ -2,8 +2,8 @@
 
     run_fleet.py --mode single   --n 2            # N machines in ONE Renode
     run_fleet.py --mode separate --n 2            # today's one process per drone
-    run_fleet.py --mode single --n 4 --telnet --slow 16
-    run_fleet.py --mode single --n 2 --telnet --slow 8 --fail physics|pause|halt|killall --fail-on-ground
+    run_fleet.py --mode single --n 2 --telnet --fail physics|pause|halt|killall --fail-on-ground
+    run_fleet.py --mode single --n 4 --shared-time --serial --quantum 0.0001 --slow 16   # Task 16's slow setup
 
 Both modes prepare each drone with RenodeLauncher(instance=N) (ports
 5762+N / 9002+N, sysid N, its own SD/FRAM/flash copies) and use its own
@@ -265,16 +265,19 @@ def main() -> int:
     ap.add_argument("--tag", default=None)
     ap.add_argument("--cs-after-first-mach", action="store_true")
     ap.add_argument("--start-per-machine", action="store_true")
-    ap.add_argument("--quantum", default="0.0001", help="single mode: global quantum in seconds")
+    ap.add_argument("--quantum", default="0.01", help="single mode: each machine's quantum in seconds")
     ap.add_argument("--debug-command", action="append", default=[],
                     help="extra monitor command run on every machine before start (diagnostics)")
     ap.add_argument("--unused", type=int, nargs="*", default=[],
                     help="drone numbers that are created as machines but not booted over MAVLink or flown "
                          "(in serial mode the FIRST machine never gets past early boot - see RESULTS.md)")
-    ap.add_argument("--local-time", action="store_true",
-                    help="single mode: give every machine its own time source (needed for --parallel)")
-    ap.add_argument("--parallel", action="store_true",
-                    help="single mode: leave Renode's default parallel machine execution on (it crashes)")
+    ap.add_argument("--shared-time", action="store_true",
+                    help="single mode: plain `mach create` machines on the shared master time source "
+                         "(Task 16's setup; needs --serial --quantum 0.0001 to run at all)")
+    ap.add_argument("--master-quantum", default="0.1",
+                    help="single mode: the master time source's own quantum, in seconds")
+    ap.add_argument("--serial", action="store_true",
+                    help="single mode: one machine executes at a time (emulation SetGlobalSerialExecution)")
     ap.add_argument("--telnet", action="store_true",
                     help="monitor on telnet port %d instead of --console (needed for --fail pause)" % MONITOR_PORT)
     ap.add_argument("--fail-on-ground", action="store_true",
@@ -290,8 +293,8 @@ def main() -> int:
     result: dict = {"tag": tag, "mode": args.mode, "n": args.n, "gc": args.gc, "fail": args.fail,
                     "options": {"cs_after_first_mach": args.cs_after_first_mach,
                                 "start_per_machine": args.start_per_machine, "quantum": args.quantum,
-                                "serial_execution": single and not args.parallel,
-                                "local_time_sources": args.local_time},
+                                "serial_execution": single and args.serial,
+                                "local_time_sources": not args.shared_time, "master_quantum": args.master_quantum},
                     "memory": [], "events": []}
     env = dict(os.environ)
     if args.gc != "default":
@@ -315,8 +318,8 @@ def main() -> int:
             script.write_text(make_fleet_resc.generate(
                 [d.launcher for d in drones], cs_after_first_mach=args.cs_after_first_mach,
                 start_per_machine=args.start_per_machine, quantum=args.quantum,
-                debug_commands=tuple(args.debug_command), serial=not args.parallel,
-                local_time=args.local_time))
+                debug_commands=tuple(args.debug_command), serial=args.serial,
+                local_time=not args.shared_time, master_quantum=args.master_quantum))
             log_path = OUT / f"{tag}_renode.log"
             shared_log = open(log_path, "wb")
             t_launch = time.monotonic()
@@ -440,7 +443,7 @@ def inject(kind: str, drones: list[Drone], shared, result: dict) -> None:
         note(f"pausing only machine {name} through the monitor, alt {victim.alt_m:.1f} m")
         result["monitor_pause"] = monitor(f'mach set "{name}"') + " || " + monitor("machine Pause")
         watch(20, f"with {name} paused")
-        result["monitor_resume"] = monitor(f'mach set "{name}"') + " || " + monitor("machine Resume")
+        result["monitor_resume"] = monitor(f'mach set "{name}"') + " || " + monitor("machine Start")
         watch(15, f"after resuming {name}")
         note(f"now removing machine {name}: mach rem")
         result["monitor_rem"] = monitor(f'mach rem "{name}"', wait_s=8.0)
