@@ -40,6 +40,14 @@ class MissionStepLabel(unittest.TestCase):
         self.assertEqual(mission_step_label("[FC] Mission: 1 Takeoff", previous="Landed"), (None, None))
         self.assertEqual(mission_step_label("[FC] Mission: 1 Takeoff", previous="Armed"), ("Takeoff", None))
 
+    def test_a_final_outcome_is_not_replaced_by_a_later_step(self):
+        failed = "Failed - its physics sidecar exited mid-flight (exit code -9)"
+        self.assertEqual(mission_step_label("Mission stopped.", previous=failed), (None, None))
+        self.assertEqual(mission_step_label("[FC] Mission: 2 Land", previous=failed), (None, None))
+        self.assertEqual(mission_step_label("Mission stopped.", previous="Completed"), (None, None))
+        self.assertEqual(mission_step_label("Stopped", previous=failed), ("Stopped", None))
+        self.assertEqual(mission_step_label("Mission stopped.", previous="Takeoff"), ("Stopping", None))
+
     def test_other_mission_command(self):
         self.check("[FC] Mission: 4 Loiter_Time", "Loiter_Time (item 4)")
 

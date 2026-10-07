@@ -51,6 +51,40 @@ What happens with two or more drones (`services/fleet_mission.py`):
 Plan minimums: Search needs 2 drones, V-formation an odd number from 3, grid
 formation 4.
 
+## Fleet emulation: one Renode per drone, or one shared Renode
+
+**Mission Planner > Fleet emulation** (saved in `data/app_settings.json`)
+chooses how a fleet of two or more drones is emulated. A single drone
+always uses its own Renode.
+
+| | One Renode per drone (default) | Shared Renode (low memory) |
+|---|---|---|
+| Processes | one Renode + one physics sidecar per drone | ONE Renode + one sidecar per drone |
+| Renode memory, 3 drones flying | 6.3 GB | 2.4 GB |
+| Renode memory, 4 drones flying | 8.9 GB | 2.5 GB |
+| Fleet ready (all armable), 3 / 4 drones | 176 s / 192-195 s | 197 s / 230 s |
+| If a Renode dies | only that drone fails | every drone fails |
+
+In the shared mode (`engine/shared_renode.py`) every drone is a machine
+(`drone<SYSID>`) inside one Renode, running in parallel on its own host
+thread. Ports, SYSIDs, SD / FRAM / flash copies and the physics sidecars
+are exactly the per-drone ones described below; routes, separation, the
+landing check, the Flight Log table and Stop work the same.
+
+- Each machine is created with its own time source
+  (`Machine(createLocalTimeSource: true)`, through the monitor's Python).
+  With the monitor's plain `mach create`, two of these machines cannot run
+  in parallel at all - see `experiments/single_renode/RESULTS.md`.
+- The watchdog watches the one Renode (if it dies, every flying drone
+  fails) and each physics sidecar (if one dies, only that drone fails: its
+  machine is halted through Renode's monitor and the others keep flying).
+  A drone whose sidecar has died keeps sending MAVLink, so the sidecar
+  process is the only place it shows.
+- Boot waits are stretched by 25 % per extra drone, because several
+  machines in one process boot a little slower than one alone.
+- The shared Renode's script and console log are in
+  `renode_instances/shared/`.
+
 ## Per-instance isolation (`engine/renode_launcher.py`)
 
 `RenodeLauncher(..., instance=N)`:

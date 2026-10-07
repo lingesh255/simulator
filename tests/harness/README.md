@@ -21,7 +21,7 @@ process whose command line contains the text, including your own shell.
 ## Unit tests
 
 ```bash
-.venv/bin/python -m unittest tests.test_mavlink_mission -v
+.venv/bin/python -m unittest tests.test_mavlink_mission tests.test_mission_steps tests.test_shared_renode -v
 ```
 
 ## GUI scenarios - `gui_drive.py <scenario>`
@@ -44,6 +44,7 @@ the window at the end. Needs a display.
 | `fleet_bootfail`, `fleet_bootfail3` | the last drone's MAVLink port pre-occupied by `port_squatter.py` |
 | `fleet_kill2` | 3 drones, drone 2's Renode killed (SIGKILL) once all are above 20 m |
 | `fleet_dupsysid` | adds a temporary profile sharing SYSID 1, expects the fleet to be refused, removes it |
+| `fleet_sidecar3` | 3 drones, drone 2's physics sidecar killed (SIGKILL) once all are above 20 m - meant for the shared mode, where only the sidecar shows the failure |
 | `table_demo` | D1-D3 on the local preview: the Flight Log table, Table/Logs toggle and Logs badge, with screenshots (prefix from `TABLE_DEMO_PREFIX`, default `s13`) |
 
 Fleet scenarios live in `fleet_scenarios.py`. `fleet_vform3` flies a
@@ -58,6 +59,15 @@ printing the exit code and pgrep after each (and `free -m` before
 
 ```bash
 tests/harness/regression.sh s9e baseline fleet_travell3 fleet_search3 fleet_stop3 fleet_bootfail3
+```
+
+Any fleet scenario flies in the shared-Renode mode with
+`FLEET_EMULATION=shared` in the environment (`per_drone` forces the default;
+unset uses the saved setting). The choice is not written to the settings
+file:
+
+```bash
+FLEET_EMULATION=shared tests/harness/regression.sh s18sh fleet_travell3 fleet_sidecar3
 ```
 
 Each scenario's log lands in `tests/harness/out/<prefix>_<scenario>.out`.
@@ -76,6 +86,9 @@ It can run detached (`nohup setsid ... &`) so it survives the terminal.
 | `sd_check.py` | golden SD image passes `fsck.fat -n`, original untouched, instance 0's command vs main, fresh SD copy on relaunch |
 | `port_conflict_check.py` | a taken MAVLink port fails the instance within seconds, both via the pre-boot check and via Renode's log |
 | `flight_check.py <instance>` | one headless boot + 110 m flight on an instance; reports EKF failsafes and where it landed |
+| `boot_check.py [instance]` | one instance to armable and stopped again, no flight |
+| `launch_command_check.py` | prints the launch command for instances 0, 1 and 3 without starting anything; diff it between two checkouts |
+| `shared_fleet_check.py [n]` | `SharedRenodeFleet`: n drones in one Renode to armable, pids and memory, `stop_drone()` on the last one while the others keep sending heartbeats, `stop_all()` |
 
 ```bash
 .venv/bin/python tests/harness/sd_check.py
