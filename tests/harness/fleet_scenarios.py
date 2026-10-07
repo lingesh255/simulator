@@ -6,9 +6,15 @@
     fleet_dupsysid   two checked profiles sharing a SYSID - must be refused
     fleet_vform3     3 drones, V-formation
     fleet_grid4      4 drones, grid formation (adds a temporary harness_grid_d4, SYSID 4)
+    fleet_sidecar3   3 drones, drone 2's physics sidecar killed mid-flight
+
+FLEET_EMULATION=shared in the environment flies any of them with "Fleet
+emulation" set to "Shared Renode (low memory)" (not saved to the settings
+file); the default is whatever the settings file says.
 """
 import itertools
 import math
+import os
 import signal
 import subprocess
 
@@ -27,6 +33,7 @@ GRID_D4 = "harness_grid_d4"
 def build(scenario, d, w, log, fly, after, LOG, pts):
     mp = w.mission_planner
     n = 3 if scenario == "fleet_kill2" else (int(scenario[-1]) if scenario[-1].isdigit() else 2)
+    emulation = os.environ.get("FLEET_EMULATION")   # "shared" / "per_drone" / unset = the saved setting
     st = {"finished": [], "boot_failed": [], "flying": 0, "all_sysid_batch": None, "free": None,
           "max_alt": {}, "last": {}, "dummy": None, "boot_started": None}
 
@@ -45,7 +52,8 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
         for pid, argv in _renode_processes():
             rss = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
             port = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--physics-port"), None) or \
-                next((p.split()[2] for p in " ".join(argv).split("; ") if p.startswith("physics Connect")), "?")
+                next((p.split()[2] for p in " ".join(argv).split("; ") if p.startswith("physics Connect")), None) or \
+                ("all - the shared Renode" if "fleet.resc" in " ".join(argv) else "?")
             log(f"  pid {pid} {argv[0].rsplit('/', 1)[-1]} (physics port {port}): RSS {int(rss) / 1024:.0f} MB"
                 if rss else f"  pid {pid}: gone")
 
@@ -79,6 +87,16 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
         d.then(f"check {', '.join(names)}", lambda: True, lambda: d.check_drones(names))
         d.then(f"select {plan}", lambda: True, lambda: d.select_plan(plan))
         d.then("check 'Fly via real MAVLink'", lambda: True, lambda: mp.external_mavlink_check.setChecked(True))
+
+        def pick_emulation():
+            combo = mp.fleet_emulation_combo
+            if emulation:
+                combo.blockSignals(True)   # this run only - don't write the settings file
+                combo.setCurrentIndex(combo.findData(emulation))
+                combo.blockSignals(False)
+            log(f"fleet emulation: {combo.currentText()!r} (enabled={combo.isEnabled()}, "
+                f"shared_renode_fleet()={mp.shared_renode_fleet()})")
+        d.then("fleet emulation", lambda: True, pick_emulation)
 
     def plan_travell(dest):
         d.then("click Plan Mission", lambda: True, d.click_plan)
@@ -167,6 +185,26 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
             "Renode processes 5s after the kill: " + (subprocess.run(
                 ["pgrep", "-af", "[r]enode-bin/[r]enode|[r]enode-physics"], capture_output=True, text=True
             ).stdout.strip().replace("\n", " || ") or "(nothing)")))
+        d.then("fleet finished", lambda: st["finished"], lambda: None, timeout_s=1800)
+        d.then("settle 10s", after(10), summary)
+    elif scenario == "fleet_sidecar3":
+        common("travell")
+        plan_travell(short_north)
+        d.then("all 3 drones above 20 m", lambda: all_above(20), lambda: None, timeout_s=1500)
+
+        def kill_sidecar2():
+            from engine.renode_launcher import _renode_processes
+            before = [(pid, argv[0].rsplit("/", 1)[-1]) for pid, argv in _renode_processes()]
+            victims = [pid for pid, argv in _renode_processes()
+                       if argv[0].endswith("renode-physics") and "9004" in argv]
+            for pid in victims:
+                log(f"SIGKILL drone 2's physics sidecar only: pid {pid} (processes before: {before})")
+                subprocess.run(["kill", "-9", str(pid)])
+        d.then("kill drone 2's physics sidecar", lambda: True, kill_sidecar2)
+        d.then("10s later: processes", after(10), lambda: log(
+            "Renode processes 10s after the kill: " + (subprocess.run(
+                ["pgrep", "-af", "[r]enode-bin/[r]enode|[r]enode-physics"], capture_output=True, text=True
+            ).stdout.strip().replace("\n", " || ")[:600] or "(nothing)")))
         d.then("fleet finished", lambda: st["finished"], lambda: None, timeout_s=1800)
         d.then("settle 10s", after(10), summary)
     elif scenario in ("fleet_vform3", "fleet_grid4"):

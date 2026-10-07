@@ -54,9 +54,14 @@ def mission_step_label(text: str, previous: str | None = None) -> tuple[str | No
     `previous` is the drone's current label. After landing, the firmware
     resets its mission and announces "Mission: 1 Takeoff" again on disarm -
     that is not a new takeoff, so it maps to None once the drone is
-    "Landing"/"Landed"."""
+    "Landing"/"Landed". Once the label is a final outcome ("Failed - ...",
+    "Completed", ...) only another final outcome replaces it."""
     label, level = _label(text)
     if label == "Takeoff" and previous in ("Landing", "Landed"):
+        return None, level
+    # A final outcome stays: a drone the fleet has failed still gets its
+    # flight's own "Mission stopped." afterwards, which is not a new step.
+    if previous is not None and previous.startswith(FINAL_PREFIXES) and not (label or "").startswith(FINAL_PREFIXES):
         return None, level
     return label, level
 
