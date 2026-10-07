@@ -271,6 +271,8 @@ def main() -> int:
     ap.add_argument("--unused", type=int, nargs="*", default=[],
                     help="drone numbers that are created as machines but not booted over MAVLink or flown "
                          "(in serial mode the FIRST machine never gets past early boot - see RESULTS.md)")
+    ap.add_argument("--local-time", action="store_true",
+                    help="single mode: give every machine its own time source (needed for --parallel)")
     ap.add_argument("--parallel", action="store_true",
                     help="single mode: leave Renode's default parallel machine execution on (it crashes)")
     ap.add_argument("--telnet", action="store_true",
@@ -288,7 +290,8 @@ def main() -> int:
     result: dict = {"tag": tag, "mode": args.mode, "n": args.n, "gc": args.gc, "fail": args.fail,
                     "options": {"cs_after_first_mach": args.cs_after_first_mach,
                                 "start_per_machine": args.start_per_machine, "quantum": args.quantum,
-                                "serial_execution": single and not args.parallel},
+                                "serial_execution": single and not args.parallel,
+                                "local_time_sources": args.local_time},
                     "memory": [], "events": []}
     env = dict(os.environ)
     if args.gc != "default":
@@ -312,7 +315,8 @@ def main() -> int:
             script.write_text(make_fleet_resc.generate(
                 [d.launcher for d in drones], cs_after_first_mach=args.cs_after_first_mach,
                 start_per_machine=args.start_per_machine, quantum=args.quantum,
-                debug_commands=tuple(args.debug_command), serial=not args.parallel))
+                debug_commands=tuple(args.debug_command), serial=not args.parallel,
+                local_time=args.local_time))
             log_path = OUT / f"{tag}_renode.log"
             shared_log = open(log_path, "wb")
             t_launch = time.monotonic()
