@@ -7,6 +7,9 @@
     fleet_vform3     3 drones, V-formation
     fleet_grid4      4 drones, grid formation (adds a temporary harness_grid_d4, SYSID 4)
     fleet_sidecar3   3 drones, drone 2's physics sidecar killed mid-flight
+    fleet_stopboot3  3 drones, Stop pressed 60 s into the fleet boot
+    fleet_renodekill3  3 drones, every Renode process killed mid-flight (in the
+                     shared mode that is the one Renode)
 
 FLEET_EMULATION=shared in the environment flies any of them with "Fleet
 emulation" set to "Shared Renode (low memory)" (not saved to the settings
@@ -153,6 +156,33 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
         d.then("click Stop mid-flight", lambda: True, d.click_stop)
         d.then("fleet finished after Stop", lambda: st["finished"], lambda: None, timeout_s=120)
         d.then("settle 5s", after(5), summary)
+    elif scenario == "fleet_stopboot3":
+        common("travell")
+        plan_travell(short_north)
+        # 60 s into the boot: Renode is up and the firmware is booting, no drone is armable yet
+        d.then("60s into the fleet boot", lambda: st["boot_started"] and time.monotonic() - st["boot_started"] > 60,
+               lambda: log("Renode processes 60s into the boot: " + (subprocess.run(
+                   ["pgrep", "-af", "[r]enode-bin/[r]enode|[r]enode-physics"], capture_output=True, text=True
+               ).stdout.strip().replace("\n", " || ")[:500] or "(nothing)")), timeout_s=300)
+        d.then("click Stop mid-boot", lambda: True, d.click_stop)
+        d.then("fleet boot reported failed/stopped", lambda: st["boot_failed"] or st["finished"], lambda: None,
+               timeout_s=120)
+        d.then("settle 10s", after(10), summary)
+    elif scenario == "fleet_renodekill3":
+        common("travell")
+        plan_travell(short_north)
+        d.then("all 3 drones above 20 m", lambda: all_above(20), lambda: None, timeout_s=1500)
+
+        def kill_renode():
+            from engine.renode_launcher import _renode_processes
+            procs = [(pid, argv[0].rsplit("/", 1)[-1]) for pid, argv in _renode_processes()]
+            victims = [pid for pid, name in procs if name == "renode"]
+            log(f"SIGKILL every Renode (not the sidecars): pids {victims} (processes before: {procs})")
+            for pid in victims:
+                subprocess.run(["kill", "-9", str(pid)])
+        d.then("kill Renode", lambda: True, kill_renode)
+        d.then("fleet finished", lambda: st["finished"], lambda: None, timeout_s=300)
+        d.then("settle 10s", after(10), summary)
     elif scenario in ("fleet_bootfail", "fleet_bootfail3"):
         port = 5762 + n  # the last drone's MAVLink port (instance n)
 
