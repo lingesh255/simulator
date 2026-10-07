@@ -10,6 +10,13 @@
            instance stopped (a fleet is never reused - the next mission
            boots a fresh one)
 
+The fleet's emulation is one of two backends, chosen per mission
+(`FleetMission.start(..., shared_renode=...)`): one Renode process per drone
+as above (the default), or every drone as a machine in ONE Renode process
+(engine.shared_renode - about a quarter of the memory for four drones, a
+little slower). Everything from the per-drone MavlinkFlightService down is
+the same for both.
+
 Boot runs on this service's own worker thread (Python threads inside it, one
 per instance), so the GUI thread never blocks on Renode.
 """
@@ -24,6 +31,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from contracts.gui_orchestration import DroneConfig, LatLon, SwarmTelemetryBatch
 from engine.renode_launcher import RenodeLauncher, kill_all_renode_processes
+from engine.shared_renode import SharedRenodeFleet
 from services.mavlink_flight_service import MavlinkFlightService
 
 # Highest sysid (= Renode instance) a fleet may use. Instance N listens on
@@ -62,6 +70,7 @@ class DroneOutcome:
 class _FleetPlan:
     assignments: list = field(default_factory=list)   # [(DroneConfig, [LatLon, ...])]
     standalone_dir: str = ""
+    shared_renode: bool = False   # every drone a machine in ONE Renode process
 
 
 class _BootWorker(QObject):
@@ -73,6 +82,7 @@ class _BootWorker(QObject):
     def __init__(self):
         super().__init__()
         self._launchers: dict[int, RenodeLauncher] = {}
+        self._shared: SharedRenodeFleet | None = None   # the shared-Renode backend, when used
         self._lock = threading.Lock()
         self._aborted = threading.Event()
         self._cancelled = threading.Event()   # stopped by the user, not by a failure
@@ -84,6 +94,9 @@ class _BootWorker(QObject):
         killed = kill_all_renode_processes()
         if killed:
             self.progress.emit(f"Cleared {len(killed)} stray Renode process(es) before the fleet launch.")
+        if plan.shared_renode:
+            self._boot_shared(plan)
+            return
         errors: dict[int, str] = {}
         connections: dict[int, str] = {}
         threads = []
@@ -150,22 +163,81 @@ class _BootWorker(QObject):
             return
         self.ready.emit(connections)
 
-    def exited_instances(self) -> dict[int, int]:
-        """{sysid: exit code} of every instance whose Renode has died."""
+    def _boot_shared(self, plan: _FleetPlan) -> None:
+        """The shared-Renode backend's boot: same signals as the per-process
+        one. SharedRenodeFleet.start() already stops everything and names
+        the drone if any of them fails to boot."""
+        names = {drone.sysid: drone.name for drone, _route in plan.assignments}
+        t = time.monotonic()
+        try:
+            fleet = SharedRenodeFleet(
+                plan.standalone_dir,
+                [(drone.sysid, route[0].lat, route[0].lon) for drone, route in plan.assignments],
+            )
+            with self._lock:
+                if self._aborted.is_set():
+                    raise RuntimeError("fleet launch aborted")
+                self._shared = fleet
+            self.progress.emit(
+                "One shared Renode: " + ", ".join(
+                    f"{drone.name} (SYSID {drone.sysid}) is machine drone{drone.sysid}"
+                    for drone, _route in plan.assignments) + " ...")
+
+            def on_phase(sysid: int, text: str) -> None:
+                self.phase.emit(sysid, text)
+                if text.startswith("Armable"):
+                    self.progress.emit(
+                        f"{names[sysid]} (SYSID {sysid}): armable on {fleet.connection_string(sysid)} "
+                        f"after {time.monotonic() - t:.0f}s")
+
+            connections = fleet.start(cancel=self._aborted, on_phase=on_phase)
+        except Exception as exc:  # noqa: BLE001 - any boot failure fails the fleet
+            self.stop_all()
+            if self._cancelled.is_set():
+                self.failed.emit("fleet launch stopped by the user")
+            else:
+                self.failed.emit(f"{exc} - the shared Renode and every physics sidecar were stopped")
+            return
+        if self._aborted.is_set():
+            self.stop_all()
+            self.failed.emit("fleet launch stopped by the user" if self._cancelled.is_set() else "fleet launch aborted")
+            return
+        pids = fleet.pids()
+        self.progress.emit(f"Shared Renode pid {pids['renode']}, physics sidecars {pids['physics']}.")
+        self.ready.emit(connections)
+
+    def dead_drones(self) -> dict[int, str]:
+        """{sysid: why} for every drone whose emulation has died under it.
+        Per-process fleet: its own Renode exited. Shared Renode: the one
+        Renode exited (every drone), or that drone's physics sidecar did -
+        its MAVLink link stays up on frozen sensor values, so only the
+        process shows it."""
         with self._lock:
             launchers = dict(self._launchers)
+            shared = self._shared
+        if shared is not None:
+            code = shared.renode_exit_code
+            if code is not None:
+                return {sysid: f"the shared Renode exited mid-flight (exit code {code})" for sysid in shared.launchers}
+            return {sysid: f"its physics sidecar exited mid-flight (exit code {sidecar_code})"
+                    for sysid, sidecar_code in shared.dead_sidecars().items()}
         return {
-            sysid: launcher._proc.returncode
+            sysid: f"its Renode instance exited mid-flight (exit code {launcher._proc.returncode})"
             for sysid, launcher in launchers.items()
             if launcher._proc is not None and launcher._proc.poll() is not None
         }
 
     def stop_one(self, sysid: int) -> None:
-        """Stop one instance (its physics sidecar too) - the rest keep going."""
+        """Stop one drone's emulation (its physics sidecar too) - the rest
+        keep going. In a shared Renode that halts its machine."""
         with self._lock:
             launcher = self._launchers.pop(sysid, None)
+            shared = self._shared
         if launcher is not None:
             launcher.stop()
+        if shared is not None:
+            # Off this (GUI) thread: it talks to Renode's monitor for a few seconds.
+            threading.Thread(target=shared.stop_drone, args=(sysid,), name=f"stop-drone-{sysid}", daemon=True).start()
 
     def stop_all(self, cancelled: bool = False) -> None:
         """Stop every instance - safe from any thread, and while booting.
@@ -176,8 +248,11 @@ class _BootWorker(QObject):
             self._aborted.set()
             launchers = list(self._launchers.values())
             self._launchers.clear()
+            shared, self._shared = self._shared, None
         for launcher in launchers:
             launcher.stop()
+        if shared is not None:
+            shared.stop_all()
 
 
 class FleetMission(QObject):
@@ -247,19 +322,29 @@ class FleetMission(QObject):
                     f"range): {', '.join(outside)}.")
         return None
 
-    def start(self, assignments: list[tuple[DroneConfig, list[LatLon]]], standalone_dir: str) -> None:
-        self._plan = _FleetPlan(assignments=list(assignments), standalone_dir=standalone_dir)
+    def start(self, assignments: list[tuple[DroneConfig, list[LatLon]]], standalone_dir: str,
+              shared_renode: bool = False) -> None:
+        """`shared_renode` boots every drone as a machine in ONE Renode
+        process instead of one Renode per drone."""
+        self._plan = _FleetPlan(assignments=list(assignments), standalone_dir=standalone_dir,
+                                shared_renode=shared_renode)
         self._outcomes = {d.sysid: DroneOutcome(d.sysid, d.name) for d, _ in assignments}
         self._latest.clear()
         self._ended = set()
         self._stopping = False
         self._active = True
         self._started_at = time.monotonic()
-        self.progress.emit(
-            f"Booting a fleet of {len(assignments)} Renode instance(s) "
-            f"({'all at once' if not BOOT_STAGGER_S else f'{BOOT_STAGGER_S:.0f}s apart'}) - "
-            "the missions start once every drone is armable ..."
-        )
+        if shared_renode:
+            self.progress.emit(
+                f"Booting a fleet of {len(assignments)} drones in one shared Renode (low memory) - "
+                "the missions start once every drone is armable ..."
+            )
+        else:
+            self.progress.emit(
+                f"Booting a fleet of {len(assignments)} Renode instance(s) "
+                f"({'all at once' if not BOOT_STAGGER_S else f'{BOOT_STAGGER_S:.0f}s apart'}) - "
+                "the missions start once every drone is armable ..."
+            )
         self._boot_requested.emit(self._plan)
 
     # ---- boot ----
@@ -308,12 +393,12 @@ class FleetMission(QObject):
         ))
 
     def _check_instances(self) -> None:
-        for sysid, code in self._worker.exited_instances().items():
+        for sysid, reason in self._worker.dead_drones().items():
             outcome = self._outcomes.get(sysid)
             if outcome is None or outcome.state != "flying":
                 continue
-            self._mark(sysid, "failed", f"its Renode instance exited mid-flight (exit code {code})")
-            self._worker.stop_one(sysid)   # its physics sidecar too
+            self._mark(sysid, "failed", reason)
+            self._worker.stop_one(sysid)   # its physics sidecar too; in a shared Renode, halt its machine
             self._flights[sysid].abort()   # its flight then reports finished -> _on_drone_ended
 
     def _mark(self, sysid: int, state: str, reason: str = "") -> None:
