@@ -1,29 +1,13 @@
-"""Generate ONE Renode script that runs N drones as N machines in one process.
-
-The standalone folder's own scripts each assume one machine per Renode
-(`mach create "ardupilot"`, a server socket terminal called "serial", CAN
-hubs called "can1Hub"/"can2Hub"), so they can't simply be included N times.
-This copies their content into one script instead - the folder's files are
-only ever read:
-
-  1. the variables and every `include *.cs` line, once (the peripherals are
-     compiled once for the whole process);
-  2. per drone: `mach create "droneN"` and that machine's own platform
-     (its own FRAM / persistent-flash copies), ELF, vector table, reset
-     macro, MAVLink server socket, CAN hubs, SD card, hooks, physics
-     connection and GPS UART hub - every emulation-level object gets a
-     per-drone name;
-  3. the emulation-wide settings and one `start`.
-
-Each machine is created with its own time source (see `local_time` in
-generate()); with plain `mach create` two of these machines cannot run in
-parallel (RESULTS.md).
+"""Experiment front end for engine.shared_renode.generate_fleet_script: ONE
+Renode script that runs N drones as N machines in one process.
 
     python experiments/single_renode/make_fleet_resc.py 2 > fleet.resc
 
+The generator itself now lives in engine/shared_renode.py (the app uses it);
+this file adds the diagnostics knobs the Task 16/17 experiments needed -
+leaving lines out, patched platform copies, the failing `mach create` setup.
 The per-drone files (SD copy, FRAM, retargeted .repl) are the ones
-RenodeLauncher(instance=N) prepares; run_fleet.py does that before using
-the script.
+RenodeLauncher(instance=N).prepare() makes; run_fleet.py does that first.
 """
 from __future__ import annotations
 
@@ -35,137 +19,19 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from engine import shared_renode  # noqa: E402
 from engine.renode_launcher import RenodeLauncher  # noqa: E402
 
 STANDALONE = REPO / "pixhawk6c_renode_standalone"
-H743_SCRIPT = STANDALONE / "Tools" / "renode" / "scripts" / "ardupilot_h743.resc"
-
-# Emulation-level objects the board script names "serial", "can1Hub" and
-# "can2Hub" (and the launcher's "gpsHub"): one per drone here.
-_PER_DRONE_NAMES = ("serial", "can1Hub", "can2Hub")
-
-
-def _cs_includes(script: Path) -> list[str]:
-    return [line.strip() for line in script.read_text().splitlines()
-            if re.match(r"^include \S+\.cs$", line.strip())]
-
-
-def _board_body(launcher: RenodeLauncher, tag: str) -> list[str]:
-    """The board script's own per-machine lines (everything after its
-    include of ardupilot_h743.resc), with the MAVLink port and the
-    emulation-level names made this drone's own, and its `logLevel` line
-    left out (set once for the whole emulation)."""
-    lines = launcher.board_script.read_text().splitlines()
-    start = next(i for i, line in enumerate(lines) if line.strip().endswith("ardupilot_h743.resc"))
-    body = []
-    for line in lines[start + 1:]:
-        stripped = line.strip()
-        if stripped.startswith("#") or stripped.startswith("logLevel") or stripped.startswith("$sdcard?="):
-            continue
-        line = line.replace(f"CreateServerSocketTerminal {launcher.declared_port} ",
-                            f"CreateServerSocketTerminal {launcher.port} ")
-        for name in _PER_DRONE_NAMES:
-            line = re.sub(rf'(?<![\w.]){name}(?![\w])', f"{name}_{tag}", line)
-        line = line.replace("$sdcard", f"@{launcher.sdcard_path}")
-        body.append(line)
-    return body
-
 
 def machine_name(launcher: RenodeLauncher) -> str:
-    return f"drone{launcher.instance}"
+    return shared_renode.machine_name(launcher.instance)
 
 
-def generate(launchers: list[RenodeLauncher], *, cs_after_first_mach: bool = False,
-             start_per_machine: bool = False, quantum: str = "0.01",
-             debug_commands: tuple[str, ...] = (), serial: bool = False,
-             local_time: bool = True, master_quantum: str | None = "0.1") -> str:
-    """The whole script. `launchers` are RenodeLauncher(instance=N >= 1)
-    objects whose work dirs are already prepared. The two flags are the
-    fallbacks Task 16 lists: compile the .cs files after the first
-    `mach create` instead of before it, and start each machine on its own
-    instead of one `start`."""
-    first = launchers[0]
-    launch = {m.group(1): m.group(2) for line in first._launch_lines
-              if (m := re.match(r"^\$(\w+)=(\S+)$", line.strip()))}
-    board_vars = {m.group(1): m.group(2) for line in first.board_script.read_text().splitlines()
-                  if (m := re.match(r"^\$(\w+)\??=(\S+)$", line.strip()))}
-    vector_base = launch.get("vector_base", board_vars["app_base"])
-    binaries = [line.strip() for line in first._launch_lines if line.strip().startswith("sysbus LoadBinary ")]
-
-    includes = _cs_includes(first.board_script) + _cs_includes(H743_SCRIPT)
-    out = [
-        "# GENERATED by experiments/single_renode/make_fleet_resc.py - "
-        f"{len(launchers)} drone(s) as machines in one Renode.",
-        f"$repo={launch['repo']}",
-        f"$elf={launch['elf']}",
-        f"$renode_data={launch['renode_data']}",
-        f"$mcu_svd={launch['mcu_svd']}",
-        f"$vector_base={vector_base}",
-        "",
-    ]
-    if not cs_after_first_mach:
-        out += ["# every peripheral source, compiled once for the whole process", *includes, ""]
-
-    for index, launcher in enumerate(launchers):
-        name = machine_name(launcher)
-        tag = f"d{launcher.instance}"
-        platform = launcher.work_dir / launcher.platform_repl.name
-        persistent = launcher.work_dir / launcher.persistent_repl.name
-        out.append(f"# ---- {name}: MAVLink {launcher.port}, physics {launcher.physics_port} ----")
-        if local_time:
-            # `mach create` makes every machine a direct sink of the emulation's one
-            # master time source; that is what breaks with two of these machines
-            # (RESULTS.md). Machine(createLocalTimeSource=True) gives the machine its
-            # own SlaveTimeSource instead - the monitor has no command for it.
-            out += ['python "from Antmicro.Renode.Core import Machine, EmulationManager; '
-                    f"EmulationManager.Instance.CurrentEmulation.AddMachine(Machine(True), '{name}')\"",
-                    f'mach set "{name}"']
-        else:
-            out.append(f'mach create "{name}"')
-        if cs_after_first_mach and index == 0:
-            out += includes
-        out += [
-            f"machine LoadPlatformDescription @{platform}",
-            "sysbus ApplySVD $mcu_svd",
-            "sysbus LoadELF $elf",
-            "cpu VectorTableOffset $vector_base",
-            "cpu PerformanceInMips 300",
-            *_board_body(launcher, tag),
-            *binaries,
-            f"machine LoadPlatformDescription @{persistent}",
-            'physics Connect %d "%s" %.6f %.6f %.1f %.1f %d' % (
-                launcher.physics_port, launcher.PHYSICS_MODEL, launcher.latitude_deg, launcher.longitude_deg,
-                launcher.PHYSICS_ALTITUDE_M, launcher.PHYSICS_HEADING_DEG, launcher.PHYSICS_RATE_HZ),
-            f'emulation CreateUARTHub "gpsHub_{tag}"',
-            f"connector Connect sysbus.{launcher.GPS_UART_HOST} gpsHub_{tag}",
-            f"connector Connect sysbus.gps gpsHub_{tag}",
-            "",
-        ]
-
-    out += [
-        "# emulation-wide (ardupilot_h743.resc and the board script set these per process)",
-        f'emulation SetGlobalQuantum "{quantum}"',
-        "emulation SetGlobalAdvanceImmediately false",
-        "logLevel 3",
-    ]
-    if master_quantum and local_time:
-        # With per-machine time sources the machines only meet at the master's
-        # sync points. The drones never talk to each other inside Renode, so
-        # the master can sync less often than each machine's own quantum.
-        out.append(f'emulation SetQuantum "{master_quantum}"')
-    if serial:
-        # Task 16's workaround, kept for comparison: with `mach create`
-        # machines (local_time=False) the only setting in which every
-        # machine runs is serial execution with a 100 us quantum.
-        out.append("emulation SetGlobalSerialExecution true")
-    # diagnostics only, e.g. "logLevel -1 sysbus.nvic": run on every machine, after the global logLevel
-    for launcher in launchers if debug_commands else ():
-        out += [f'mach set "{machine_name(launcher)}"', *debug_commands]
-    if start_per_machine:
-        for launcher in launchers:
-            out += [f'mach set "{machine_name(launcher)}"', "machine Start"]
-    else:
-        out.append("start")
+def generate(launchers: list[RenodeLauncher], **options) -> str:
+    """engine.shared_renode.generate_fleet_script, plus this experiment's
+    SINGLE_RENODE_DROP knob."""
+    out = shared_renode.generate_fleet_script(launchers, **options).splitlines()
     # diagnostics only: SINGLE_RENODE_DROP="text1|text2" leaves out every line containing one of them
     drop = [t for t in os.environ.get("SINGLE_RENODE_DROP", "").split("|") if t]
     out = [line for line in out if not any(t in line for t in drop)]
