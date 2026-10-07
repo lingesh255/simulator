@@ -75,7 +75,8 @@ def machine_name(launcher: RenodeLauncher) -> str:
 
 def generate(launchers: list[RenodeLauncher], *, cs_after_first_mach: bool = False,
              start_per_machine: bool = False, quantum: str = "0.0001",
-             debug_commands: tuple[str, ...] = (), serial: bool = True) -> str:
+             debug_commands: tuple[str, ...] = (), serial: bool = True,
+             local_time: bool = False) -> str:
     """The whole script. `launchers` are RenodeLauncher(instance=N >= 1)
     objects whose work dirs are already prepared. The two flags are the
     fallbacks Task 16 lists: compile the .cs files after the first
@@ -108,8 +109,17 @@ def generate(launchers: list[RenodeLauncher], *, cs_after_first_mach: bool = Fal
         tag = f"d{launcher.instance}"
         platform = launcher.work_dir / launcher.platform_repl.name
         persistent = launcher.work_dir / launcher.persistent_repl.name
-        out += [f"# ---- {name}: MAVLink {launcher.port}, physics {launcher.physics_port} ----",
-                f'mach create "{name}"']
+        out.append(f"# ---- {name}: MAVLink {launcher.port}, physics {launcher.physics_port} ----")
+        if local_time:
+            # `mach create` makes every machine a direct sink of the emulation's one
+            # master time source; that is what breaks with two of these machines
+            # (RESULTS.md). Machine(createLocalTimeSource=True) gives the machine its
+            # own SlaveTimeSource instead - the monitor has no command for it.
+            out += ['python "from Antmicro.Renode.Core import Machine, EmulationManager; '
+                    f"EmulationManager.Instance.CurrentEmulation.AddMachine(Machine(True), '{name}')\"",
+                    f'mach set "{name}"']
+        else:
+            out.append(f'mach create "{name}"')
         if cs_after_first_mach and index == 0:
             out += includes
         out += [
@@ -159,6 +169,51 @@ def generate(launchers: list[RenodeLauncher], *, cs_after_first_mach: bool = Fal
     return "\n".join(out) + "\n"
 
 
+def patched_platform(launcher: RenodeLauncher, out_dir: Path, drop: list[str], replace: dict[str, str]) -> Path:
+    """Diagnostics only (Task 17): a copy of this drone's platform .repl, and
+    of the stm32h743_base.repl it pulls in, with the peripherals named in
+    `drop` removed (their whole entry) and each `replace` text swapped. The
+    originals are only read. Returns the copy to load instead."""
+    def strip(text: str) -> str:
+        out, skipping = [], False
+        for line in text.splitlines():
+            head = re.match(r"^(\w+):", line)
+            if head:
+                skipping = head.group(1) in drop
+            if not skipping:
+                out.append(line)
+        text = "\n".join(out) + "\n"
+        for old, new in replace.items():
+            text = text.replace(old, new)
+        return text
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    board = (launcher.work_dir / launcher.platform_repl.name).read_text()
+    base_path = re.search(r'^using "([^"]+)"', board, re.M).group(1)
+    base_copy = out_dir / f"base_d{launcher.instance}.repl"
+    base_copy.write_text(strip(Path(base_path).read_text()))
+    board_copy = out_dir / f"board_d{launcher.instance}.repl"
+    board_copy.write_text(strip(board.replace(base_path, str(base_copy))))
+    return board_copy
+
+
 if __name__ == "__main__":
+    # Diagnostics knobs (environment): SINGLE_RENODE_PARALLEL=1 leaves parallel
+    # execution on, SINGLE_RENODE_QUANTUM sets the quantum, SINGLE_RENODE_LOCAL_TIME=1 gives each
+    # machine its own time source, SINGLE_RENODE_INLINE_RESET=1
+    # uses no reset macro, SINGLE_RENODE_REPL_DROP="a|b" loads platform copies without
+    # those peripherals, SINGLE_RENODE_PATCHED_DIR is where those copies go.
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    print(generate([RenodeLauncher(str(STANDALONE), instance=n) for n in range(1, count + 1)]), end="")
+    fleet = [RenodeLauncher(str(STANDALONE), instance=n) for n in range(1, count + 1)]
+    text = generate(fleet, serial=not os.environ.get("SINGLE_RENODE_PARALLEL"),
+                    quantum=os.environ.get("SINGLE_RENODE_QUANTUM", "0.0001"),
+                    local_time=bool(os.environ.get("SINGLE_RENODE_LOCAL_TIME")))
+    repl_drop = [t for t in os.environ.get("SINGLE_RENODE_REPL_DROP", "").split("|") if t]
+    if repl_drop:
+        out_dir = Path(os.environ.get("SINGLE_RENODE_PATCHED_DIR", str(REPO / "experiments/single_renode/out/patched")))
+        for launcher in fleet:
+            original = launcher.work_dir / launcher.platform_repl.name
+            text = text.replace(f"@{original}\n", f"@{patched_platform(launcher, out_dir, repl_drop, {})}\n")
+    if os.environ.get("SINGLE_RENODE_INLINE_RESET"):
+        text = re.sub(r'macro reset\n"""\n(.*?)"""\nrunMacro \$reset\n', lambda m: m.group(1), text, flags=re.S)
+    print(text, end="")
