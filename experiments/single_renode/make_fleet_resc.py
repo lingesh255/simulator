@@ -13,9 +13,11 @@ only ever read:
      macro, MAVLink server socket, CAN hubs, SD card, hooks, physics
      connection and GPS UART hub - every emulation-level object gets a
      per-drone name;
-  3. the emulation-wide settings and one `start`: serial execution and a
-     100 us quantum, the only combination found in which every machine runs
-     (RESULTS.md).
+  3. the emulation-wide settings and one `start`.
+
+Each machine is created with its own time source (see `local_time` in
+generate()); with plain `mach create` two of these machines cannot run in
+parallel (RESULTS.md).
 
     python experiments/single_renode/make_fleet_resc.py 2 > fleet.resc
 
@@ -74,9 +76,9 @@ def machine_name(launcher: RenodeLauncher) -> str:
 
 
 def generate(launchers: list[RenodeLauncher], *, cs_after_first_mach: bool = False,
-             start_per_machine: bool = False, quantum: str = "0.0001",
-             debug_commands: tuple[str, ...] = (), serial: bool = True,
-             local_time: bool = False) -> str:
+             start_per_machine: bool = False, quantum: str = "0.01",
+             debug_commands: tuple[str, ...] = (), serial: bool = False,
+             local_time: bool = True, master_quantum: str | None = "0.1") -> str:
     """The whole script. `launchers` are RenodeLauncher(instance=N >= 1)
     objects whose work dirs are already prepared. The two flags are the
     fallbacks Task 16 lists: compile the .cs files after the first
@@ -146,14 +148,15 @@ def generate(launchers: list[RenodeLauncher], *, cs_after_first_mach: bool = Fal
         "emulation SetGlobalAdvanceImmediately false",
         "logLevel 3",
     ]
+    if master_quantum and local_time:
+        # With per-machine time sources the machines only meet at the master's
+        # sync points. The drones never talk to each other inside Renode, so
+        # the master can sync less often than each machine's own quantum.
+        out.append(f'emulation SetQuantum "{master_quantum}"')
     if serial:
-        # One machine executes at a time. With the default (parallel)
-        # execution two of these machines never survive: within about a
-        # second one CPU takes a spurious interrupt (vector 0x210, "CPU
-        # abort [PC=0xF092D004]") or the whole emulation deadlocks. Serial
-        # execution also needs the 100 us quantum above: at the standalone
-        # scripts' 10 ms only the last-created machine runs properly. See
-        # RESULTS.md.
+        # Task 16's workaround, kept for comparison: with `mach create`
+        # machines (local_time=False) the only setting in which every
+        # machine runs is serial execution with a 100 us quantum.
         out.append("emulation SetGlobalSerialExecution true")
     # diagnostics only, e.g. "logLevel -1 sysbus.nvic": run on every machine, after the global logLevel
     for launcher in launchers if debug_commands else ():
@@ -198,16 +201,19 @@ def patched_platform(launcher: RenodeLauncher, out_dir: Path, drop: list[str], r
 
 
 if __name__ == "__main__":
-    # Diagnostics knobs (environment): SINGLE_RENODE_PARALLEL=1 leaves parallel
-    # execution on, SINGLE_RENODE_QUANTUM sets the quantum, SINGLE_RENODE_LOCAL_TIME=1 gives each
-    # machine its own time source, SINGLE_RENODE_INLINE_RESET=1
+    # Diagnostics knobs (environment): SINGLE_RENODE_SHARED_TIME=1 creates the machines
+    # with plain `mach create` (the failing Task 16 setup), SINGLE_RENODE_SERIAL=1 turns
+    # serial execution on, SINGLE_RENODE_QUANTUM / SINGLE_RENODE_MASTER_QUANTUM set the
+    # quanta, SINGLE_RENODE_INLINE_RESET=1
     # uses no reset macro, SINGLE_RENODE_REPL_DROP="a|b" loads platform copies without
     # those peripherals, SINGLE_RENODE_PATCHED_DIR is where those copies go.
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     fleet = [RenodeLauncher(str(STANDALONE), instance=n) for n in range(1, count + 1)]
-    text = generate(fleet, serial=not os.environ.get("SINGLE_RENODE_PARALLEL"),
-                    quantum=os.environ.get("SINGLE_RENODE_QUANTUM", "0.0001"),
-                    local_time=bool(os.environ.get("SINGLE_RENODE_LOCAL_TIME")))
+    shared = bool(os.environ.get("SINGLE_RENODE_SHARED_TIME"))
+    text = generate(fleet, serial=bool(os.environ.get("SINGLE_RENODE_SERIAL")),
+                    quantum=os.environ.get("SINGLE_RENODE_QUANTUM", "0.01"),
+                    local_time=not shared,
+                    master_quantum=os.environ.get("SINGLE_RENODE_MASTER_QUANTUM", "0.1"))
     repl_drop = [t for t in os.environ.get("SINGLE_RENODE_REPL_DROP", "").split("|") if t]
     if repl_drop:
         out_dir = Path(os.environ.get("SINGLE_RENODE_PATCHED_DIR", str(REPO / "experiments/single_renode/out/patched")))

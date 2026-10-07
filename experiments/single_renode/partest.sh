@@ -3,7 +3,8 @@
 # Runs the generated script with no MAVLink client, no physics and no GPS
 # hub (the Task 16 fault shows without them), samples virtual time twice,
 # and prints ABORT / FROZEN / RUNNING. Generator knobs come from the
-# environment (see make_fleet_resc.py); RENODE_BIN picks another Renode.
+# environment (see make_fleet_resc.py; SINGLE_RENODE_SHARED_TIME=1 reproduces the
+# Task 16 fault); RENODE_BIN picks another Renode.
 cd "$(dirname "$0")/../.."
 tag=$1; n=${2:-2}; secs=${3:-25}
 out=$PWD/experiments/single_renode/out
