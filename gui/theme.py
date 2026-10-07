@@ -16,7 +16,7 @@ from typing import Literal
 from PySide6.QtCore import Property, QObject, Signal
 
 from contracts.gui_orchestration import AppSettings
-from services.storage import save_app_settings
+from services.storage import load_app_settings, save_app_settings
 
 ThemeName = Literal["light", "dark"]
 
@@ -144,7 +144,9 @@ class ThemeManager(QObject):
         if name not in _PALETTES or name == self._current:
             return
         self._current = name
-        save_app_settings(AppSettings(theme=name))
+        settings = load_app_settings()   # keep the file's other preferences
+        settings.theme = name
+        save_app_settings(settings)
         self.theme_changed.emit(name)
 
 

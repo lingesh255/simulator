@@ -1252,8 +1252,10 @@ class MainWindow(QMainWindow):
         self.fault_injection.update_active_sysids([d.sysid for d, _ in assignments])
         self.map_viewer.clear_drones()
         self.map_viewer.clear_paths()
+        shared_renode = panel.shared_renode_fleet()
         self.flight_log.log_event(
-            f"Fleet mission '{result.plan_name}': {len(assignments)} drone(s), one Renode instance each."
+            f"Fleet mission '{result.plan_name}': {len(assignments)} drone(s), "
+            + ("all in one shared Renode (low memory)." if shared_renode else "one Renode instance each.")
         )
         for drone, route in assignments:
             self.flight_log.log_event(
@@ -1262,7 +1264,7 @@ class MainWindow(QMainWindow):
             )
         self._pending_plan_name = None
         self._plan_source = None
-        self.fleet.start(assignments, panel.renode_dir_edit.text().strip())
+        self.fleet.start(assignments, panel.renode_dir_edit.text().strip(), shared_renode=shared_renode)
 
     # One threshold for every plan, spawns and landings alike: only points
     # that (nearly) coincide get moved - shared endpoints such as a travell

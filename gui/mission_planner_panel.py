@@ -22,6 +22,11 @@ from PySide6.QtWidgets import (
 
 from engine.pddl_planner import PlanStep
 from services.plan_service import list_plans
+from services.storage import load_app_settings, save_app_settings
+
+# AppSettings.fleet_emulation values.
+FLEET_EMULATION_PER_DRONE = "per_drone"
+FLEET_EMULATION_SHARED = "shared"
 
 # Display-only labels for plan folders under plans/ - the underlying folder
 # name (used everywhere else as the plan identifier) is unchanged.
@@ -133,6 +138,28 @@ class MissionPlannerPanel(QWidget):
         renode_row.addWidget(self.renode_dir_edit, stretch=1)
         renode_row.addWidget(self.renode_launch_btn)
 
+        # How a fleet (two or more checked drones flown via Renode) is
+        # emulated. Persisted in data/app_settings.json. A single drone
+        # always uses its own Renode, whatever this says.
+        self.fleet_emulation_combo = QComboBox()
+        self.fleet_emulation_combo.addItem("One Renode per drone", FLEET_EMULATION_PER_DRONE)
+        self.fleet_emulation_combo.addItem("Shared Renode (low memory)", FLEET_EMULATION_SHARED)
+        self.fleet_emulation_combo.setToolTip(
+            "Applies when two or more drones are checked and Renode is the vehicle.\n"
+            "One Renode per drone (default): each drone gets its own Renode process, "
+            "about 2.2 GB each.\n"
+            "Shared Renode (low memory): every drone is a machine inside one Renode "
+            "process - about 2.5 GB for four drones instead of about 9 GB, and "
+            "roughly 20 % slower. One process also means one point of failure."
+        )
+        saved = self.fleet_emulation_combo.findData(load_app_settings().fleet_emulation)
+        self.fleet_emulation_combo.setCurrentIndex(max(saved, 0))
+        self.fleet_emulation_combo.setEnabled(False)
+        self.fleet_emulation_combo.currentIndexChanged.connect(self._on_fleet_emulation_changed)
+        fleet_row = QHBoxLayout()
+        fleet_row.addWidget(QLabel("Fleet emulation:"))
+        fleet_row.addWidget(self.fleet_emulation_combo, stretch=1)
+
         plan_group = QGroupBox("Named Plan (plans/<name>/)")
         plan_layout = QVBoxLayout(plan_group)
         plan_layout.addLayout(pick_row)
@@ -141,6 +168,7 @@ class MissionPlannerPanel(QWidget):
         plan_layout.addLayout(connection_row)
         plan_layout.addWidget(self.mock_vehicle_check)
         plan_layout.addLayout(renode_row)
+        plan_layout.addLayout(fleet_row)
         plan_layout.addWidget(self.plan_btn)
 
         self.status_label = QLabel("Idle.")
@@ -355,11 +383,22 @@ class MissionPlannerPanel(QWidget):
         # _update_renode_launch_gating() (that only sets the button), so
         # it's handled directly here.
         self.renode_dir_edit.setEnabled(self.external_mavlink_check.isChecked() and not checked)
+        self.fleet_emulation_combo.setEnabled(self.external_mavlink_check.isChecked() and not checked)
         self._update_renode_launch_gating()
+
+    def _on_fleet_emulation_changed(self, _index: int) -> None:
+        settings = load_app_settings()   # keep the file's other preferences
+        settings.fleet_emulation = self.fleet_emulation_combo.currentData()
+        save_app_settings(settings)
+
+    def shared_renode_fleet(self) -> bool:
+        """Whether a fleet should fly as machines in one shared Renode."""
+        return self.fleet_emulation_combo.currentData() == FLEET_EMULATION_SHARED
 
     def _on_external_mavlink_toggled(self, checked: bool) -> None:
         self.mavlink_connection_edit.setEnabled(checked)
         self.renode_dir_edit.setEnabled(checked and not self.mock_vehicle_check.isChecked())
+        self.fleet_emulation_combo.setEnabled(checked and not self.mock_vehicle_check.isChecked())
         self._update_plan_gating()
         self._update_mock_vehicle_gating()
         self._update_renode_launch_gating()
