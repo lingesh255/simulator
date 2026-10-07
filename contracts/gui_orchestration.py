@@ -130,7 +130,11 @@ class FlockCommand(BaseModel):
 # --------------------------------------------------------------------------
 
 class AppSettings(BaseModel):
-    """Small local preferences file - currently just the light/dark theme
-    choice (gui/theme.py)."""
+    """Small local preferences file: the light/dark theme choice
+    (gui/theme.py) and how a fleet of two or more drones is emulated
+    (gui/mission_planner_panel.py)."""
 
     theme: str = "dark"
+    # "per_drone": one Renode process per drone (the default).
+    # "shared": every drone a machine in one Renode process (low memory).
+    fleet_emulation: str = "per_drone"
