@@ -469,6 +469,7 @@ class RenodeLauncher:
         self._read_layout()
 
         self._proc: subprocess.Popen | None = None
+        self._owns_renode = True   # False once attach()ed to a caller's Renode
         self._physics_proc: subprocess.Popen | None = None
         self._renode_log = None
         self._renode_log_path: Path | None = None
@@ -647,20 +648,20 @@ class RenodeLauncher:
             raise RenodeLauncherError("already running - call stop() first")
 
         self._kill_own_stale_processes()
-        self._check_ports_free()
+        self.check_ports_free()
 
         # `cancel` (e.g. a fleet's abort) reaches this launch at any stage -
         # stop() alone can't, before this start() has spawned its processes.
         self._cancel = cancel
         try:
             self._check_cancel()
-            self._prepare_work_dir()
+            self.prepare()
             self._check_cancel()
-            self._start_physics(physics_ready_timeout_s)
+            self.start_physics(physics_ready_timeout_s)
             self._check_cancel()
             self._start_renode()
             self._check_cancel()
-            self._wait_for_gps_fix(gps_ready_timeout_s)
+            self.wait_for_gps_fix(gps_ready_timeout_s)
             self._check_cancel()
         except Exception:
             self.stop()
@@ -668,7 +669,53 @@ class RenodeLauncher:
 
         return self.connection_string
 
-    def _check_ports_free(self) -> None:
+    # ---- The same steps, one at a time ----
+    #
+    # For a caller that runs Renode itself (engine.shared_renode: one Renode
+    # holding several drones): prepare() and start_physics() per drone, then
+    # attach() each launcher to the caller's process, then wait_for_gps_fix(),
+    # provision_first_boot_params() and wait_until_armable() as usual.
+
+    def prepare(self) -> None:
+        """This instance's files: a fresh SD image and, for instances >= 1,
+        its FRAM / flash copies and the scripts that name them."""
+        self._prepare_work_dir()
+
+    def start_physics(self, ready_timeout_s: float = 30.0) -> int:
+        """Start this instance's physics sidecar and wait until it listens.
+        Returns its pid."""
+        self._start_physics(ready_timeout_s)
+        return self._physics_proc.pid
+
+    def stop_physics(self) -> None:
+        self._terminate(self._physics_proc)
+        self._physics_proc = None
+
+    @property
+    def physics_pid(self) -> int | None:
+        return self._physics_proc.pid if self._physics_proc is not None else None
+
+    @property
+    def physics_exit_code(self) -> int | None:
+        """The sidecar's exit code once it has died, else None."""
+        return self._physics_proc.poll() if self._physics_proc is not None else None
+
+    def attach(self, proc: subprocess.Popen, log_path: Path, cancel: threading.Event | None = None) -> None:
+        """Use a Renode the caller started (and owns) as this instance's
+        vehicle: the MAVLink waits watch `proc` and `log_path` exactly as
+        they watch a Renode start() spawned. stop() then leaves `proc`
+        alone and only stops this instance's sidecar."""
+        self._proc = proc
+        self._renode_log_path = Path(log_path)
+        self._owns_renode = False
+        self._cancel = cancel
+
+    def wait_for_gps_fix(self, timeout_s: float = 240.0) -> None:
+        """Block until the vehicle on this instance's MAVLink port reports a
+        3D GPS fix."""
+        self._wait_for_gps_fix(timeout_s)
+
+    def check_ports_free(self) -> None:
         """Fail at once, rather than after the full GPS wait, if something
         already listens on this instance's MAVLink or physics port. Bound
         with SO_REUSEADDR like Renode's own listener, so connections still in
@@ -694,7 +741,7 @@ class RenodeLauncher:
     def _check_renode_log(self) -> None:
         """Renode reports a MAVLink port it couldn't bind only in its own
         console log and then boots on regardless - catch that during boot
-        (e.g. a port taken between _check_ports_free and Renode's bind)."""
+        (e.g. a port taken between check_ports_free and Renode's bind)."""
         path = self._renode_log_path
         if path is None or not path.exists():
             return
@@ -761,6 +808,7 @@ class RenodeLauncher:
         # Captured to a file, not DEVNULL: an unhandled exception inside a
         # Renode peripheral crashes the whole process with no other signal
         # than an early exit code - this is the only way to see why.
+        self._owns_renode = True
         self._renode_log_path = self.renode_log_path
         self._renode_log = open(self._renode_log_path, "wb")
         # stdin=DEVNULL: with the terminal inherited, `--console` switches
@@ -1200,7 +1248,8 @@ class RenodeLauncher:
         """Tears down both processes - neither is left orphaned if the
         other fails to stop first, since each is torn down independently
         in its own try/except."""
-        self._terminate(self._proc)
+        if self._owns_renode:
+            self._terminate(self._proc)
         self._proc = None
         if self._renode_log is not None:
             self._renode_log.close()

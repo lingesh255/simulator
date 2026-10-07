@@ -30,7 +30,7 @@ try:
     for label, bypass in (("(a) pre-boot port check", False), ("(b) Renode log watch only", True)):
         launcher = RenodeLauncher(STANDALONE, instance=2)
         if bypass:
-            launcher._check_ports_free = lambda: None
+            launcher.check_ports_free = lambda: None
         t = time.monotonic()
         try:
             launcher.start()

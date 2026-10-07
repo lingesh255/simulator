@@ -170,7 +170,7 @@ class Drone:
         l = self.launcher
         try:
             if single:
-                l._wait_for_gps_fix(600.0 * slow)
+                l.wait_for_gps_fix(600.0 * slow)
             else:
                 l.start(gps_ready_timeout_s=600.0)
             self.r["gps_fix_s"] = round(time.monotonic() - t_launch, 1)
@@ -310,9 +310,9 @@ def main() -> int:
     try:
         if single:
             for d in drones:
-                d.launcher._check_ports_free()
-                d.launcher._prepare_work_dir()
-                d.launcher._start_physics(30.0)
+                d.launcher.check_ports_free()
+                d.launcher.prepare()
+                d.launcher.start_physics(30.0)
             log(f"{args.n} physics sidecar(s) listening; work dirs prepared in {time.monotonic() - t_launch:.1f}s")
             script = OUT / f"{tag}.resc"
             script.write_text(make_fleet_resc.generate(
