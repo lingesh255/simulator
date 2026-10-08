@@ -54,9 +54,11 @@ Item {
         MapRectangle {
             id: regionRect
             visible: false
-            color: theme.accent
+            // `theme` is a context property; it is already null while the
+            // window is being torn down, when these bindings run once more.
+            color: theme ? theme.accent : "transparent"
             opacity: 0.12
-            border.color: theme.accent
+            border.color: theme ? theme.accent : "transparent"
             border.width: 2
         }
 
