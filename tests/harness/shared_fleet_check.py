@@ -74,8 +74,10 @@ def main():
         ok &= all(seen == {s} and count >= 2 for s, (count, seen) in results.items())
 
         victim = n
+        log(f"monitor before the stop: {fleet.monitor([f'mach set \"drone{victim}\"', 'cpu IsHalted', 'bogus command'])}")
         log(f"stop_drone({victim})")
-        fleet.stop_drone(victim)
+        fleet.stop_drone(victim)     # raises DroneStopError unless the halt reads back True
+        log(f"monitor after the stop: {fleet.monitor([f'mach set \"drone{victim}\"', 'cpu IsHalted', 'mach set \"drone1\"', 'cpu IsHalted'])}")
         log(f"Renode alive: {fleet.is_running}; pids now {fleet.pids()}; dead sidecars reported: {fleet.dead_sidecars()}")
         time.sleep(3)
         results = {}

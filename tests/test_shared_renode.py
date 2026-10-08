@@ -8,8 +8,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import socket
+import subprocess
+import sys
+import threading
+
 from engine.renode_launcher import RenodeLauncher, RenodeLauncherError
-from engine.shared_renode import MACHINE_QUANTUM_S, MASTER_QUANTUM_S, SharedRenodeFleet, generate_fleet_script
+from engine.shared_renode import (
+    MACHINE_QUANTUM_S, MASTER_QUANTUM_S, DroneStopError, SharedRenodeFleet, generate_fleet_script,
+)
 
 
 def make_standalone(root: Path) -> Path:
@@ -171,6 +178,219 @@ class FleetObject(unittest.TestCase):
         self.assertEqual(fleet.dead_sidecars(), {})
         self.assertEqual(fleet.pids(), {"renode": None, "physics": {}})
         fleet.stop_all()   # harmless
+
+
+class FakeMonitor:
+    """A stand-in for Renode's telnet monitor: greets with a prompt, echoes
+    each command, answers it and prompts again. `halted` is what
+    `cpu IsHalted` reads back per machine; `behaviour` picks the fault."""
+
+    def __init__(self, behaviour="good"):
+        self.behaviour = behaviour
+        self.halted = {}
+        self.commands = []
+        self.connections = 0
+        self._server = socket.socket()
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(4)
+        self.port = self._server.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._server.close()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self._session, args=(conn,), daemon=True).start()
+
+    def _answer(self, machine, command):
+        if command.startswith("mach set "):
+            return command.split('"')[1], ""
+        if self.behaviour == "error" and command == "cpu IsHalted true":
+            return machine, "\x1b[;031mThere was an error executing command 'cpu IsHalted true'\x1b[0m\r\nboom"
+        if self.behaviour == "error_once" and command == "cpu IsHalted true" and self.connections == 1:
+            return machine, "There was an error executing command 'cpu IsHalted true'"
+        if command == "cpu IsHalted true":
+            if self.behaviour != "ignored":
+                self.halted[machine] = True
+            return machine, ""
+        if command == "cpu IsHalted":
+            return machine, "True" if self.halted.get(machine) else "False"
+        return machine, ""
+
+    def _session(self, conn):
+        machine = "monitor"
+        try:
+            if self.behaviour == "silent":
+                while conn.recv(1024):      # accept, read, never say anything
+                    pass
+                return
+            if self.connections == 1:
+                # like the real one: only the first connection is greeted, with a prompt and
+                # then a replay of the startup command's output; later ones get nothing
+                conn.sendall(b"Renode, version fake\r\n\x1b[31;1m(monitor) \x1b[0m")
+                conn.sendall(b"include @/x/fleet.resc\r\nStarting emulation...\r\n\x1b[33;1m(drone2) \x1b[0m")
+            buffer = b""
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    command = line.decode().strip()
+                    self.commands.append(command)
+                    machine, reply = self._answer(machine, command)
+                    text = command + "\r\n" + (reply + "\r\n" if reply else "") + f"\x1b[33;1m({machine}) \x1b[0m"
+                    conn.sendall(text.encode())
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
+class StopDrone(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.fleet = SharedRenodeFleet(str(make_standalone(root)), [(1, 1.0, 2.0), (2, 1.0, 2.0)],
+                                       work_root=str(root / "w"))
+        self.fleet.MONITOR_REPLY_TIMEOUT_S = 1.0
+        # a live stand-in for the shared Renode, so is_running is True
+        self.fleet._proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.monitors = []
+
+    def tearDown(self):
+        self.fleet._proc.kill()
+        self.fleet._proc.wait()
+        for monitor in self.monitors:
+            monitor.close()
+        self._tmp.cleanup()
+
+    def monitor(self, behaviour):
+        fake = FakeMonitor(behaviour)
+        self.monitors.append(fake)
+        self.fleet.monitor_port = fake.port
+        return fake
+
+    def test_good_monitor_halts_and_confirms(self):
+        fake = self.monitor("good")
+        self.fleet.stop_drone(2)
+        self.assertEqual(fake.commands, ['mach set "drone2"', "cpu IsHalted true", "cpu IsHalted", "physics Disconnect"])
+        self.assertEqual(fake.halted, {"drone2": True})
+        self.assertEqual(fake.connections, 1)
+        self.fleet.stop_drone(2)          # already stopped: nothing more is sent
+        self.assertEqual(fake.connections, 1)
+
+    def test_monitor_replies_are_parsed(self):
+        fake = self.monitor("good")
+        fake.halted["drone1"] = True
+        commands = ['mach set "drone1"', "cpu IsHalted", 'mach set "drone2"', "cpu IsHalted"]
+        self.assertEqual(self.fleet.monitor(commands), ["", "True", "", "False"])   # first connection: greeted
+        self.assertEqual(self.fleet.monitor(commands), ["", "True", "", "False"])   # second: no greeting
+
+    def test_error_reply_is_reported_after_a_retry(self):
+        fake = self.monitor("error")
+        with self.assertRaises(DroneStopError) as caught:
+            self.fleet.stop_drone(2)
+        self.assertIn("drone2 (SYSID 2)", str(caught.exception))
+        self.assertIn("monitor refused 'cpu IsHalted true'", str(caught.exception))
+        self.assertEqual(fake.connections, 2)      # tried twice
+
+    def test_halt_that_does_not_take_is_reported(self):
+        self.monitor("ignored")
+        with self.assertRaises(DroneStopError) as caught:
+            self.fleet.stop_drone(1)
+        self.assertIn("read back 'False', not True", str(caught.exception))
+
+    def test_one_failed_attempt_then_success_is_not_an_error(self):
+        fake = self.monitor("error_once")
+        self.fleet.stop_drone(2)
+        self.assertEqual(fake.connections, 2)
+        self.assertEqual(fake.halted, {"drone2": True})
+
+    def test_refused_connection_is_reported(self):
+        with socket.socket() as probe:              # a port nobody listens on
+            probe.bind(("127.0.0.1", 0))
+            self.fleet.monitor_port = probe.getsockname()[1]
+        with self.assertRaises(DroneStopError) as caught:
+            self.fleet.stop_drone(2)
+        self.assertIn("Connection refused", str(caught.exception))
+
+    def test_monitor_that_never_answers_is_reported(self):
+        self.monitor("silent")
+        with self.assertRaises(DroneStopError) as caught:
+            self.fleet.stop_drone(2)
+        self.assertIn("no reply from the monitor within 1 s to 'mach set \"drone2\"'", str(caught.exception))
+
+    def test_renode_already_gone_is_not_an_error(self):
+        self.fleet._proc.kill()
+        self.fleet._proc.wait()
+        self.fleet.monitor_port = 1               # would be refused if it were tried
+        self.fleet.stop_drone(2)                  # nothing to halt; just the sidecar
+
+
+class MonitorReadiness(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.fleet = SharedRenodeFleet(str(make_standalone(root)), [(1, 1.0, 2.0)], work_root=str(root / "w"))
+        self.fleet.MONITOR_READY_TIMEOUT_S = 1.0
+        self.fleet.work_dir.mkdir(parents=True)
+        self.fleet.log_path.write_text("Renode starting\n")
+        self.fleet._proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.fleet.monitor_port = self.listener.getsockname()[1]
+
+    def tearDown(self):
+        self.listener.close()
+        self.fleet._proc.kill()
+        self.fleet._proc.wait()
+        self._tmp.cleanup()
+
+    def announce(self):
+        with open(self.fleet.log_path, "a") as log:
+            log.write(f"[INFO] Monitor available in telnet mode on port {self.fleet.monitor_port}\n")
+
+    def test_ready_when_announced_and_listening(self):
+        self.listener.listen(1)
+        self.announce()
+        self.fleet._wait_for_monitor()
+
+    def test_never_announced(self):
+        self.listener.listen(1)            # something listens, but Renode never said it is its monitor
+        with self.assertRaises(RenodeLauncherError) as caught:
+            self.fleet._wait_for_monitor()
+        self.assertIn(f"monitor didn't come up on port {self.fleet.monitor_port} within 1 s", str(caught.exception))
+        self.assertIn("never announced", str(caught.exception))
+
+    def test_announced_but_not_listening(self):
+        self.announce()                    # bound but not listening: connections are refused
+        with self.assertRaises(RenodeLauncherError) as caught:
+            self.fleet._wait_for_monitor()
+        self.assertIn("does not accept connections", str(caught.exception))
+
+    def test_renode_exits_first(self):
+        self.fleet._proc.kill()
+        self.fleet._proc.wait()
+        with self.assertRaises(RenodeLauncherError) as caught:
+            self.fleet._wait_for_monitor()
+        self.assertIn("exited (code -9) before its monitor came up", str(caught.exception))
+
+    def test_cancel_is_honoured(self):
+        def cancelled():
+            raise RenodeLauncherError("cancelled")
+        with self.assertRaises(RenodeLauncherError) as caught:
+            self.fleet._wait_for_monitor(cancelled)
+        self.assertEqual(str(caught.exception), "cancelled")
 
 
 if __name__ == "__main__":
