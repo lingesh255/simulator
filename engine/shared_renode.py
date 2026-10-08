@@ -35,6 +35,14 @@ from engine.renode_launcher import RenodeLauncher, RenodeLauncherError
 # "can2Hub" (and the launcher's "gpsHub"): one per drone here.
 _PER_DRONE_NAMES = ("serial", "can1Hub", "can2Hub")
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# The monitor's prompt: "(monitor) " or "(<current machine>) " at the end of its output.
+_PROMPT = re.compile(r"\(\S+\) ?$")
+# How the monitor reports a command it could not run.
+_MONITOR_ERROR = re.compile(r"There was an error executing command|Bad parameters for command|"
+                            r"No such command or device|Could not tokenize|does not provide a field",
+                            re.IGNORECASE)
+
 # Each machine's own quantum - the standalone scripts' value.
 MACHINE_QUANTUM_S = "0.01"
 # How often the machines are brought back in step with each other. They
@@ -42,6 +50,11 @@ MACHINE_QUANTUM_S = "0.01"
 # own quantum; it is also the most (virtual) time a MAVLink byte from
 # outside can wait before its machine sees it.
 MASTER_QUANTUM_S = "0.1"
+
+
+class DroneStopError(RenodeLauncherError):
+    """stop_drone() could not confirm that the drone's machine is halted,
+    although the shared Renode is still running."""
 
 
 def machine_name(sysid: int) -> str:
@@ -213,6 +226,12 @@ class SharedRenodeFleet:
     PROVISION_TIMEOUT_S = 45.0
     ARMABLE_TIMEOUT_S = 180.0
     TIMEOUT_GROWTH_PER_DRONE = 0.25
+    # Renode announces its monitor about a second after it starts, before it
+    # reads the fleet script; 30 s is ample and still far from a boot wait.
+    MONITOR_READY_TIMEOUT_S = 30.0
+    # One monitor command normally answers within tens of milliseconds.
+    MONITOR_REPLY_TIMEOUT_S = 5.0
+    STOP_DRONE_ATTEMPTS = 2
 
     def __init__(self, standalone_dir: str, drones: list[tuple[int, float, float]],
                  work_root: str | None = None):
@@ -283,6 +302,7 @@ class SharedRenodeFleet:
                 launcher.start_physics()
                 check_cancel()
             self._start_renode()
+            self._wait_for_monitor(check_cancel)
             for launcher in self.launchers.values():
                 launcher.attach(self._proc, self.log_path, cancel)
             return self._boot_all(phase)
@@ -306,6 +326,37 @@ class SharedRenodeFleet:
             stderr=subprocess.STDOUT,
             env={**os.environ, **RenodeLauncher.RENODE_ENV},
         )
+
+    def _wait_for_monitor(self, check_cancel: Callable[[], None] = lambda: None) -> None:
+        """Don't let a fleet boot (let alone fly) without the monitor that
+        stop_drone() needs. The port was only known to be free a moment
+        before Renode started, so confirm that it is THIS Renode listening
+        on it: its own log line announcing the monitor on that port, and a
+        connection that is accepted. Otherwise the launch fails here."""
+        announcement = f"Monitor available in telnet mode on port {self.monitor_port}".encode()
+        deadline = time.monotonic() + self.MONITOR_READY_TIMEOUT_S
+        why = "Renode never announced it"
+        while time.monotonic() < deadline:
+            check_cancel()
+            if self._proc is None or self._proc.poll() is not None:
+                code = None if self._proc is None else self._proc.returncode
+                raise RenodeLauncherError(
+                    f"the shared Renode exited (code {code}) before its monitor came up on port "
+                    f"{self.monitor_port} - see {self.log_path}")
+            try:
+                announced = announcement in self.log_path.read_bytes()
+            except OSError:
+                announced = False
+            if announced:
+                try:
+                    socket.create_connection(("127.0.0.1", self.monitor_port), timeout=2).close()
+                    return
+                except OSError as exc:
+                    why = f"it was announced but does not accept connections ({exc})"
+            time.sleep(0.25)
+        raise RenodeLauncherError(
+            f"Renode's monitor didn't come up on port {self.monitor_port} within "
+            f"{self.MONITOR_READY_TIMEOUT_S:.0f} s ({why}) - the fleet was not started")
 
     def _boot_all(self, phase: Callable[[int, str], None]) -> dict[int, str]:
         scale = self.timeout_scale
@@ -368,51 +419,118 @@ class SharedRenodeFleet:
                         if launcher.physics_pid is not None},
         }
 
-    def monitor(self, commands: list[str], reply_wait_s: float = 1.0) -> list[str]:
-        """Run monitor commands on the shared Renode; returns what each printed."""
+    def monitor(self, commands: list[str], reply_timeout_s: float | None = None) -> list[str]:
+        """Run monitor commands on the shared Renode, one connection for all
+        of them (so `mach set` applies to the commands after it). Returns
+        what each printed, without the echoed command and the prompt.
+        Raises OSError if the monitor can't be reached, and TimeoutError
+        if a command's echo and the prompt after it don't come back in time.
+
+        The monitor's greeting is not relied on: the first connection gets
+        a banner, a prompt and a replay of the startup command's output,
+        later connections get nothing until they send something. Each reply
+        is found by the command's own echo instead."""
+        timeout = self.MONITOR_REPLY_TIMEOUT_S if reply_timeout_s is None else reply_timeout_s
         replies = []
-        with socket.create_connection(("127.0.0.1", self.monitor_port), timeout=5) as sock:
-            sock.settimeout(0.2)
-            self._drain(sock, 0.5)   # banner and prompt
+        with socket.create_connection(("127.0.0.1", self.monitor_port), timeout=timeout) as sock:
+            sock.settimeout(0.1)
+            self._drain_until_quiet(sock)
             for command in commands:
                 sock.sendall(command.encode() + b"\n")
-                replies.append(self._drain(sock, reply_wait_s))
+                replies.append(self._read_reply(sock, timeout, command))
         return replies
 
     @staticmethod
-    def _drain(sock: socket.socket, seconds: float) -> str:
-        deadline, chunks = time.monotonic() + seconds, []
+    def _drain_until_quiet(sock: socket.socket, quiet_s: float = 0.3, limit_s: float = 2.0) -> None:
+        """Discard whatever the monitor sends on connect (possibly nothing)."""
+        deadline = time.monotonic() + limit_s
+        last = time.monotonic()
+        while time.monotonic() < deadline and time.monotonic() - last < quiet_s:
+            try:
+                if sock.recv(65536):
+                    last = time.monotonic()
+                else:
+                    return
+            except socket.timeout:
+                pass
+
+    @staticmethod
+    def _read_reply(sock: socket.socket, timeout_s: float, command: str) -> str:
+        """What the monitor printed for `command`: the text between its echo
+        of the command and the next prompt ("(monitor) " or "(droneN) ")."""
+        deadline, data = time.monotonic() + timeout_s, b""
         while time.monotonic() < deadline:
             try:
-                data = sock.recv(65536)
+                chunk = sock.recv(65536)
             except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not data:
-                break
-            chunks.append(data)
-        text = b"".join(chunks).decode(errors="replace").replace("\r", "")
-        return re.sub(r"\x1b\[[0-9;]*m", "", text)
+                chunk = None
+            if chunk == b"":
+                raise ConnectionError(f"the monitor closed the connection while answering {command!r}")
+            if chunk:
+                data += chunk
+            text = _ANSI.sub("", data.decode(errors="replace")).replace("\r", "")
+            echo = text.find(command)   # the first: an error reply quotes the command again
+            if echo >= 0:
+                after = text[echo + len(command):]
+                prompt = _PROMPT.search(after)
+                if prompt:
+                    return after[:prompt.start()].strip()
+        raise TimeoutError(f"no reply from the monitor within {timeout_s:.0f} s to {command!r}")
+
+    def _halt_machine(self, sysid: int) -> None:
+        """Halt one machine's CPU and disconnect its physics, and CONFIRM the
+        halt by reading `cpu IsHalted` back. Raises DroneStopError if any
+        reply is an error or the read-back isn't True; OSError/TimeoutError
+        if the monitor can't be reached."""
+        name = machine_name(sysid)
+        commands = [f'mach set "{name}"', "cpu IsHalted true", "cpu IsHalted", "physics Disconnect"]
+        replies = self.monitor(commands)
+        for command, reply in zip(commands, replies):
+            if _MONITOR_ERROR.search(reply):
+                raise DroneStopError(f"the monitor refused {command!r}: {' '.join(reply.split())[:200]}")
+        if replies[2].strip() != "True":
+            raise DroneStopError(f"`cpu IsHalted` on {name} read back {replies[2].strip()!r}, not True")
 
     def stop_drone(self, sysid: int) -> None:
         """Take one drone out; the others keep running. Its CPU is halted
-        and its physics disconnected through the monitor (if the shared
-        Renode is still up), then its sidecar is stopped. The machine stays
-        halted for the rest of the run: a machine un-halted without its
-        physics crashes and stalls the others, and `machine Pause` stops
-        every machine, so neither is ever used."""
+        and its physics disconnected through the monitor, the halt is read
+        back, then its sidecar is stopped. The machine stays halted for the
+        rest of the run: a machine un-halted without its physics crashes
+        and stalls the others, and `machine Pause` stops every machine, so
+        neither is ever used.
+
+        The halt is tried twice. If it still can't be confirmed while the
+        shared Renode is running, the sidecar is stopped anyway and
+        DroneStopError is raised: that machine may still be executing on
+        frozen physics, and the caller must not treat the drone as cleanly
+        stopped (services.fleet_mission stops the whole fleet). If Renode
+        itself is gone there is nothing to halt, and that is not an error."""
         launcher = self.launchers[sysid]
         with self._lock:
             if sysid in self._stopped_drones:
                 return
             self._stopped_drones.add(sysid)
-        if self.is_running and self.monitor_port is not None:
-            try:
-                self.monitor([f'mach set "{machine_name(sysid)}"', "cpu IsHalted true", "physics Disconnect"])
-            except OSError:
-                pass   # the monitor went away with Renode; the sidecar still gets stopped
-        launcher.stop_physics()
+        failure = None
+        try:
+            for attempt in range(1, self.STOP_DRONE_ATTEMPTS + 1):
+                if not self.is_running or self.monitor_port is None:
+                    failure = None      # no Renode, nothing left to halt
+                    break
+                try:
+                    self._halt_machine(sysid)
+                    failure = None
+                    break
+                except (OSError, DroneStopError) as exc:   # TimeoutError and ConnectionError are OSErrors
+                    failure = f"attempt {attempt}: {exc}"
+                    time.sleep(0.5)
+            if failure is not None and not self.is_running:
+                failure = None          # Renode died while we were asking
+        finally:
+            launcher.stop_physics()
+        if failure is not None:
+            raise DroneStopError(
+                f"could not confirm that {machine_name(sysid)} (SYSID {sysid}) is halted in the shared Renode "
+                f"after {self.STOP_DRONE_ATTEMPTS} attempts ({failure}); its physics sidecar was stopped")
 
     def stop_all(self) -> None:
         """Kill the one Renode and every sidecar - safe from any thread, at
