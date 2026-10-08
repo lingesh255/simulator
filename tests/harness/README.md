@@ -46,6 +46,15 @@ the window at the end. Needs a display.
 | `fleet_dupsysid` | adds a temporary profile sharing SYSID 1, expects the fleet to be refused, removes it |
 | `fleet_sidecar3` | 3 drones, drone 2's physics sidecar killed (SIGKILL) once all are above 20 m - meant for the shared mode, where only the sidecar shows the failure |
 | `fleet_stopboot3` | 3 drones, Stop pressed 60 s into the fleet boot |
+| `fleet_twice3` | two fleet missions back to back in one app session |
+| `fleet_switch3` | per-drone, then shared, then per-drone fleets in one app session |
+| `fleet_stopthen3` | Stop mid-flight, then a new mission straight away |
+| `fleet_travell5`, `fleet_travell6` | 5 / 6 drones (adds temporary `harness_d<N>.json` profiles, removes them afterwards) |
+| `fleet_sidecar4` | 4 drones, drone 2's physics sidecar killed mid-flight |
+| `fleet_long3` | 3 drones on a ~3 km route (about 30 minutes of flying) |
+| `fleet_close3`, `fleet_sigterm3`, `fleet_sigkill3` | the app window closed / SIGTERM / SIGKILL to the app with 3 drones airborne (run `fleet_sigkill3` on its own with `gui_drive.py`, then another fleet scenario without cleaning up, to see the next launch clear the orphans) |
+| `fleet_single1` | one drone checked: must use the single-drone path whatever the fleet emulation says |
+| `fleet_norenode1` | a typed address, then the mock vehicle: the control is off and no Renode starts |
 | `fleet_renodekill3` | 3 drones, every Renode process killed (SIGKILL) once all are above 20 m - in the shared mode that is the one Renode |
 | `table_demo` | D1-D3 on the local preview: the Flight Log table, Table/Logs toggle and Logs badge, with screenshots (prefix from `TABLE_DEMO_PREFIX`, default `s13`) |
 
