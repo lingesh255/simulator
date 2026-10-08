@@ -295,8 +295,9 @@ class SharedRenodeFleet:
                     raise RenodeLauncherError(f"drone with SYSID {sysid}: {exc}") from exc
             self.monitor_port = _free_port()
             check_cancel()
+            for sysid in self.launchers:
+                phase(sysid, "Booting Renode")   # all at once: they boot together
             for sysid, launcher in self.launchers.items():
-                phase(sysid, "Booting Renode")
                 launcher.prepare()
                 check_cancel()
                 launcher.start_physics()
