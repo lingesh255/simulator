@@ -135,7 +135,7 @@ class SpeedFleet(SharedRenodeFleet):
             for item in o.gc.split(","):
                 key, value = item.split("=", 1)
                 env[key] = value
-        cpus = o.renode_cpus
+        cpus = self.renode_cpus
 
         def setup():
             os.setsid()
@@ -228,14 +228,33 @@ def main() -> int:
                     help="renode-p: Renode on the P-core CPUs (0-11), sidecars on the E-cores; renode-p1: Renode on one "
                          "logical CPU per P-core (0,2,..,10), sidecars on the E-cores; renode-e: Renode on the E-cores, "
                          "sidecars on the P-cores (control)")
+    ap.add_argument("--renode-cpus", default=None, help='explicit CPU list for Renode, e.g. "0,2,4,6,8,10" or "0-11" '
+                                                         "(overrides --affinity); with several groups, "
+                                                         'one list per group separated by "/"')
+    ap.add_argument("--sidecar-cpus", default=None, help="explicit CPU list for every physics sidecar")
     ap.add_argument("--boot-only", action="store_true", help="stop once every drone is armable (plus 30 s)")
     args = ap.parse_args()
     groups = [[int(x) for x in g.split(",")] for g in args.groups.split("/")]
     sysids = [s for g in groups for s in g]
+    explicit_renode_cpus = args.renode_cpus
     args.renode_cpus = {"none": None, "renode-p": P_CORE_CPUS, "renode-p1": set(range(0, 12, 2)),
                         "renode-e": E_CORE_CPUS}[args.affinity]
     sidecar_cpus = {"none": None, "renode-p": E_CORE_CPUS, "renode-p1": E_CORE_CPUS,
                     "renode-e": P_CORE_CPUS}[args.affinity]
+    def cpu_list(text):
+        cpus = set()
+        for part in text.split(","):
+            lo, _, hi = part.partition("-")
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+        return cpus
+    group_cpus = None
+    if explicit_renode_cpus:
+        group_cpus = [cpu_list(t) for t in explicit_renode_cpus.split("/")]
+        if len(group_cpus) == 1:
+            group_cpus = group_cpus * len(groups)
+        args.renode_cpus = sorted(group_cpus[0])
+    if args.sidecar_cpus:
+        sidecar_cpus = cpu_list(args.sidecar_cpus)
     OUT.mkdir(exist_ok=True)
 
     estimate_mb = int(1024 * sum(RENODE_GB + EXTRA_DRONE_GB * (len(g) - 1) for g in groups))
@@ -257,7 +276,11 @@ def main() -> int:
     for i, group in enumerate(groups, 1):
         fleet = SpeedFleet(str(STANDALONE), [(s, *drones[s].start) for s in group])
         fleet.configure(i, args)
+        fleet.renode_cpus = group_cpus[i - 1] if group_cpus else args.renode_cpus
         fleets.append(fleet)
+    result["renode_cpus_per_group"] = [sorted(f.renode_cpus) if f.renode_cpus else None for f in fleets]
+    result["sidecar_cpus"] = sorted(sidecar_cpus) if sidecar_cpus else None
+    log(f"affinity: Renode {result['renode_cpus_per_group']}, sidecars {result['sidecar_cpus']}")
     connections: dict[int, str] = {}
     boot_errors: list[str] = []
     t_launch = time.monotonic()
