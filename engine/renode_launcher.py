@@ -95,11 +95,20 @@ def _renode_processes() -> list[tuple[int, list[str]]]:
 
 
 def _pid_gone(pid: int) -> bool:
+    """Whether the process has let go of everything (ports, files). Not
+    there at all, or a zombie WITH NO OTHER THREADS LEFT: a killed
+    multi-threaded process's main thread turns zombie while its other
+    threads are still exiting, and until they have, its listening sockets
+    stay bound (seen with a killed 2.4 GB Renode: "port already in use"
+    0.1 s after its pid read as a zombie)."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
+        if stat.rsplit(")", 1)[-1].split()[0] != "Z":
+            return False
+        threads = [entry.name for entry in Path(f"/proc/{pid}/task").iterdir()]
     except OSError:
         return True
-    return stat.rsplit(")", 1)[-1].split()[0] == "Z"  # a zombie holds no ports or files
+    return threads in ([], [str(pid)])
 
 
 def _kill_pids(pids: list[int], timeout_s: float = 5.0) -> None:
