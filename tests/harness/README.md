@@ -45,6 +45,8 @@ the window at the end. Needs a display.
 | `fleet_kill2` | 3 drones, drone 2's Renode killed (SIGKILL) once all are above 20 m |
 | `fleet_dupsysid` | adds a temporary profile sharing SYSID 1, expects the fleet to be refused, removes it |
 | `fleet_sidecar3` | 3 drones, drone 2's physics sidecar killed (SIGKILL) once all are above 20 m - meant for the shared mode, where only the sidecar shows the failure |
+| `fleet_stopboot3` | 3 drones, Stop pressed 60 s into the fleet boot |
+| `fleet_renodekill3` | 3 drones, every Renode process killed (SIGKILL) once all are above 20 m - in the shared mode that is the one Renode |
 | `table_demo` | D1-D3 on the local preview: the Flight Log table, Table/Logs toggle and Logs badge, with screenshots (prefix from `TABLE_DEMO_PREFIX`, default `s13`) |
 
 Fleet scenarios live in `fleet_scenarios.py`. `fleet_vform3` flies a
@@ -71,6 +73,9 @@ FLEET_EMULATION=shared tests/harness/regression.sh s18sh fleet_travell3 fleet_si
 ```
 
 Each scenario's log lands in `tests/harness/out/<prefix>_<scenario>.out`.
+`summarize.py <prefix>` then prints one line per scenario: exit code,
+processes left, the fleet result, failsafe count, Renode RSS in flight, and
+the seconds to fleet ready and finished.
 It can run detached (`nohup setsid ... &`) so it survives the terminal.
 
 ## Headless checks
