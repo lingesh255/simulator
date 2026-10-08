@@ -13,6 +13,13 @@ Measured on 7-8 Oct 2026: the standalone folder's Renode (reports 1.16.1,
 build 2a060779-202608220408), ArduCopter 4.8.0-dev on the Pixhawk6C
 platform, 16 cores, 15 GiB RAM.
 
+**Integrated (Tasks 18-19):** this is now the app's optional "Shared Renode
+(low memory)" fleet mode. The generator and the fleet class live in
+`engine/shared_renode.py`, wired in through `services/fleet_mission.py` and
+Mission Planner's "Fleet emulation" setting; MULTI_DRONE.md has the user
+view and the both-modes regression numbers. The scripts here remain the
+experiment record (`make_fleet_resc.py` now calls the engine's generator).
+
 ## Verdict (Task 17)
 
 **GO: integrate "one Renode, parallel machines with their own time

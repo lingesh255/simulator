@@ -53,37 +53,99 @@ formation 4.
 
 ## Fleet emulation: one Renode per drone, or one shared Renode
 
-**Mission Planner > Fleet emulation** (saved in `data/app_settings.json`)
-chooses how a fleet of two or more drones is emulated. A single drone
-always uses its own Renode.
+### Choosing a mode
 
-| | One Renode per drone (default) | Shared Renode (low memory) |
-|---|---|---|
-| Processes | one Renode + one physics sidecar per drone | ONE Renode + one sidecar per drone |
-| Renode memory, 3 drones flying | 6.3 GB | 2.4 GB |
-| Renode memory, 4 drones flying | 8.9 GB | 2.5 GB |
-| Fleet ready (all armable), 3 / 4 drones | 176 s / 192-195 s | 197 s / 230 s |
-| If a Renode dies | only that drone fails | every drone fails |
+**Mission Planner > Fleet emulation** (saved as `fleet_emulation` in
+`data/app_settings.json`) chooses how a fleet of two or more drones is
+emulated. It is enabled once **Fly via real MAVLink** is checked. A single
+drone always uses its own Renode, whatever it says.
 
-In the shared mode (`engine/shared_renode.py`) every drone is a machine
-(`drone<SYSID>`) inside one Renode, running in parallel on its own host
-thread. Ports, SYSIDs, SD / FRAM / flash copies and the physics sidecars
-are exactly the per-drone ones described below; routes, separation, the
-landing check, the Flight Log table and Stop work the same.
+- **One Renode per drone** (the default): each drone gets its own Renode
+  process, about 2.2 GB each. A Renode that dies takes one drone with it.
+- **Shared Renode (low memory)**: every drone is a machine inside ONE
+  Renode process, about 2.4-2.7 GB in all. About 10-15 % slower end to end.
+  If that Renode dies, every drone fails.
 
-- Each machine is created with its own time source
-  (`Machine(createLocalTimeSource: true)`, through the monitor's Python).
-  With the monitor's plain `mach create`, two of these machines cannot run
-  in parallel at all - see `experiments/single_renode/RESULTS.md`.
-- The watchdog watches the one Renode (if it dies, every flying drone
-  fails) and each physics sidecar (if one dies, only that drone fails: its
-  machine is halted through Renode's monitor and the others keep flying).
-  A drone whose sidecar has died keeps sending MAVLink, so the sidecar
-  process is the only place it shows.
-- Boot waits are stretched by 25 % per extra drone, because several
-  machines in one process boot a little slower than one alone.
-- The shared Renode's script and console log are in
-  `renode_instances/shared/`.
+The fleet log says which is in use ("Booting a fleet of 4 drones in one
+shared Renode (low memory) ...").
+
+### Measured (8 Oct 2026, GUI regression, both modes on the same routes)
+
+| Scenario | Result (both modes) | Renode RSS in flight: per drone / shared | Fleet ready: per drone / shared | Fleet finished: per drone / shared |
+|---|---|---|---|---|
+| Travell, 3 drones | 3 of 3 completed | 6717 / 2379 MB | 177 / 202 s | 551 / 631 s |
+| Search, 3 drones | 3 of 3 completed | 6583 / 2399 MB | 178 / 198 s | 609 / 672 s |
+| V-formation, 3 drones | 3 of 3 completed | 6480 / 2322 MB | 181 / 202 s | 570 / 631 s |
+| **Grid, 4 drones** | 4 of 4 completed | **8536 / 2673 MB** | 198 / 234 s | 644 / 733 s |
+| Stop pressed mid-flight, 3 drones | 0 of 3, all "stopped by the user" | - | 186 / 205 s | 233 / 257 s |
+| Last drone's MAVLink port taken | fleet refused in under a second, nothing started | - | - | - |
+| One drone's emulation killed mid-flight | 2 of 3 completed, that drone failed | 6865 / 2525 MB | 181 / 203 s | 528 / 608 s |
+
+Every run exited cleanly with no Renode or sidecar left and no EKF
+failsafe. The grid's landing spread is the same in both modes (10.0 m
+sides, 14.1 m diagonals). "One drone's emulation killed" is that drone's
+Renode in the per-drone mode and its physics sidecar in the shared mode.
+Shared mode only: the one Renode killed mid-flight fails all three drones
+("the shared Renode exited mid-flight") and leaves nothing running; Stop
+pressed 60 s into the boot stops everything within about a second.
+
+### How the shared mode works (`engine/shared_renode.py`)
+
+- `generate_fleet_script` writes one Renode script: every peripheral source
+  included once, then one machine per drone (`drone<SYSID>`) with that
+  drone's own platform files, MAVLink socket (`serial_d<N>`, port 5762+N),
+  CAN and GPS hubs, SD card and physics connection (9002+N), then one
+  `start`. Ports, SYSIDs, SD / FRAM / flash copies and the physics sidecars
+  are exactly the per-drone ones described below.
+- Each machine is created with its own time source, through the monitor's
+  Python because the monitor has no command for it:
+  `AddMachine(Machine(True), 'droneN')`.
+- The machines run in parallel, one host thread each. Each keeps the 10 ms
+  quantum of the standalone scripts; the master time source brings them
+  back in step every 100 ms (they never talk to each other inside Renode).
+- `SharedRenodeFleet.start()` checks every port first, starts the N
+  sidecars and the one Renode, then takes every drone through the same GPS
+  fix, provisioning and armable steps as the per-drone launcher, in
+  parallel. Those waits are stretched by 25 % per extra drone. If any drone
+  fails to boot, everything is stopped and the error names it.
+- Routes, separation, the landing check, the Flight Log table and Stop are
+  the same code as in the per-drone mode.
+- The script and Renode's console log are in `renode_instances/shared/`.
+
+### Why `mach create` does not work, and the fix
+
+With the monitor's `mach create`, every machine shares the emulation's one
+master time source. One machine's timers are then advanced from another
+machine's CPU thread while its own CPU is running, and interrupts are lost
+or delivered with nothing pending: with two of these machines a CPU aborts
+(`CPU abort [PC=0xF092D004]`) or the emulation freezes within a second.
+Creating each machine with its own time source removes that; nothing else
+had to change. The full investigation is in
+`experiments/single_renode/RESULTS.md`.
+
+### The watchdog, and stopping one drone
+
+- If the one Renode dies, every flying drone is failed at once.
+- If one drone's physics sidecar dies, only that drone is failed and
+  stopped; the others keep flying. A drone whose sidecar has died keeps
+  sending MAVLink from frozen sensor values, so only the sidecar process
+  shows it - MAVLink does not.
+- Stopping one drone (`SharedRenodeFleet.stop_drone`): through Renode's
+  monitor, `mach set "droneN"`, `cpu IsHalted true`, `physics Disconnect`;
+  then its sidecar is stopped. The machine stays halted until the fleet
+  ends.
+
+### Limits and risks of the shared mode
+
+- It relies on a Renode internal (`Machine(createLocalTimeSource: true)`)
+  reached through the monitor's Python.
+- One process is one point of failure.
+- Never `machine Pause` (it stops every machine) and never un-halt a
+  stopped drone (without its physics it crashes and stalls the others).
+- The standalone folder's Renode is a modified build: official Renode
+  1.17.0 and the 7 Oct 2026 nightly cannot load this platform, so the mode
+  has only ever run on this one build.
+- Renode's monitor listens on a local TCP port for the length of the run.
 
 ## Per-instance isolation (`engine/renode_launcher.py`)
 
