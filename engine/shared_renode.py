@@ -269,8 +269,11 @@ class SharedRenodeFleet:
 
         try:
             # Every port first: nothing is started if any is taken.
-            for launcher in self.launchers.values():
-                launcher.check_ports_free()
+            for sysid, launcher in self.launchers.items():
+                try:
+                    launcher.check_ports_free()
+                except RenodeLauncherError as exc:
+                    raise RenodeLauncherError(f"drone with SYSID {sysid}: {exc}") from exc
             self.monitor_port = _free_port()
             check_cancel()
             for sysid, launcher in self.launchers.items():
