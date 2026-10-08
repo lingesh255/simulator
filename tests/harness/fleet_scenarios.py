@@ -18,7 +18,6 @@ file); the default is whatever the settings file says.
 import itertools
 import math
 import os
-import signal
 import subprocess
 
 from PySide6.QtCore import QTimer
