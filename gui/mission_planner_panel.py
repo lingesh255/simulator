@@ -156,6 +156,7 @@ class MissionPlannerPanel(QWidget):
         self.fleet_emulation_combo.setCurrentIndex(max(saved, 0))
         self.fleet_emulation_combo.setEnabled(False)
         self.fleet_emulation_combo.currentIndexChanged.connect(self._on_fleet_emulation_changed)
+        self.mavlink_connection_edit.textChanged.connect(lambda _text: self._update_fleet_emulation_gating())
         fleet_row = QHBoxLayout()
         fleet_row.addWidget(QLabel("Fleet emulation:"))
         fleet_row.addWidget(self.fleet_emulation_combo, stretch=1)
@@ -261,6 +262,7 @@ class MissionPlannerPanel(QWidget):
         setEnabled(True) call in MainWindow's ready handler that didn't
         account for the drone-selection requirement."""
         self._renode_ready = ready
+        self._update_fleet_emulation_gating()
         self._renode_launch_in_progress = False
         self._update_plan_gating()
         self._update_mock_vehicle_gating()
@@ -316,6 +318,7 @@ class MissionPlannerPanel(QWidget):
         self._mission_active = active
         self._update_plan_gating()
         self._update_renode_launch_gating()
+        self._update_fleet_emulation_gating()
 
     def _update_renode_launch_gating(self) -> None:
         """"Launch Renode" requires, in order: no mission actively flying
@@ -383,13 +386,27 @@ class MissionPlannerPanel(QWidget):
         # _update_renode_launch_gating() (that only sets the button), so
         # it's handled directly here.
         self.renode_dir_edit.setEnabled(self.external_mavlink_check.isChecked() and not checked)
-        self.fleet_emulation_combo.setEnabled(self.external_mavlink_check.isChecked() and not checked)
+        self._update_fleet_emulation_gating()
         self._update_renode_launch_gating()
 
     def _on_fleet_emulation_changed(self, _index: int) -> None:
         settings = load_app_settings()   # keep the file's other preferences
         settings.fleet_emulation = self.fleet_emulation_combo.currentData()
         save_app_settings(settings)
+
+    def _update_fleet_emulation_gating(self) -> None:
+        """The fleet emulation choice only means something when Renode can
+        be the vehicle - real MAVLink selected, no mock vehicle, no address
+        of the user's own typed into Connect (the text Renode fills in
+        itself once ready doesn't count) - and it is read when a mission
+        starts, so it is locked while one is active."""
+        own_address = bool(self.mavlink_connection_string()) and not self._renode_ready
+        self.fleet_emulation_combo.setEnabled(
+            self.external_mavlink_check.isChecked()
+            and not self.mock_vehicle_check.isChecked()
+            and not own_address
+            and not self._mission_active
+        )
 
     def shared_renode_fleet(self) -> bool:
         """Whether a fleet should fly as machines in one shared Renode."""
@@ -398,7 +415,7 @@ class MissionPlannerPanel(QWidget):
     def _on_external_mavlink_toggled(self, checked: bool) -> None:
         self.mavlink_connection_edit.setEnabled(checked)
         self.renode_dir_edit.setEnabled(checked and not self.mock_vehicle_check.isChecked())
-        self.fleet_emulation_combo.setEnabled(checked and not self.mock_vehicle_check.isChecked())
+        self._update_fleet_emulation_gating()
         self._update_plan_gating()
         self._update_mock_vehicle_gating()
         self._update_renode_launch_gating()
