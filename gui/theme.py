@@ -15,7 +15,6 @@ from typing import Literal
 
 from PySide6.QtCore import Property, QObject, Signal
 
-from contracts.gui_orchestration import AppSettings
 from services.storage import load_app_settings, save_app_settings
 
 ThemeName = Literal["light", "dark"]

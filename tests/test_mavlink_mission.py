@@ -1,6 +1,5 @@
 """upload_and_fly's landing detection, against a fake `master` that replays a
 scripted MAVLink conversation (plain unittest - also collected by pytest)."""
-import re
 import unittest
 
 from pymavlink.dialects.v20 import ardupilotmega as mav2
