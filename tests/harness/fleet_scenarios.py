@@ -202,9 +202,10 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
         d.then(f"mission {k}: prepare ({mode})", lambda: True, reset_trackers)
         d.then(f"mission {k}: click Plan Mission", lambda: mp.plan_btn.isEnabled(), d.click_plan, timeout_s=120)
         d.then(f"mission {k}: click Start", lambda: True, lambda: d.click_map(pts["CANBERRA"]))
-        d.then(f"mission {k}: click Destination", lambda: True, lambda: (
-            d.click_map(dest or short_north),
-            log(f"mission {k}: combo enabled right after starting = {mp.fleet_emulation_combo.isEnabled()}")))
+        d.then(f"mission {k}: click Destination", lambda: True, lambda: d.click_map(dest or short_north))
+        d.then(f"mission {k}: fleet boot under way", lambda: st["boot_started"] or st["boot_failed"], lambda: log(
+            f"mission {k}: while booting, fleet emulation combo enabled = {mp.fleet_emulation_combo.isEnabled()} "
+            f"(must be False), table rows = {len(d.table_rows())}"), timeout_s=120)
         if stop_above is not None:
             d.then(f"mission {k}: all {n} drones above {stop_above} m", lambda: all_above(stop_above), lambda: None,
                    timeout_s=1500)
