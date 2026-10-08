@@ -31,7 +31,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from contracts.gui_orchestration import DroneConfig, LatLon, SwarmTelemetryBatch
 from engine.renode_launcher import RenodeLauncher, kill_all_renode_processes
-from engine.shared_renode import SharedRenodeFleet
+from engine.shared_renode import DroneStopError, SharedRenodeFleet
 from services.mavlink_flight_service import MavlinkFlightService
 
 # Highest sysid (= Renode instance) a fleet may use. Instance N listens on
@@ -78,6 +78,7 @@ class _BootWorker(QObject):
     failed = Signal(str)
     progress = Signal(str)
     phase = Signal(int, str)  # (sysid, short boot phase) - see FleetMission.drone_phase
+    stop_failed = Signal(int, str)  # (sysid, why) - a shared-Renode drone could not be confirmed halted
 
     def __init__(self):
         super().__init__()
@@ -237,7 +238,12 @@ class _BootWorker(QObject):
             launcher.stop()
         if shared is not None:
             # Off this (GUI) thread: it talks to Renode's monitor for a few seconds.
-            threading.Thread(target=shared.stop_drone, args=(sysid,), name=f"stop-drone-{sysid}", daemon=True).start()
+            def halt() -> None:
+                try:
+                    shared.stop_drone(sysid)
+                except DroneStopError as exc:
+                    self.stop_failed.emit(sysid, str(exc))
+            threading.Thread(target=halt, name=f"stop-drone-{sysid}", daemon=True).start()
 
     def stop_all(self, cancelled: bool = False) -> None:
         """Stop every instance - safe from any thread, and while booting.
@@ -283,6 +289,7 @@ class FleetMission(QObject):
         self._worker.failed.connect(self._on_boot_failed)
         self._worker.progress.connect(self.progress)
         self._worker.phase.connect(self.drone_phase)
+        self._worker.stop_failed.connect(self._on_stop_failed)
         self._boot_requested.connect(self._worker.boot)
         self._thread.start()
         self._plan: _FleetPlan | None = None
@@ -400,6 +407,29 @@ class FleetMission(QObject):
             self._mark(sysid, "failed", reason)
             self._worker.stop_one(sysid)   # its physics sidecar too; in a shared Renode, halt its machine
             self._flights[sysid].abort()   # its flight then reports finished -> _on_drone_ended
+
+    def _on_stop_failed(self, sysid: int, why: str) -> None:
+        """A failed drone's machine could not be confirmed halted in the
+        shared Renode. It may still be executing on frozen physics next to
+        the drones that are flying, which nothing has been tested against -
+        so the fleet is not left running on a guess: say so loudly and stop
+        every drone that is still flying."""
+        if not self._active:
+            return
+        outcome = self._outcomes.get(sysid)
+        name = outcome.name if outcome is not None else f"SYSID {sysid}"
+        self.progress.emit(f"ERROR: {name} (SYSID {sysid}) COULD NOT BE STOPPED - {why}")
+        if outcome is not None:
+            outcome.reason = f"{outcome.reason}; and it could not be halted" if outcome.reason else "could not be halted"
+            self.drone_phase.emit(sysid, f"Failed - {outcome.reason}")
+        flying = [s for s, o in self._outcomes.items() if o.state == "flying"]
+        if flying:
+            self.progress.emit(
+                f"Stopping the other {len(flying)} drone(s): the fleet is not flown on with a machine "
+                "that may still be running.")
+        for other in flying:
+            self._mark(other, "failed", f"fleet stopped because {name} (SYSID {sysid}) could not be halted")
+            self._flights[other].abort()   # its flight then reports finished -> _on_drone_ended
 
     def _mark(self, sysid: int, state: str, reason: str = "") -> None:
         outcome = self._outcomes[sysid]
