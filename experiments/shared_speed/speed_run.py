@@ -142,7 +142,10 @@ class SpeedFleet(SharedRenodeFleet):
             if cpus:
                 os.sched_setaffinity(0, cpus)   # inherited by every thread Renode starts
         self._proc = subprocess.Popen(
-            [str(self.renode_bin), "--disable-xwt", "-P", str(self.monitor_port), "-e", f"include @{self.script_path}"],
+            [str(self.renode_bin), "--disable-xwt", "-P", str(self.monitor_port),
+             # SPEED_RENODE_CONFIG: an alternative Renode config file (the snapshot probe's detailed serializer)
+             *(["--config", os.environ["SPEED_RENODE_CONFIG"]] if os.environ.get("SPEED_RENODE_CONFIG") else []),
+             "-e", f"include @{self.script_path}"],
             cwd=self.standalone_dir, preexec_fn=setup, stdin=subprocess.DEVNULL, stdout=self._log,
             stderr=subprocess.STDOUT, env=env)
 
