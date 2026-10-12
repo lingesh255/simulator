@@ -1327,3 +1327,322 @@ def retarget_grid_problem(
                     )
 
     return result
+
+
+# ---- 3-D grid ("cube") formation expansion/retargeting ---------------------
+
+# Spacing between adjacent drones in a cube formation, in metres. The
+# horizontal figure matches the 2-D grid's GRID_SPACING_M; the vertical one is
+# the gap between consecutive layers' cruise altitudes. As with the 2-D grid,
+# these two constants drive BOTH representations - the descriptive
+# slot-*-offset facts written here, and the actual flown tracks/altitude
+# offsets derived in services.plan_service - so there is nothing to keep in
+# sync by hand.
+CUBE_SPACING_M = 10.0
+CUBE_LAYER_SPACING_M = 10.0
+
+_CUBE_MEMBER_TOKEN = "drone-member"
+
+
+def cube_dimensions(drone_count: int) -> tuple[int, int, int]:
+    """(layers, rows, cols) for a cube formation of `drone_count` drones.
+
+    Unlike `grid_dimensions`, which insists the count tile its rectangle
+    *exactly*, this picks a square horizontal footprint and stacks as many
+    layers as it takes, allowing the top layer to be partially filled. That
+    matters because exact tiling degenerates badly in three dimensions - 25
+    would come out 1x5x5 (a flat plane, not a cube at all) and any prime a
+    straight line - whereas filling a block layer by layer gives a genuinely
+    three-dimensional shape for *every* count.
+
+    The footprint side is the smallest `s` with `s**3 >= drone_count`,
+    shrunk if that would leave only a single layer (a flat plane again), so:
+
+        8  -> (2, 2, 2)   a full 2x2x2 cube
+        9  -> (3, 2, 2)   12 cells, 9 filled  (s=3 would be a flat 1x3x3)
+        16 -> (2, 3, 3)   18 cells, 16 filled
+        25 -> (3, 3, 3)   27 cells, 25 filled
+        27 -> (3, 3, 3)   a full cube
+        64 -> (4, 4, 4)   a full cube
+
+    `rows == cols` always (a square footprint); `expand_cube_drones` decides
+    which physical axis is which - row 0 is the front row, layer 0 the bottom
+    layer.
+    """
+    if drone_count < 2:
+        raise ValueError(f"cube drone_count must be >= 2, got {drone_count}")
+    side = 1
+    while side ** 3 < drone_count:
+        side += 1
+    # A single layer is a plane, not a cube - shrink the footprint until the
+    # count needs at least two of them. `side` never reaches 0: a side of 1
+    # gives a base of 1 and therefore `drone_count` layers, which is >= 2 for
+    # every count this function accepts.
+    while side > 1 and math.ceil(drone_count / (side * side)) < 2:
+        side -= 1
+    layers = math.ceil(drone_count / (side * side))
+    return layers, side, side
+
+
+def cube_cell_names(
+    layers: int, rows: int, cols: int, drone_count: int
+) -> dict[tuple[int, int, int], str]:
+    """(layer, row, col) -> drone object name for a cube formation, 0-indexed
+    with layer 0 the bottom layer and row 0 the front row.
+
+    Cells are filled in layer-major, then row-major order and only
+    `drone_count` of them are used, so a partially filled top layer simply
+    stops part way along - see `cube_dimensions`.
+
+    The leader sits at the front row of the BOTTOM layer, in the column
+    nearest the middle: bottom so that it is the first to climb (domain.pddl's
+    layer gate releases layers from the ground up), front-middle for the same
+    reason the 2-D grid puts it there. Every other filled cell is a
+    `cube-member` drone: the first one in fill order keeps the template's own
+    `drone-member` name - which is what lets `_clone_named_lines` find lines
+    to clone - and the rest are named `drone-l{layer}r{row}c{col}`.
+    """
+    leader_cell = (0, 0, (cols - 1) // 2)
+    all_cells = [
+        (layer, row, col)
+        for layer in range(layers)
+        for row in range(rows)
+        for col in range(cols)
+    ]
+    filled = all_cells[:drone_count]
+    # The leader's own cell sits at index (cols - 1) // 2 of the fill order,
+    # which is below MIN_CUBE_DRONES for every footprint this module builds,
+    # so it is always among the filled cells.
+    names = {leader_cell: "drone-lead"}
+    member_cells = [cell for cell in filled if cell != leader_cell]
+    for i, cell in enumerate(member_cells):
+        names[cell] = (
+            _CUBE_MEMBER_TOKEN if i == 0 else f"drone-l{cell[0]}r{cell[1]}c{cell[2]}"
+        )
+    return names
+
+
+# The 24 directions a cube drone communicates in: every cell of the 3x3x3
+# block around it EXCEPT itself and the two cells directly above and below.
+# That is 8 in its own layer (front/back/left/right plus the 4 diagonals),
+# 8 in the layer above and 8 in the layer below - the single condition
+# `not (dr == 0 and dc == 0)` removes exactly those three straight-vertical
+# cells, leaving 27 - 3 = 24.
+_CUBE_NEIGHBOR_OFFSETS = tuple(
+    (dl, dr, dc)
+    for dl in (-1, 0, 1)
+    for dr in (-1, 0, 1)
+    for dc in (-1, 0, 1)
+    if not (dr == 0 and dc == 0)
+)
+
+
+def _strip_unary_facts(problem_text: str, predicate: str) -> str:
+    """Remove every `(predicate X)` fact and its line - the one-argument
+    counterpart to `_strip_pair_facts`. Used by `expand_cube_drones` to clear
+    the `layer-launched`/`cleared-to-launch` flags before rebuilding them:
+    step 2 clones the template's own bottom-layer flags onto every new member
+    name, which would clear the whole block for takeoff at once and defeat the
+    layer-by-layer ascent."""
+    return re.sub(rf"[ \t]*\({re.escape(predicate)}\s+\S+\)\n?", "", problem_text)
+
+
+def expand_cube_drones(problem_text: str, drone_count: int) -> str:
+    """Grow the cube template's single reference member (`drone-member` - the
+    smallest case, a flat 1x1x2) into a full `layers x rows x cols` block
+    sized for `drone_count` drones (see `cube_dimensions`).
+
+    Like `expand_grid_drones`, and for the same reason, this rebuilds the
+    whole member list, offsets and neighbour mesh from `drone_count` directly
+    rather than incrementally extending whatever the template had: a cube's
+    shape changes non-monotonically between counts, so 27 drones is a 3x3x3
+    block rather than "a 2x3x3 plus some more somewhere".
+
+    What it writes per cell:
+
+      - `slot-along-offset`  `-row * CUBE_SPACING_M` (rows behind trail the
+        leader, matching the 2-D grid's trailing-negative convention)
+      - `slot-cross-offset`  `(col - leader_col) * CUBE_SPACING_M`
+        (negative = left of the leader)
+      - `slot-layer`         the layer index, 0 at the bottom
+      - `slot-lift-offset`   `layer * CUBE_LAYER_SPACING_M`
+      - `target-altitude`    the template's own base altitude plus that lift,
+        so each layer cruises at its own height and the stack separates
+        vertically exactly as rows and columns separate it horizontally
+
+    plus the two ascent counters (`layers-cleared` reset to 0,
+    `top-layer-index` set to `layers - 1`) and a freshly computed
+    `cube-neighbor` mesh - 24-way adjacency, one symmetric pair per link.
+
+    `drone_count` must be >= 2; raises `ValueError` otherwise. Callers
+    additionally enforce `MIN_CUBE_DRONES` so a cube always reads as a solid
+    block rather than a plane.
+    """
+    if drone_count < 2:
+        raise ValueError(f"cube drone_count must be >= 2, got {drone_count}")
+
+    layers, rows, cols = cube_dimensions(drone_count)
+    leader_col = (cols - 1) // 2
+    cell_name = cube_cell_names(layers, rows, cols, drone_count)
+    leader_cell = (0, 0, leader_col)
+    # Sorted fill order, so `drone-member` is the first member cell - matching
+    # what `cube_cell_names` named it.
+    member_cells = sorted(cell for cell in cell_name if cell != leader_cell)
+    member_names = [cell_name[cell] for cell in member_cells]
+    first_name, rest_names = member_names[0], member_names[1:]
+
+    base_altitude = _unary_fact_value(problem_text, "target-altitude", "drone-lead")
+    if base_altitude is None:
+        raise ValueError("cube template has no target-altitude for 'drone-lead'")
+
+    # 1. Objects: widen "drone-member - drone" to every member name.
+    obj_open, obj_close = _section_span(problem_text, "objects")
+    widened, n_matched = re.subn(
+        rf"\b{re.escape(_CUBE_MEMBER_TOKEN)}\b(\s*-\s*drone\b)",
+        lambda m: " ".join([first_name, *rest_names]) + m.group(1),
+        problem_text[obj_open:obj_close],
+        count=1,
+    )
+    if not n_matched:
+        raise ValueError("cube template has no 'drone-member - drone' object to expand")
+    result = problem_text[:obj_open] + widened + problem_text[obj_close:]
+
+    # 1b. Objects: widen "layer0 - layer" to one object per layer.
+    layer_names = [f"layer{i}" for i in range(layers)]
+    obj_open, obj_close = _section_span(result, "objects")
+    widened, n_matched = re.subn(
+        r"\blayer0\b(\s*-\s*layer\b)",
+        lambda m: " ".join(layer_names) + m.group(1),
+        result[obj_open:obj_close],
+        count=1,
+    )
+    if not n_matched:
+        raise ValueError("cube template has no 'layer0 - layer' object to expand")
+    result = result[:obj_open] + widened + result[obj_close:]
+
+    # 2. Clone every :init fact and goal conjunct mentioning drone-member.
+    result = _clone_named_lines(
+        result, _section_span(result, "init"), _CUBE_MEMBER_TOKEN, rest_names
+    )
+
+    def _goal_and_span(text: str) -> tuple[int, int]:
+        goal_open, goal_close = _section_span(text, "goal")
+        and_match = re.search(r"\(and\b", text[goal_open:goal_close])
+        if not and_match:
+            return goal_open, goal_close
+        and_open = goal_open + and_match.start()
+        return and_open, _find_matching_paren(text, and_open)
+
+    result = _clone_named_lines(result, _goal_and_span(result), _CUBE_MEMBER_TOKEN, rest_names)
+
+    # 3. Place every drone in its actual cell, including its own layer's
+    #    cruise altitude.
+    result = _set_unary_fact_value(result, "slot-along-offset", "drone-lead", 0.0)
+    result = _set_unary_fact_value(result, "slot-cross-offset", "drone-lead", 0.0)
+    result = _set_unary_fact_value(result, "slot-layer", "drone-lead", 0.0)
+    result = _set_unary_fact_value(result, "slot-lift-offset", "drone-lead", 0.0)
+    result = _set_unary_fact_value(result, "target-altitude", "drone-lead", base_altitude)
+    for cell, name in zip(member_cells, member_names):
+        layer, row, col = cell
+        lift = layer * CUBE_LAYER_SPACING_M
+        result = _set_unary_fact_value(result, "slot-along-offset", name, -row * CUBE_SPACING_M)
+        result = _set_unary_fact_value(
+            result, "slot-cross-offset", name, (col - leader_col) * CUBE_SPACING_M
+        )
+        result = _set_unary_fact_value(result, "slot-layer", name, float(layer))
+        result = _set_unary_fact_value(result, "slot-lift-offset", name, lift)
+        result = _set_unary_fact_value(result, "target-altitude", name, base_altitude + lift)
+
+    # 4. Layer-by-layer ascent. Step 2 cloned the template's own bottom-layer
+    #    `in-layer`/`cleared-to-launch` facts onto every new member name,
+    #    which would put the whole block in layer 0 and clear all of it for
+    #    takeoff at once - defeating the staggered ascent entirely. Strip all
+    #    four fact kinds and lay down the real chain: every drone in its own
+    #    layer, the layers chained bottom to top, and only the bottom layer
+    #    launched and cleared at the start.
+    result = _strip_pair_facts(result, "in-layer")
+    result = _strip_pair_facts(result, "layer-below")
+    result = _strip_unary_facts(result, "layer-launched")
+    result = _strip_unary_facts(result, "cleared-to-launch")
+
+    layer_facts: list[str] = []
+    for cell, name in cell_name.items():
+        layer_facts.append(f"\n        (in-layer {name} layer{cell[0]})")
+    for lo, hi in zip(layer_names, layer_names[1:]):
+        layer_facts.append(f"\n        (layer-below {lo} {hi})")
+    layer_facts.append(f"\n        (layer-launched {layer_names[0]})")
+    for cell, name in cell_name.items():
+        if cell[0] == 0:
+            layer_facts.append(f"\n        (cleared-to-launch {name})")
+    result = _add_init_facts(result, "".join(layer_facts))
+
+    # 5. Neighbour mesh: 24-way adjacency, one symmetric pair per link. The
+    #    template's own hardcoded leader<->member pair only describes the
+    #    smallest case, and step 2 cloned it onto every new member name too -
+    #    which would wire every distant cell straight to the leader instead
+    #    of to its own neighbours. Strip all of it and compute the real mesh.
+    #    Each unordered pair is emitted once, when the lower of its two cells
+    #    is visited.
+    result = _strip_pair_facts(result, "cube-neighbor")
+    neighbor_facts: list[str] = []
+    for cell in sorted(cell_name):
+        layer, row, col = cell
+        here = cell_name[cell]
+        for dl, dr, dc in _CUBE_NEIGHBOR_OFFSETS:
+            other = (layer + dl, row + dr, col + dc)
+            if other <= cell:
+                continue  # already emitted from the other end
+            if other not in cell_name:
+                continue  # outside the block, or an unfilled cell of a partial top layer
+            there = cell_name[other]
+            neighbor_facts.append(f"\n        (cube-neighbor {here} {there})")
+            neighbor_facts.append(f"\n        (cube-neighbor {there} {here})")
+    result = _add_init_facts(result, "".join(neighbor_facts))
+
+    return result
+
+
+def retarget_cube_problem(
+    problem_text: str,
+    new_source: LatLon,
+    new_destination: LatLon,
+    *,
+    no_fly_zone: list[LatLon] | None = None,
+    no_fly_buffer_m: float = NO_FLY_BUFFER_M,
+    source_name: str = "source",
+    destination_name: str = "destination",
+) -> str:
+    """Relocate a `cube-grid-formation-drone-mission` problem onto a picked
+    source/destination.
+
+    A cube is retargeted exactly as a 2-D grid is: the relocation, the
+    per-edge re-costing and the buffered-detour logic all work off the
+    `source`/`destination` locations and the `connected` edges, none of which
+    the extra vertical axis touches, and (like the grid, unlike the V) there
+    is no `slot-direction` compass bookkeeping to recompute afterwards. So
+    this delegates to `retarget_grid_problem` rather than being a fourth
+    near-identical copy of the same forty lines. It exists under its own name
+    because `services.plan_service` dispatches one retarget entry point per
+    plan kind, and so that a cube-specific step added later has somewhere
+    obvious to go.
+
+    The vertical dimension needs no retargeting of its own: each layer's
+    cruise altitude is written by `expand_cube_drones` relative to the
+    template's own base altitude, which is a height above ground rather than a
+    geographic coordinate, so moving the mission across the map leaves it
+    unchanged.
+
+    As with the grid, only the leader's corridor is planned against the
+    buffered zone, so a caller whose block extends members off to the side of
+    the leader's own column should pad `no_fly_buffer_m` by that lateral
+    reach - see `services.plan_service._run_cube_formation`.
+    """
+    return retarget_grid_problem(
+        problem_text,
+        new_source,
+        new_destination,
+        no_fly_zone=no_fly_zone,
+        no_fly_buffer_m=no_fly_buffer_m,
+        source_name=source_name,
+        destination_name=destination_name,
+    )

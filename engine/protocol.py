@@ -50,6 +50,8 @@ class CommandName(str, Enum):
     LAND = "LAND"
     ABORT = "ABORT"
     SET_GPS = "SET_GPS"
+    SET_SPEED = "SET_SPEED"   # change cruise speed in flight
+    TRAIN_PACE = "TRAIN_PACE"  # formation keeping: where the front of the train is (engine.train_keeping)
     PING = "PING"
     SHUTDOWN = "SHUTDOWN"
 

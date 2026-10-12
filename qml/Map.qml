@@ -130,7 +130,8 @@ Item {
                     id: pin
                     width: 16; height: 16; radius: 8
                     color: model.role === "start" ? "#2ecc71"
-                           : (model.role === "no_fly_zone" ? "#f39c12" : "#e74c3c")
+                           : ((model.role === "no_fly_zone" || model.role === "figure8_crossing")
+                              ? "#f39c12" : "#e74c3c")
                     border.color: "black"
                     border.width: 1
                 }

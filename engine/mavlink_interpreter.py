@@ -126,11 +126,28 @@ class CommandInterpreter:
             destination = payload.get("destination")
             if destination is None:
                 return []
+            if any(payload.get(key) for key in ("approach", "loop", "depart")):
+                return self.build_route_mission(
+                    payload.get("approach", []),
+                    payload.get("loop", []),
+                    payload.get("depart", []),
+                    destination,
+                    altitude_m=float(payload.get("altitude_m", destination.alt_m or 50.0)),
+                    laps=int(payload.get("laps", 1)),
+                    final=bool(payload.get("final", True)),
+                )
             return self.build_waypoint_mission(
                 destination,
                 altitude_m=float(payload.get("altitude_m", destination.alt_m or 50.0)),
                 final=bool(payload.get("final", True)),
             )
+
+        if kind is CommandType.SET_SPEED:
+            speed = float(payload.get("speed_mps", 0.0))
+            if speed <= 0:
+                return []
+            # param1 = speed type (1 = ground speed), param2 = speed in m/s.
+            return [self._command(mav2.MAV_CMD_DO_CHANGE_SPEED, 1, speed, -1)]
 
         if kind is CommandType.HOLD:
             return [self._set_mode(MODE_BRAKE)]
@@ -199,6 +216,69 @@ class CommandInterpreter:
             ),
         ]
         return frames
+
+    def _item(self, seq: int, command: int, lat: float = 0.0, lon: float = 0.0,
+              altitude_m: float = 0.0, param1: float = 0.0, param2: float = 0.0):
+        return self._mav.mission_item_int_encode(
+            self.target_system, self.target_component,
+            seq,
+            mav2.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            command,
+            0, 1,                                     # current, autocontinue
+            param1, param2, 0, 0,
+            int(lat * 1e7), int(lon * 1e7), altitude_m,
+        )
+
+    def build_route_mission(
+        self,
+        approach: list[Position],
+        loop: list[Position],
+        depart: list[Position],
+        destination: Position,
+        altitude_m: float = 50.0,
+        laps: int = 1,
+        final: bool = True,
+    ) -> list[bytes]:
+        """A whole route as ONE mission, the way a real GCS uploads a survey:
+
+            0          NAV_TAKEOFF
+            ...        NAV_WAYPOINT  approach   (flown without stopping)
+            s..        NAV_WAYPOINT  loop
+            ...        DO_JUMP -> s, repeat laps-1 times   (only if laps > 1)
+            ...        NAV_WAYPOINT  depart
+            last       NAV_LAND (or a plain waypoint if not `final`) at `destination`
+
+        The flight controller flies it end to end on its own, instead of
+        holding at every waypoint until the next leg's mission arrives.
+        """
+        items = [self._item(0, mav2.MAV_CMD_NAV_TAKEOFF, altitude_m=altitude_m)]
+
+        def add(points: list[Position]) -> None:
+            for point in points:
+                items.append(self._item(len(items), mav2.MAV_CMD_NAV_WAYPOINT, point.lat, point.lon, altitude_m))
+
+        add(approach)
+        loop_start = len(items)
+        add(loop)
+        if loop and laps > 1:
+            items.append(self._item(len(items), mav2.MAV_CMD_DO_JUMP, param1=loop_start, param2=laps - 1))
+        add(depart)
+        items.append(self._item(
+            len(items),
+            mav2.MAV_CMD_NAV_LAND if final else mav2.MAV_CMD_NAV_WAYPOINT,
+            destination.lat, destination.lon, altitude_m,
+        ))
+        self.pending_mission = MissionPlan(items=items, uploading=True)
+        return [
+            self._set_mode(MODE_GUIDED),
+            self._command(mav2.MAV_CMD_COMPONENT_ARM_DISARM, 1),
+            self._frame(
+                self._mav.mission_count_encode(
+                    self.target_system, self.target_component,
+                    self.pending_mission.count, mav2.MAV_MISSION_TYPE_MISSION,
+                )
+            ),
+        ]
 
     # ---- Uplink handling (the mission protocol is a conversation) ----
 

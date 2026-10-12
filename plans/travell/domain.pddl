@@ -1,11 +1,11 @@
 (define (domain swarm-drone-mission)
 
     (:requirements
-        :strips
-        :typing
-        :numeric-fluents
-        :negative-preconditions
-        :conditional-effects
+        :strips ;;Basic Planing Preconditions → Action → Effects
+        :typing ;; Allows you to specify types drone, location, waypoint, controller
+        :numeric-fluents ;; Allows numeric values such as: battery, energy-required, distance, health
+        :negative-preconditions ;; Allows you to specify negative preconditions such as: (not (at ?d ?from))
+        :conditional-effects ;; Allows you to specify conditional effects
     )
 
     ;; Types used in the mission
@@ -208,7 +208,6 @@
 
         :effect
             (and
-
                 ;; Move drone to the new location
                 (at ?d ?to)
                 (not (at ?d ?from))

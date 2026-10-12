@@ -167,8 +167,31 @@ class DroneLink:
             altitude = destination.alt_m or (source.alt_m if source else 0.0)
             payload = {"altitude_m": altitude} if altitude else {}
             out.append(Command(CommandType.TAKEOFF, payload))
-            out.append(Command(CommandType.GOTO, {"destination": destination, "final": final}))
+            goto = {"destination": destination, "final": final}
+            # Optionally a whole route in one command, flown back to back
+            # from `source`: `approach`, then `loop` repeated `laps` times,
+            # then `depart`, then `destination` - instead of one NAVIGATE per
+            # leg (see ThreadSwarmBackend.start_mission_paths' `train_routes`).
+            def positions(key: str) -> list[Position]:
+                found = [_to_position(p) for p in message.params.get(key) or []]
+                return [p for p in found if p is not None]
+
+            approach, loop, depart = positions("approach"), positions("loop"), positions("depart")
+            if approach or loop or depart:
+                goto["approach"] = approach
+                goto["loop"] = loop
+                goto["laps"] = max(1, int(message.params.get("laps", 1)))
+                goto["depart"] = depart
+            if message.params.get("train"):
+                goto["train"] = dict(message.params["train"])
+            out.append(Command(CommandType.GOTO, goto))
             return out
+
+        if name is CommandName.TRAIN_PACE:
+            return [Command(CommandType.TRAIN_PACE, dict(message.params))]
+
+        if name is CommandName.SET_SPEED:
+            return [Command(CommandType.SET_SPEED, {"speed_mps": float(message.params.get("speed_mps", 0.0))})]
 
         if name is CommandName.SET_GPS:
             available = bool(message.params.get("available", True))

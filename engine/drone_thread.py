@@ -27,6 +27,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Optional
 
+from engine.train_keeping import Pace, RouteTracker, TrainSlot, local_xy, train_speed
+
 EARTH_RADIUS_M = 6_371_000.0
 DEFAULT_TICK_S = 0.1          # 10 Hz loop
 CLIMB_RATE_MPS = 3.0
@@ -87,6 +89,8 @@ class CommandType(str, Enum):
     LAND = "LAND"
     ABORT = "ABORT"
     SET_GPS = "SET_GPS"                   # fault injection
+    SET_SPEED = "SET_SPEED"               # change cruise speed in flight
+    TRAIN_PACE = "TRAIN_PACE"             # formation keeping (engine.train_keeping)
     HEARTBEAT = "HEARTBEAT"
     SHUTDOWN = "SHUTDOWN"
 
@@ -130,6 +134,9 @@ class DroneSnapshot:
     gps_available: bool
     elapsed_s: float
     note: str = ""
+    # time.monotonic() of the tick `position` was computed on - lets a reader
+    # comparing several drones line their snapshots up in time.
+    wall_s: float = 0.0
 
 
 def haversine_m(a: Position, b: Position) -> float:
@@ -198,6 +205,18 @@ class DroneThread(threading.Thread):
         # multi-leg route (ThreadSwarmBackend._advance_legs) sets this False
         # for every intermediate leg.
         self.final_leg = True
+        # Waypoints still to fly after `destination`, for a whole route
+        # handed over in one GOTO (see _apply_command) rather than one
+        # NAVIGATE per leg - flown back to back without stopping.
+        self._route_queue: list[Position] = []
+        # Formation keeping in a train (engine.train_keeping): this drone's
+        # place, its whole route to measure progress along, and the latest
+        # pace from the ground station. None outside a train mission.
+        self._train_slot = None
+        self._train_tracker = None
+        self._train_origin: Optional[Position] = None
+        self._train_pace = None
+        self._train_sent_mps: Optional[float] = None
         self.mission_state = MissionState.IDLE
 
         # ---- internals ----
@@ -206,6 +225,7 @@ class DroneThread(threading.Thread):
         self._consumed_mah = 0.0
         self._note = ""
         self._running = threading.Event()
+        self._last_tick_s: Optional[float] = None
         self._inbox: "queue.Queue[Command]" = queue.Queue()
         self._telemetry_sink = telemetry_sink
         # Optional pull-based transport (a UDP link, say). Polled once per tick
@@ -258,6 +278,7 @@ class DroneThread(threading.Thread):
                 gps_available=self.gps_available,
                 elapsed_s=self.elapsed_s,
                 note=self._note,
+                wall_s=self._last_tick_s or 0.0,
             )
 
     @property
@@ -279,6 +300,7 @@ class DroneThread(threading.Thread):
             while self._running.is_set():
                 self.receive_command()
                 self.update_state()
+                self.keep_train_place()
                 self.monitor_health()
                 self.execute_operation()
                 self.publish_telemetry()
@@ -345,12 +367,40 @@ class DroneThread(threading.Thread):
                     # `_cruise` ease towards it rather than re-entering the
                     # ground-up climb phase and freezing lateral movement.
                     self.current_operation = Operation.GOTO
+        elif kind is CommandType.TRAIN_PACE:
+            front = payload.get("front_at_m")
+            self._train_pace = Pace(
+                at_m=float(payload.get("at_m", 0.0)),
+                mps=float(payload.get("mps", 0.0)),
+                stamp_s=float(payload.get("stamp_s", time.time())),
+                front_at_m=None if front is None else float(front),
+            )
+        elif kind is CommandType.SET_SPEED:
+            speed = payload.get("speed_mps")
+            if speed:
+                with self._lock:
+                    self.cruise_speed_mps = max(0.1, float(speed))
         elif kind in (CommandType.GOTO, CommandType.SET_DESTINATION):
             destination = payload.get("destination")
+            route: list[Position] = []
+            if any(payload.get(key) for key in ("approach", "loop", "depart")):
+                # A whole route at once - approach, loop x laps, depart,
+                # ending at `destination` - see engine.drone_link._translate.
+                laps = max(1, int(payload.get("laps", 1)))
+                route = [
+                    *payload.get("approach", []),
+                    *(list(payload.get("loop", [])) * laps),
+                    *payload.get("depart", []),
+                    destination,
+                ]
+                if payload.get("train"):
+                    self._start_train_keeping(payload["train"], [self.position, *route])
+                destination = route[0]
             if destination is not None:
                 with self._lock:
                     self.destination = destination
-                    self.final_leg = bool(payload.get("final", True))
+                    self._route_queue = route[1:]
+                    self.final_leg = bool(payload.get("final", True)) and not self._route_queue
                     self.current_operation = Operation.GOTO
                     self._hold_requested = False
                     if self.mission_state in (MissionState.HOLDING, MissionState.LANDING):
@@ -396,15 +446,85 @@ class DroneThread(threading.Thread):
         for frame in self.interpreter.interpret(command):
             self.flight_controller.send(frame)
 
+    # ---- formation keeping (a train - see engine.train_keeping) ----
+
+    def _start_train_keeping(self, train: dict, route: list[Position]) -> None:
+        origin = route[0]
+        self._train_origin = origin
+        self._train_tracker = RouteTracker(
+            [local_xy(p.lat, p.lon, origin.lat, origin.lon) for p in route]
+        )
+        self._train_slot = TrainSlot(
+            shared_from_m=float(train.get("shared_from_m", 0.0)),
+            slot_m=float(train.get("slot_m", 0.0)),
+            spacing_m=float(train.get("spacing_m", 10.0)),
+            max_mps=float(train.get("max_mps", self.cruise_speed_mps)),
+            min_mps=float(train.get("min_mps", 0.1)),
+            schedule=tuple((float(t), float(m)) for t, m in train.get("schedule") or ()),
+        )
+        # Wait for the first word from the pace, not a moment longer: left
+        # at its profile speed, the autopilot would set off sideways the
+        # instant the climb finished - one tick before this keeper takes
+        # over - and a drone whose turn hasn't come yet would dart across
+        # the pads of the drones still waiting ahead of it.
+        self._train_sent_mps = self._train_slot.min_mps
+        hold = Command(CommandType.SET_SPEED, {"speed_mps": self._train_sent_mps})
+        self._apply_command(hold)
+        self._dispatch_to_firmware(hold)
+
+    def keep_train_place(self) -> None:
+        """Every tick, in a train: set this drone's own speed so it is where
+        the pace says it should be at the next tick - measured from its own
+        exact position, and applied to its own autopilot straight away."""
+        if self._train_slot is None or self._train_pace is None:
+            return
+        if self.mission_state is not MissionState.EN_ROUTE:
+            return
+        slot, origin = self._train_slot, self._train_origin
+        xy = local_xy(self.position.lat, self.position.lon, origin.lat, origin.lon)
+        at_m = self._train_tracker.progress_m(xy) - slot.shared_from_m
+        end_m = self._train_tracker.length_m - slot.shared_from_m
+        speed = train_speed(
+            slot, self._train_pace, at_m, end_m,
+            now_s=time.time(), time_scale=self.time_scale,
+            tick_sim_s=self.tick_s * self.time_scale,
+        )
+        last = self._train_sent_mps
+        if last is not None and abs(speed - last) <= 0.02 * max(last, 0.1):
+            return
+        self._train_sent_mps = speed
+        command = Command(CommandType.SET_SPEED, {"speed_mps": speed})
+        self._apply_command(command)
+        self._dispatch_to_firmware(command)
+
+    def _tick_dt(self) -> float:
+        """Simulated seconds since the last tick: the real time that actually
+        passed (not the nominal `tick_s`), times `time_scale`. With many drone
+        threads sharing one interpreter, some ticks run late; measuring the
+        real gap means a late drone covers correspondingly more ground,
+        instead of silently falling behind the rest of the swarm. Clamped
+        (at half a second, far above any ordinary late tick) so a long stall
+        (debugger, suspended laptop) doesn't teleport it."""
+        now = time.monotonic()
+        last, self._last_tick_s = self._last_tick_s, now
+        real = self.tick_s if last is None else min(max(0.0, now - last), 0.5)
+        return real * self.time_scale
+
     def _service_firmware(self, dt: float) -> None:
         """Step the firmware, answer its requests, and read the state back."""
         self.flight_controller.update(dt)
 
         # The mission protocol is a conversation: the controller asks for each
-        # waypoint in turn and the interpreter answers.
-        for message in self.flight_controller.receive():
-            for reply in self.interpreter.on_message(message):
-                self.flight_controller.send(reply)
+        # waypoint in turn and the interpreter answers. Keep answering until
+        # it has nothing more to ask, so a whole multi-waypoint mission
+        # uploads within the tick it was sent instead of one item per tick.
+        for _round in range(10_000):
+            messages = self.flight_controller.receive()
+            if not messages:
+                break
+            for message in messages:
+                for reply in self.interpreter.on_message(message):
+                    self.flight_controller.send(reply)
 
         st = self.flight_controller.state()
         with self._lock:
@@ -427,14 +547,14 @@ class DroneThread(threading.Thread):
         With a flight controller attached the firmware owns the airframe and
         this only mirrors what it reports.
         """
+        dt = self._tick_dt()
         if self.flight_controller is not None:
-            self._service_firmware(self.tick_s * self.time_scale)
+            self._service_firmware(dt)
             return
 
         if self.mission_finished or self.mission_state is MissionState.IDLE:
             return
 
-        dt = self.tick_s * self.time_scale
         with self._lock:
             self.elapsed_s += dt
             self._consumed_mah += NOMINAL_DRAW_A * (dt / 3600.0) * 1000.0
@@ -481,6 +601,17 @@ class DroneThread(threading.Thread):
                 -DESCENT_RATE_MPS if new_alt < current_alt else 0.0
             )
 
+            # A queued route is flown straight through: whatever distance is
+            # left this tick after reaching a waypoint carries on toward the
+            # next one, rather than stopping at each.
+            while remaining <= step and self._route_queue:
+                step -= remaining
+                self.position = replace(
+                    self.position, lat=self.destination.lat, lon=self.destination.lon
+                )
+                self.destination = self._route_queue.pop(0)
+                self.final_leg = not self._route_queue
+                remaining = haversine_m(self.position, self.destination)
             if remaining <= step or remaining <= 0.0:
                 self.position = replace(
                     self.position, lat=self.destination.lat, lon=self.destination.lon, alt_m=new_alt

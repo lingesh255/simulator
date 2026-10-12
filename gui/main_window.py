@@ -37,7 +37,19 @@ from gui.map_viewer import MapViewer
 from gui.mission_planner_panel import MissionPlannerPanel
 from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
-from services.plan_service import MIN_GRID_DRONES, PlanRunResult, PlanService, plan_kind
+from services.plan_service import (
+    MIN_CUBE_DRONES,
+    MIN_GRID_DRONES,
+    PlanRunResult,
+    PlanService,
+    Figure8ShapeError,
+    plan_figure8_mission,
+    planets_drone_count_error,
+    star_drone_count_error,
+    plan_kind,
+)
+from engine.figure8_problem import figure8_geometry
+from engine.pddl_problem import LatLon as PddlLatLon
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -84,6 +96,11 @@ class MainWindow(QMainWindow):
         # `FOREST_CORNER_COUNT` search-area corners instead of a destination
         # - `_plan_kind` (set once per `_on_plan_requested`) is what tells
         # `_handle_plan_click`/`_run_planned_mission` which sequence is live.
+        #
+        # A figure-8 plan collects four points instead: the base the drones
+        # fly from and back to, then the 8's left end, the middle point where
+        # its lobes cross, and its right end (`_plan_figure8_points`, in
+        # that order).
         self.plan_service = PlanService(self)
         self._planning_mode = False
         self._plan_mark_nfz = False
@@ -93,6 +110,7 @@ class MainWindow(QMainWindow):
         self._plan_destination: LatLon | None = None
         self._plan_no_fly_zone: list[LatLon] = []
         self._plan_forest_corners: list[LatLon] = []
+        self._plan_figure8_points: list[LatLon] = []
 
         # Two interchangeable flight sources with the same surface: the local
         # kinematic preview, and independent drone threads commanded over UDP
@@ -612,6 +630,7 @@ class MainWindow(QMainWindow):
         self._plan_destination = None
         self._plan_no_fly_zone = []
         self._plan_forest_corners = []
+        self._plan_figure8_points = []
         self.client.stop_swarm()
         self.client.disconnect_telemetry()
         self.map_viewer.clear_markers()
@@ -679,6 +698,7 @@ class MainWindow(QMainWindow):
         self._plan_destination = None
         self._plan_no_fly_zone = []
         self._plan_forest_corners = []
+        self._plan_figure8_points = []
         self._plan_mark_nfz = self.mission_planner.mark_restricted_area()
         self._planning_mode = True
         self.map_viewer.clear_markers()
@@ -687,6 +707,18 @@ class MainWindow(QMainWindow):
         if self._plan_kind == "area_coverage":
             self.statusBar().showMessage(
                 f"Plan '{plan_name}' armed - click the drones' base point on the map."
+            )
+        elif self._plan_kind == "figure8_formation":
+            self.statusBar().showMessage(
+                f"Plan '{plan_name}' armed - click the BASE the drones fly from and back to."
+            )
+        elif self._plan_kind == "star_formation":
+            self.statusBar().showMessage(
+                f"Plan '{plan_name}' armed - click the place to perform the show (the source)."
+            )
+        elif self._plan_kind == "planets_formation":
+            self.statusBar().showMessage(
+                f"Plan '{plan_name}' armed - click the source (the sun) for the drones to orbit."
             )
         else:
             self.statusBar().showMessage(f"Plan '{plan_name}' armed - click the Start point on the map.")
@@ -697,6 +729,15 @@ class MainWindow(QMainWindow):
         hand - see `_on_plan_requested` for what that sequence is."""
         if self._plan_kind == "area_coverage":
             self._handle_area_plan_click(point)
+            return
+        if self._plan_kind == "figure8_formation":
+            self._handle_figure8_plan_click(point)
+            return
+        if self._plan_kind in ("star_formation", "planets_formation"):
+            # A show stays in one place: the source is the only click.
+            self._plan_source = point
+            self._planning_mode = False
+            self._run_planned_mission()
             return
 
         name = self._pending_plan_name
@@ -766,10 +807,51 @@ class MainWindow(QMainWindow):
         self._planning_mode = False
         self._run_planned_mission()
 
+    def _handle_figure8_plan_click(self, point: LatLon) -> None:
+        """Consume one click of an armed figure-8 plan's sequence: the base
+        (green pin), the 8's left end (red pin), the middle crossing point
+        (amber pin), then its right end (red pin). Once all four are in, the
+        mission is checked and planned."""
+        name = self._pending_plan_name
+        self._plan_figure8_points.append(point)
+        collected = len(self._plan_figure8_points)
+
+        if collected == 1:
+            self._plan_source = point
+            self.map_viewer.mode_combo.setCurrentText("Set Destination Point")
+            self.statusBar().showMessage(
+                f"Plan '{name}': base set - now click the LEFT end of the figure-8."
+            )
+            return
+        if collected in (2, 3):
+            # The map pinned this click as the "destination"; re-pin it under
+            # its own role so the next click doesn't move it.
+            role = "figure8_left" if collected == 2 else "figure8_crossing"
+            self.map_viewer.marker_model.set_point(role, point.lat, point.lon)
+            self.statusBar().showMessage(
+                f"Plan '{name}': left end set - now click the MIDDLE point where the 8 crosses."
+                if collected == 2
+                else f"Plan '{name}': middle point set - now click the RIGHT end of the 8."
+            )
+            return
+
+        self._planning_mode = False
+        self._plan_destination = point
+        self._run_planned_mission()
+
+    def _figure8_points_pddl(self) -> list[PddlLatLon]:
+        """base, left end, middle, right end - as the engine's LatLon."""
+        return [PddlLatLon(lat=p.lat, lon=p.lon) for p in self._plan_figure8_points]
+
     def _run_planned_mission(self) -> None:
         if self._plan_source is None or self._pending_plan_name is None:
             return
-        if self._plan_kind == "area_coverage":
+        if self._plan_kind in ("star_formation", "planets_formation"):
+            pass  # the source is all a show needs
+        elif self._plan_kind == "figure8_formation":
+            if len(self._plan_figure8_points) < 4:
+                return
+        elif self._plan_kind == "area_coverage":
             if len(self._plan_forest_corners) < FOREST_CORNER_COUNT:
                 return
         elif self._plan_destination is None:
@@ -831,9 +913,62 @@ class MainWindow(QMainWindow):
                 "fits it exactly (e.g. 8 -> 2x4, 12 -> 3x4).",
             )
             return
+        if self._plan_kind == "cube_formation" and len(checked) < MIN_CUBE_DRONES:
+            QMessageBox.information(
+                self, "3-D grid formation needs more drones",
+                "A 3-D grid formation stacks its drones into horizontal layers, so "
+                f"it needs at least {MIN_CUBE_DRONES} checked drones to read as a "
+                f"2x2x2 cube rather than a flat grid. {len(checked)} are currently "
+                "checked.\n\n"
+                "Any count from there works - a perfect cube (8, 27, 64) forms a "
+                "full cube, and any other count fills the smallest block that holds "
+                "it, leaving the top layer partly filled (e.g. 16 -> 2x3x3, "
+                "25 -> 3x3x3).",
+            )
+            return
+        if self._plan_kind == "star_formation":
+            problem = star_drone_count_error(len(checked))
+            if problem:
+                QMessageBox.information(self, "Star show needs a different number of drones", problem)
+                return
+        if self._plan_kind == "planets_formation":
+            problem = planets_drone_count_error(len(checked))
+            if problem:
+                QMessageBox.information(self, "Planets needs a different number of drones", problem)
+                return
+        if self._plan_kind == "figure8_formation":
+            # The clicks must make a flyable 8 and base, and the whole train
+            # must fit - inside the smaller lobe with room to spare at the
+            # crossing, and clear of itself on the trip out and back.
+            base, left, crossing, right = self._figure8_points_pddl()
+            try:
+                mission = plan_figure8_mission(
+                    base, left, crossing, right, len(checked), self.mission_planner.figure8_laps()
+                )
+            except Figure8ShapeError as exc:
+                QMessageBox.warning(self, "Figure-8 can't be built from these points", str(exc))
+                self._on_plan_requested(self._pending_plan_name)  # re-arm for fresh clicks
+                return
+            except ValueError as exc:
+                # The shape itself is fine - show it, then say why not now.
+                self.map_viewer.set_restricted_area(figure8_geometry(left, crossing, right).ring)
+                QMessageBox.warning(self, "Figure-8 can't be flown with this many drones", str(exc))
+                return
+            self.map_viewer.set_restricted_area(mission.preview_path())
         self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         self.statusBar().showMessage(f"Running ENHSP for plan '{self._pending_plan_name}'...")
-        if self._plan_kind == "area_coverage":
+        if self._plan_kind in ("star_formation", "planets_formation"):
+            self.plan_service.run_show_async(
+                self._pending_plan_name, self._plan_source,
+                drone_count=len(checked), laps=self.mission_planner.figure8_laps(),
+            )
+        elif self._plan_kind == "figure8_formation":
+            base, left, crossing, right = self._plan_figure8_points
+            self.plan_service.run_figure8_async(
+                self._pending_plan_name, base, left, crossing, right,
+                drone_count=len(checked), laps=self.mission_planner.figure8_laps(),
+            )
+        elif self._plan_kind == "area_coverage":
             # One lane (and one PDDL drone) per checked drone, so the marked
             # area is split across however many drones the swarm has.
             self.plan_service.run_area_async(
@@ -870,8 +1005,17 @@ class MainWindow(QMainWindow):
             return
 
         if result.per_drone_waypoints is not None:
-            if self._plan_kind in ("formation", "grid_formation"):
+            if self._plan_kind == "road_inspection":
+                # Show the road being inspected; one drone flies it (any
+                # further checked drones stay on the ground).
+                self.map_viewer.set_restricted_area(result.waypoints)
+            if self._plan_kind in (
+                "formation", "grid_formation", "cube_formation", "figure8_formation", "star_formation",
+                "planets_formation",
+            ):
                 noun = "slot"
+            elif self._plan_kind == "road_inspection":
+                noun = "route"
             else:
                 noun = "lane"
             self._start_area_coverage_mission(result, drones, route_noun=noun)
@@ -1078,6 +1222,19 @@ class MainWindow(QMainWindow):
         cleared_assignments = [(d, r) for d, r in assignments if d.sysid in cleared_sysids]
         total_distance_km = sum(f.distance_m for f in flights) / 1000.0
 
+        # A 3-D grid separates its layers by height, so each drone carries an
+        # extra cruise altitude on top of the terrain profile. Filtered the
+        # same way the assignments are, so the two lists stay aligned; `None`
+        # for every other plan kind, which flies one shared altitude.
+        cleared_offsets = None
+        if result.per_drone_altitude_offset_m is not None:
+            by_name = list(result.per_drone_altitude_offset_m.values())
+            cleared_offsets = [
+                by_name[i] if i < len(by_name) else 0.0
+                for i, (d, _r) in enumerate(assignments)
+                if d.sysid in cleared_sysids
+            ]
+
         self._warn_grounded(grounded, len(flights), total_distance_km, label="combined route")
 
         if len(cleared_assignments) < len(routes):
@@ -1097,14 +1254,29 @@ class MainWindow(QMainWindow):
         self.fault_injection.update_active_sysids([d.sysid for d, _ in cleared_assignments])
         self.map_viewer.clear_paths()
 
-        if not self.thread_sim.start_mission_paths(cleared_assignments):
+        # A figure-8 needs every drone (checked above), so its train routes
+        # line up with the assignments one to one.
+        train_routes = list(result.train_routes.values()) if result.train_routes else None
+        # A drone show plays at its own (slower) speed - see the planner
+        # panel's "Show speed".
+        time_scale = (
+            self.mission_planner.show_time_scale()
+            if self._plan_kind in ("star_formation", "planets_formation") else None
+        )
+        if not self.thread_sim.start_mission_paths(
+            cleared_assignments, cleared_offsets, train_routes=train_routes, time_scale=time_scale
+        ):
             self.drone_management.set_running(False)
             self.statusBar().showMessage("Could not start drone nodes for the planned mission - see the log.")
             return
 
+        laps_text = (
+            f", {result.laps} lap(s)"
+            if self._plan_kind in ("figure8_formation", "star_formation", "planets_formation") else ""
+        )
         self.mission_planner.set_status(
             f"Flying plan '{result.plan_name}' - {len(cleared_assignments)} drone(s), "
-            f"{len(routes)} {route_noun}(s), {total_distance_km:.1f} km combined."
+            f"{len(routes)} {route_noun}(s){laps_text}, {total_distance_km:.1f} km combined."
         )
         self.statusBar().showMessage(
             f"Flying {len(cleared_assignments)} drone(s) on plan '{result.plan_name}' "
@@ -1117,7 +1289,10 @@ class MainWindow(QMainWindow):
         plan_name = self._pending_plan_name or "?"
         self.mission_planner.set_error(f"Plan '{plan_name}' failed:\n\n{message}")
         self.mission_planner.set_status("Planning failed - see the log below.")
-        QMessageBox.warning(self, "Mission planning failed", message)
+        title = "Mission planning failed"
+        if self._plan_kind == "road_inspection":
+            title = "Inspect: no road route"
+        QMessageBox.warning(self, title, message)
         self.statusBar().showMessage("Mission planning failed - see the dialog.", 8000)
 
     # ---- Telemetry wiring ----

@@ -20,7 +20,7 @@ import socket
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from pymavlink.dialects.v20 import ardupilotmega as mav2
 
@@ -38,7 +38,6 @@ from engine.mavlink_interpreter import (
 EARTH_RADIUS_M = 6_371_000.0
 CLIMB_RATE_MPS = 3.0
 DESCENT_RATE_MPS = 2.0
-WAYPOINT_RADIUS_M = 5.0
 NOMINAL_DRAW_A = 20.0
 AUTOPILOT_SYSID = 1
 AUTOPILOT_COMPID = 1
@@ -81,6 +80,18 @@ def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     y = math.sin(dlon) * math.cos(p2)
     x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+class _MissionItem(NamedTuple):
+    """One stored mission item. `command` defaults to a plain waypoint so
+    the single-target paths (RTL, guided target) can build one directly."""
+
+    lat: float
+    lon: float
+    alt: float
+    command: int = mav2.MAV_CMD_NAV_WAYPOINT
+    param1: float = 0.0
+    param2: float = 0.0
 
 
 class FlightController(ABC):
@@ -142,6 +153,8 @@ class SimulatedFlightController(FlightController):
         # which uploads a fresh 2-item mission per leg of a chained route and
         # marks only the true final one MAV_CMD_NAV_LAND).
         self._mission_lands_at_end = True
+        # DO_JUMP items: how many times each (by seq) has jumped so far.
+        self._jumps_done: dict[int, int] = {}
 
         self.commands_seen: list[str] = []
         self.frames_decoded = 0
@@ -172,7 +185,7 @@ class SimulatedFlightController(FlightController):
         elif kind == "SET_POSITION_TARGET_GLOBAL_INT":
             # Guided-mode target, accepted as an immediate single waypoint.
             self._target_alt_m = message.alt
-            self._mission = [(message.lat_int / 1e7, message.lon_int / 1e7, message.alt)]
+            self._mission = [_MissionItem(message.lat_int / 1e7, message.lon_int / 1e7, message.alt)]
             self.st.mission_seq = 0
             self.st.mission_complete = False
             self.commands_seen.append("SET_POSITION_TARGET_GLOBAL_INT")
@@ -205,9 +218,14 @@ class SimulatedFlightController(FlightController):
                 self._target_alt_m = message.param7
                 self.st.landed = False
             self.commands_seen.append(f"NAV_TAKEOFF({message.param7:.0f}m)")
+        elif command == mav2.MAV_CMD_DO_CHANGE_SPEED:
+            # param2 = target speed (m/s); -1 / 0 means "no change".
+            if message.param2 > 0:
+                self.cruise_speed_mps = max(0.1, float(message.param2))
+            self.commands_seen.append(f"DO_CHANGE_SPEED({message.param2:.1f})")
         elif command == mav2.MAV_CMD_NAV_RETURN_TO_LAUNCH:
             self.st.mode = MODE_RTL
-            self._mission = [(self.home_lat, self.home_lon, self._target_alt_m)]
+            self._mission = [_MissionItem(self.home_lat, self.home_lon, self._target_alt_m)]
             self.st.mission_seq = 0
             self.st.mission_complete = False
             self.commands_seen.append("NAV_RETURN_TO_LAUNCH")
@@ -221,9 +239,12 @@ class SimulatedFlightController(FlightController):
             return
         lat = message.x / 1e7 if abs(message.x) > 1000 else float(message.x)
         lon = message.y / 1e7 if abs(message.y) > 1000 else float(message.y)
-        self._mission.append((lat, lon, message.z))
+        self._mission.append(_MissionItem(
+            lat, lon, message.z, message.command, message.param1, message.param2))
         if message.command == mav2.MAV_CMD_NAV_TAKEOFF:
             self._target_alt_m = message.z
+        elif message.command == mav2.MAV_CMD_DO_JUMP:
+            pass  # not a place to fly to
         else:
             # The waypoint item (whichever command it carries) is always the
             # last one uploaded for a leg, so this ends up reflecting it by
@@ -238,6 +259,7 @@ class SimulatedFlightController(FlightController):
                 mav2.MAV_MISSION_TYPE_MISSION))
         else:
             self._receiving = False
+            self._jumps_done = {}
             self.st.mission_seq = 0
             self.st.mission_complete = False
             self._emit(self._tx.mission_ack_encode(
@@ -316,33 +338,54 @@ class SimulatedFlightController(FlightController):
                 st.ground_speed_mps = 0.0
             return
 
-        lat, lon, alt = self._mission[st.mission_seq]
-        if lat == 0.0 and lon == 0.0:
-            st.mission_seq += 1  # takeoff item, already satisfied by the climb
-            return
-
-        remaining = _haversine_m(st.lat, st.lon, lat, lon)
-        if remaining <= WAYPOINT_RADIUS_M:
-            st.lat, st.lon = lat, lon
-            st.mission_seq += 1
+        # This tick's flying distance is spent along the mission: reaching a
+        # waypoint part-way through the tick carries straight on toward the
+        # next one with whatever distance is left - the way ArduPilot flies
+        # through intermediate waypoints of an AUTO mission, rather than
+        # stopping at each.
+        budget = self.cruise_speed_mps * dt
+        for _guard in range(10_000):
             if st.mission_seq >= len(self._mission):
-                st.mission_complete = True
-                st.ground_speed_mps = 0.0
-                if self._mission_lands_at_end:
-                    st.mode = MODE_LAND  # ArduPilot's land-at-end behaviour
-                # else: just the next leg of a chained route - hold here.
-                # ThreadSwarmBackend._advance_legs sends the next leg's own
-                # NAVIGATE the moment it notices the same arrival, which
-                # re-uploads a fresh mission and this waypoint is forgotten;
-                # nothing lands here.
-            return
+                return
+            item = self._mission[st.mission_seq]
+            if item.command == mav2.MAV_CMD_DO_JUMP:
+                done = self._jumps_done.get(st.mission_seq, 0)
+                if done < int(item.param2):
+                    self._jumps_done[st.mission_seq] = done + 1
+                    st.mission_seq = int(item.param1)
+                else:
+                    st.mission_seq += 1
+                continue
+            if item.command == mav2.MAV_CMD_NAV_TAKEOFF or (item.lat == 0.0 and item.lon == 0.0):
+                st.mission_seq += 1  # takeoff item, already satisfied by the climb
+                continue
 
-        step = self.cruise_speed_mps * dt
-        fraction = min(1.0, step / remaining)
-        st.lat += (lat - st.lat) * fraction
-        st.lon += (lon - st.lon) * fraction
-        st.heading_deg = _bearing_deg(st.lat, st.lon, lat, lon)
-        st.ground_speed_mps = self.cruise_speed_mps
+            remaining = _haversine_m(st.lat, st.lon, item.lat, item.lon)
+            if remaining <= budget or remaining <= 1e-3:
+                budget -= remaining
+                if remaining > 1e-3:
+                    st.heading_deg = _bearing_deg(st.lat, st.lon, item.lat, item.lon)
+                st.lat, st.lon = item.lat, item.lon
+                st.mission_seq += 1
+                if st.mission_seq >= len(self._mission):
+                    st.mission_complete = True
+                    st.ground_speed_mps = 0.0
+                    if self._mission_lands_at_end:
+                        st.mode = MODE_LAND  # ArduPilot's land-at-end behaviour
+                    # else: just the next leg of a chained route - hold here.
+                    # ThreadSwarmBackend._advance_legs sends the next leg's own
+                    # NAVIGATE the moment it notices the same arrival, which
+                    # re-uploads a fresh mission and this waypoint is forgotten;
+                    # nothing lands here.
+                    return
+                continue
+
+            fraction = budget / remaining
+            st.heading_deg = _bearing_deg(st.lat, st.lon, item.lat, item.lon)
+            st.lat += (item.lat - st.lat) * fraction
+            st.lon += (item.lon - st.lon) * fraction
+            st.ground_speed_mps = self.cruise_speed_mps
+            return
 
     def _descend(self, dt: float) -> None:
         st = self.st

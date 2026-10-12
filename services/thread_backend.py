@@ -11,6 +11,9 @@ queue keeps the crossing explicit.
 """
 from __future__ import annotations
 
+import math
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -40,9 +43,73 @@ from engine.fleet import DroneFleet
 from engine.gcs import GroundControlStation
 from engine.protocol import CommandName
 from engine.terrain import plan_terrain_profile
+from engine.train_keeping import SCHEDULE_UNIT_MPS, RouteTracker, schedule_at
 from services.local_flight import EmergencyLanding, nearest_point, plan_flights
 
 POLL_MS = 100
+
+# Train formation keeping (see ThreadSwarmBackend._keep_train_spacing).
+TRAIN_CRUISE_FRACTION = 0.8   # train speed, as a fraction of its slowest drone's top speed
+TRAIN_MAX_BOOST = 1.3         # fastest a drone may go to catch up, x the train speed
+TRAIN_MIN_MPS = 0.1           # "wait here" - creeping rather than hovering dead still
+TRAIN_STRAGGLER_SLACK = 1.5   # spacings a drone may lag before the whole train waits for it
+TRAIN_PACE_ACCEL = 1.0        # m/s^2 (simulated) - the pace speeds up and slows down gently
+# Design speed of timed formation tracks (engine.star_problem).
+TRAIN_SCHEDULE_UNIT_MPS = SCHEDULE_UNIT_MPS
+# Train/formation drones tick often enough that one tick is at most this
+# much simulated time - at the default 20x time scale a 0.1 s tick is ~25 m
+# of flight, far too coarse to hold a 10 m gap (or to look like a smooth
+# line on the map). At slower time scales the ordinary 0.1 s tick is enough.
+TRAIN_TICK_SIM_S = 0.5
+
+
+def _local_xy(point, origin) -> tuple[float, float]:
+    """(east, north) metres of `point` from `origin` - locally flat."""
+    north = (point.lat - origin.lat) * 111_320.0
+    east = (point.lon - origin.lon) * 111_320.0 * math.cos(math.radians(origin.lat))
+    return east, north
+
+
+@dataclass
+class _TrainState:
+    """A train formation in flight. Every drone flies the same SHARED path
+    (base -> 8 -> base) between its own way off its pad and its own way onto
+    its landing pad. Positions are compared in shared-path metres: a
+    drone's progress along its own route minus its private lead-in
+    (`shared_from_m`), so 0 is the base point on the way out.
+
+    `pace_m` is the GCS's single "where the front of the train should be"
+    on the shared path; drone k belongs `slot_m[k]` behind it.
+
+    A formation flying timed tracks instead (the star plan) gives each
+    drone a `schedules` timetable; `pace_m` is then a shared clock in
+    nominal seconds, advancing `pace_unit_mps` times slower than a pace in
+    metres would (see engine.train_keeping)."""
+
+    order: list[int]                         # sysids, front of the train first
+    origin: object                           # LatLon the tracks' local metres are measured from
+    tracks: dict[int, RouteTracker]          # sysid -> its route and progress on it
+    shared_from_m: dict[int, float]          # sysid -> length of its own pad-to-base lead-in
+    slot_m: dict[int, float]                 # sysid -> its place behind the front of the train
+    spacing_m: float                         # nominal gap between neighbours
+    cruise_mps: float                        # the speed the whole train flies
+    total_s: float                           # estimated mission length, for progress
+    pace_m: float = 0.0
+    pace_mps: float = 0.0                    # the pace's speed as last broadcast
+    pace_wall_s: Optional[float] = None
+    schedules: dict[int, tuple] = field(default_factory=dict)
+    pace_unit_mps: float = 1.0               # metres per unit of pace (1 for a pace in metres)
+
+    def end_m(self, sysid: int) -> float:
+        """Shared-path metres at which this drone's own route ends."""
+        return self.tracks[sysid].cumulative_m[-1] - self.shared_from_m[sysid]
+
+    def target_m(self, sysid: int) -> float:
+        """Where the pace says this drone should be right now."""
+        schedule = self.schedules.get(sysid)
+        if schedule:
+            return schedule_at(schedule, self.pace_m)[0]
+        return self.pace_m - self.slot_m[sysid]
 
 # The node's mission vocabulary, in the terms the dashboard speaks.
 _STATUS_MAP = {
@@ -158,7 +225,9 @@ class ThreadSwarmBackend(QObject):
         # need climbing past the ceiling. Same route for every drone in a
         # mission, so it's computed once in start_mission_path.
         self._altitudes: dict[int, list[float]] = {}
+        self._train: Optional[_TrainState] = None
         self._time_scale = time_scale
+        self._default_time_scale = time_scale
         self._elapsed_s = 0.0
         self._tick = 0
         self._paused = False
@@ -242,23 +311,65 @@ class ThreadSwarmBackend(QObject):
         self._timer.start()
         return True
 
-    def start_mission_paths(self, assignments: list[tuple[DroneConfig, list[LatLon]]]) -> bool:
+    def start_mission_paths(
+        self,
+        assignments: list[tuple[DroneConfig, list[LatLon]]],
+        altitude_offsets_m: Optional[list[float]] = None,
+        train_routes: Optional[list] = None,
+        time_scale: Optional[float] = None,
+    ) -> bool:
         """Like `start_mission_path`, but each drone flies its own distinct
         route rather than everyone sharing one - the forest-search mission's
         per-drone lane, where drone1 and drone2 are planned completely
         separate routes that just happen to both start/end at the same base
         point.
 
+        `altitude_offsets_m`, if given, is one extra height in metres per
+        assignment, added to every leg of that drone's terrain-derived cruise
+        profile. It exists for the 3-D grid ("cube") formation, whose layers
+        are separated VERTICALLY: two drones in the same row and column of
+        different layers fly the *same* lateral track, so without an offset
+        `plan_terrain_profile` would put them at the same altitude and they
+        would occupy the same points in space. Every other plan separates its
+        drones laterally and passes `None`, keeping one shared profile.
+
         `_advance_legs`/`_poll` already key every piece of chained-route
         state (`_paths`, `_altitudes`, `_leg_index`) by sysid, so nothing
-        below this needs to know or care that the routes differ per drone -
-        only the setup here (each drone gets its own terrain profile, home
-        point and first NAVIGATE) is genuinely different from
-        `start_mission_path`.
+        below this needs to know or care that the routes - or now the
+        altitudes - differ per drone; only the setup here (each drone gets
+        its own terrain profile, home point and first NAVIGATE) is genuinely
+        different from `start_mission_path`.
+
+        `train_routes`, if given, flies the assignments as a TRAIN (the
+        figure-8 formation): the assignments are in front-to-back order,
+        each assignment's waypoints are its whole route written out, and
+        `train_routes` holds the same route per assignment structured as
+        `start -> approach -> loop x laps -> depart` (see
+        `engine.figure8_problem.TrainRoute`). Then
+
+        - each drone gets its WHOLE route as one NAVIGATE - uploaded to its
+          flight controller as a single mission with a DO_JUMP repeating the
+          loop `laps` times - so it flies through every waypoint without
+          stopping, instead of holding at each one until `_advance_legs`
+          sends the next leg;
+        - the GCS keeps one shared pace along the path (the slowest drone's
+          top speed times TRAIN_CRUISE_FRACTION, leaving headroom to catch
+          up) and broadcasts it (`_keep_train_spacing`); every drone holds
+          its own place behind it ON BOARD, every tick
+          (`engine.train_keeping`), braking for the drone in front, while
+          the pace waits for any drone that has fallen behind.
+
+        `time_scale`, if given, runs this mission at that many times real
+        time instead of the backend's default (20x) - a drone show watched
+        at 20x is over in seconds.
         """
         self.stop()
         if not assignments:
             return False
+        if time_scale:
+            # This mission only - e.g. a drone show played closer to real
+            # time; `stop()` puts the default back.
+            self._time_scale = float(time_scale)
 
         self._gcs = GroundControlStation(verbose=False)
         self._gcs.start()
@@ -268,12 +379,17 @@ class ThreadSwarmBackend(QObject):
         # that's what remains once a drone reaches the end of its own route.
         self._destination = assignments[0][1][-1]
 
+        offsets = list(altitude_offsets_m or [])
         per_drone: dict[int, tuple[list[LatLon], list[float]]] = {}
-        for drone, waypoints in assignments:
+        for i, (drone, waypoints) in enumerate(assignments):
             if len(waypoints) < 2:
                 continue
             points, altitudes = plan_terrain_profile(waypoints)
-            if not self._spawn_drone(drone, points[0]):
+            lift = offsets[i] if i < len(offsets) else 0.0
+            if lift:
+                altitudes = [a + lift for a in altitudes]
+            tick_s = min(0.1, TRAIN_TICK_SIM_S / self._time_scale) if train_routes else None
+            if not self._spawn_drone(drone, points[0], tick_s=tick_s):
                 continue
             per_drone[drone.sysid] = (points, altitudes)
 
@@ -284,15 +400,18 @@ class ThreadSwarmBackend(QObject):
         self._gcs.register_many(self._views)
         self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
 
-        for sysid in self._views:
-            points, altitudes = per_drone[sysid]
-            source = [points[0].lat, points[0].lon, 0.0]
-            target = [points[1].lat, points[1].lon, altitudes[1]]
-            is_final = 1 >= len(points) - 1
-            self._paths[sysid] = list(points)
-            self._altitudes[sysid] = list(altitudes)
-            self._leg_index[sysid] = 1
-            self._gcs.navigate(sysid, source, target, final=is_final)
+        if train_routes:
+            self._start_train(assignments, per_drone, train_routes)
+        else:
+            for sysid in self._views:
+                points, altitudes = per_drone[sysid]
+                source = [points[0].lat, points[0].lon, 0.0]
+                target = [points[1].lat, points[1].lon, altitudes[1]]
+                is_final = 1 >= len(points) - 1
+                self._paths[sysid] = list(points)
+                self._altitudes[sysid] = list(altitudes)
+                self._leg_index[sysid] = 1
+                self._gcs.navigate(sysid, source, target, final=is_final)
 
         self._elapsed_s = 0.0
         self._tick = 0
@@ -302,7 +421,167 @@ class ThreadSwarmBackend(QObject):
         self._timer.start()
         return True
 
-    def _spawn_drone(self, drone: DroneConfig, home: LatLon) -> bool:
+    def _start_train(
+        self,
+        assignments: list[tuple[DroneConfig, list[LatLon]]],
+        per_drone: dict[int, tuple[list[LatLon], list[float]]],
+        train_routes: list,
+    ) -> None:
+        """Launch a train formation - see `start_mission_paths`' `train_routes`."""
+        order = [d.sysid for d, _r in assignments if d.sysid in self._views]
+        configs = {d.sysid: d for d, _r in assignments}
+        cruise = TRAIN_CRUISE_FRACTION * min(configs[s].max_velocity_mps for s in order)
+        origin = per_drone[order[0]][0][0]
+        tracks = {
+            sysid: RouteTracker([_local_xy(p, origin) for p in per_drone[sysid][0]])
+            for sysid in order
+        }
+        # The nominal gap: how far apart the first two drones start.
+        spacing = 10.0
+        if len(order) > 1:
+            a, b = per_drone[order[0]][0][0], per_drone[order[1]][0][0]
+            spacing = max(1.0, engine_haversine(
+                Position(lat=a.lat, lon=a.lon), Position(lat=b.lat, lon=b.lon)))
+
+        route_of = {d.sysid: r for (d, _w), r in zip(assignments, train_routes)}
+        schedules = {s: tuple(route_of[s].schedule) for s in order if getattr(route_of[s], "schedule", ())}
+        if schedules:
+            # Timed tracks: the pace is a clock in nominal seconds, each
+            # nominal second being TRAIN_SCHEDULE_UNIT_MPS metres of the
+            # tracks' own design speed - so the clock runs as fast as this
+            # swarm's cruise speed allows.
+            unit = TRAIN_SCHEDULE_UNIT_MPS
+            end = max(sched[-1][0] for sched in schedules.values())
+            self._train = _TrainState(
+                order=order, origin=origin, tracks=tracks,
+                shared_from_m={s: 0.0 for s in order}, slot_m={s: 0.0 for s in order},
+                spacing_m=spacing, cruise_mps=cruise / unit,
+                total_s=end / max(1e-3, cruise / unit),
+                pace_m=0.0, schedules=schedules, pace_unit_mps=unit,
+            )
+        else:
+            self._train = _TrainState(
+                order=order,
+                origin=origin,
+                tracks=tracks,
+                shared_from_m={s: route_of[s].shared_from_m for s in order},
+                slot_m={s: route_of[s].slot_m for s in order},
+                spacing_m=spacing,
+                cruise_mps=cruise,
+                total_s=tracks[order[0]].cumulative_m[-1] / max(0.1, cruise),
+                # The front of the train starts where the leader's pad is.
+                pace_m=-route_of[order[0]].shared_from_m,
+            )
+        train = self._train
+        for sysid in order:
+            points, altitudes = per_drone[sysid]
+            route = route_of[sysid]
+            altitude = max(altitudes)
+
+            def wire(seq) -> list[list[float]]:
+                return [[p.lat, p.lon, altitude] for p in seq]
+
+            self._paths[sysid] = list(points)
+            self._altitudes[sysid] = list(altitudes)
+            # Nothing for _advance_legs to chain: the drone has the whole route.
+            self._leg_index[sysid] = len(points) - 1
+            landing = route.depart[-1]
+            self._gcs.navigate(
+                sysid,
+                [route.start.lat, route.start.lon, 0.0],
+                [landing.lat, landing.lon, altitude],
+                final=True,
+                approach=wire(route.approach),
+                loop=wire(route.loop),
+                laps=route.laps,
+                depart=wire(route.depart[:-1]),
+                train={
+                    "shared_from_m": route.shared_from_m,
+                    "slot_m": route.slot_m,
+                    "spacing_m": spacing,
+                    "max_mps": min(configs[sysid].max_velocity_mps, TRAIN_MAX_BOOST * cruise),
+                    "min_mps": TRAIN_MIN_MPS,
+                    "schedule": [list(k) for k in schedules.get(sysid, ())],
+                },
+            )
+        # A first, standing-still pace, so every drone knows from its very
+        # first tick in the air whether it is its turn to go yet.
+        self._broadcast_pace({}, 0.0)
+
+    def _keep_train_spacing(self, snapshots: dict[int, DroneSnapshot]) -> None:
+        """The ground station's half of train formation keeping.
+
+        It advances ONE shared pace along the path - where the front of the
+        train should be - at the train's cruise speed and broadcasts it,
+        time-stamped, every poll; each drone then holds its own place behind
+        it on board (`DroneThread.keep_train_place`). The neighbours feed
+        in through the ground station:
+
+        - FRONT: each drone's pace message carries where the drone in front
+          of it is, for its on-board safety brake;
+        - BACK: if any drone has fallen more than TRAIN_STRAGGLER_SLACK
+          spacings behind its place, the pace slows - to a stop if need be -
+          so the whole train waits for it instead of stretching away.
+
+        Positions are measured ALONG THE ROUTE and brought forward to one
+        common instant using each snapshot's tick time. The pace only
+        starts once every drone has climbed and is ready to move.
+        """
+        train = self._train
+        now = time.monotonic()
+        at_m: dict[int, float] = {}
+        waiting_for_climb = False
+        for sysid in train.order:
+            snap = snapshots.get(sysid)
+            if snap is None:
+                continue
+            if snap.mission_state in (MissionState.IDLE, MissionState.ARMED, MissionState.TAKEOFF):
+                waiting_for_climb = True
+            if snap.mission_state is not MissionState.EN_ROUTE:
+                continue
+            along = train.tracks[sysid].progress_m(_local_xy(snap.position, train.origin))
+            if snap.wall_s:
+                along += snap.velocity.ground_speed_mps * max(0.0, now - snap.wall_s) * self._time_scale
+            at_m[sysid] = along - train.shared_from_m[sysid]
+
+        # BACK: how far the worst straggler is behind its place - ignoring
+        # drones already at the end of their own route (landing on a pad).
+        worst_lag = 0.0
+        for sysid, here in at_m.items():
+            if here >= train.end_m(sysid) - train.spacing_m:
+                continue
+            worst_lag = max(worst_lag, train.target_m(sysid) - here)
+        excess = (worst_lag - TRAIN_STRAGGLER_SLACK * train.spacing_m) / (2.0 * train.spacing_m)
+        wanted_mps = train.cruise_mps * min(1.0, max(0.0, 1.0 - excess))
+        if waiting_for_climb:
+            wanted_mps = 0.0
+
+        # Move the pace on by the speed the drones were TOLD it had since
+        # the last poll - they have been flying to that - and only then
+        # change its speed, gently: a pace that jumps leaves several drones
+        # behind their places at once, all catching up flat out together,
+        # which is how two of them reach a merge point at the same moment.
+        sim_dt = 0.0 if train.pace_wall_s is None else (now - train.pace_wall_s) * self._time_scale
+        train.pace_m += train.pace_mps * sim_dt
+        train.pace_wall_s = now
+        step = TRAIN_PACE_ACCEL / train.pace_unit_mps * max(sim_dt, POLL_MS / 1000.0 * self._time_scale)
+        train.pace_mps = min(train.pace_mps + step, max(train.pace_mps - step, wanted_mps))
+        self._broadcast_pace(at_m, train.pace_mps)
+
+    def _broadcast_pace(self, at_m: dict[int, float], pace_mps: float) -> None:
+        """Send every drone the pace, plus where the drone in front of it is."""
+        train = self._train
+        stamp = time.time()
+        for i, sysid in enumerate(train.order):
+            front = train.order[i - 1] if i > 0 else None
+            self._send(
+                sysid, CommandName.TRAIN_PACE,
+                at_m=train.pace_m, mps=pace_mps, stamp_s=stamp,
+                # A drone in front only means something in a line.
+                front_at_m=None if train.schedules else at_m.get(front),
+            )
+
+    def _spawn_drone(self, drone: DroneConfig, home: LatLon, tick_s: Optional[float] = None) -> bool:
         """Bind a UDP link and spawn one drone-thread node starting at
         `home`, registering it in `self._views`. Shared by
         `start_mission_path` (every drone starts at the same point) and
@@ -331,6 +610,7 @@ class ThreadSwarmBackend(QObject):
             battery_capacity_mah=drone.battery_capacity_mah,
             start=Position(lat=home.lat, lon=home.lon),
             time_scale=self._time_scale,
+            **({"tick_s": tick_s} if tick_s else {}),
             link=link,
             flight_controller=controller,
         )
@@ -349,6 +629,8 @@ class ThreadSwarmBackend(QObject):
         self._paths.clear()
         self._leg_index.clear()
         self._altitudes.clear()
+        self._train = None
+        self._time_scale = self._default_time_scale
 
     def pause(self) -> None:
         """Hold every node in place while the controller decides."""
@@ -481,7 +763,11 @@ class ThreadSwarmBackend(QObject):
         )
 
         remaining = 0.0
-        for sysid, view in self._views.items():
+        if self._train is not None:
+            # A looping route ends where it began, so "distance to the
+            # destination" says nothing - use the planned flying time.
+            remaining = max(0.0, self._train.total_s - self._elapsed_s)
+        for sysid, view in ([] if self._train is not None else self._views.items()):
             if view.is_done or self._destination is None:
                 continue
             snap = view._snap
@@ -498,6 +784,8 @@ class ThreadSwarmBackend(QObject):
             return
 
         self._advance_legs(snapshots)
+        if self._train is not None and not self._paused:
+            self._keep_train_spacing(snapshots)
         self._check_exceptions(snapshots)
 
     def _advance_legs(self, snapshots: dict[int, DroneSnapshot]) -> None:
