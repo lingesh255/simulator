@@ -196,6 +196,9 @@ class DroneManagementPanel(QWidget):
         dialog = DroneConfigDialog(drone=drone, parent=self)
         if dialog.exec():
             updated = dialog.drone_config()
+            if updated.name != name and updated.name in self._profiles:
+                QMessageBox.warning(self, "Duplicate name", f"A profile named '{updated.name}' already exists.")
+                return
             self.store.save_profile(updated, previous_name=dialog.original_name)
             self.reload_profiles()
             self.status_message.emit(f"Updated profile '{updated.name}'.")

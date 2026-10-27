@@ -36,7 +36,7 @@ future plan sharing one of these domains works with no further wiring:
   derived parallel to it (`engine.pddl_problem.formation_member_route`), one
   per grid cell - a perfect-square drone count forms a square grid, anything
   else the most-square rectangle that tiles it exactly (see
-  `engine.pddl_problem.grid_dimensions`), 10 m apart in every direction, each
+  `engine.pddl_problem.grid_dimensions`), 20 m apart in every direction, each
   drone coordinating with only the up to 4 neighbors actually next to it
   (front/back/left/right - see `plans/gridformation/domain.pddl`).
 """
@@ -72,6 +72,7 @@ from engine.pddl_problem import (
     formation_wing_routes,
     grid_cell_names,
     grid_dimensions,
+    grid_launch_order,
     read_locations,
     retarget_formation_problem,
     retarget_grid_problem,
@@ -151,22 +152,13 @@ def _formation_drone_names(ranks: int) -> list[str]:
 
 
 def _grid_drone_names(drone_count: int) -> list[str]:
-    """Every drone name for a `drone_count`-drone grid formation, leader
-    first then every other cell nearest-to-farthest from it (Manhattan
-    distance in grid steps) - the same interleaving rationale
-    `_formation_drone_names` uses for a V's ranks: so the first checked
-    drones land nearest the leader regardless of how large the grid is.
+    """Every drone name for a `drone_count`-drone grid formation in launch
+    order: the leader first, then every other cell farthest-from-the-pad
+    first, so a later drone's flight to its slot never passes through one
+    already parked in its own - see `engine.pddl_problem.grid_launch_order`.
     Matches the naming `engine.pddl_problem.expand_grid_drones`/
     `grid_cell_names` build into the problem file."""
-    rows, cols = grid_dimensions(drone_count)
-    cell_name = grid_cell_names(rows, cols)
-    leader_cell = next(cell for cell, name in cell_name.items() if name == "drone-lead")
-
-    def manhattan(cell: tuple[int, int]) -> int:
-        return abs(cell[0] - leader_cell[0]) + abs(cell[1] - leader_cell[1])
-
-    ordered_cells = sorted(cell_name, key=manhattan)
-    return [cell_name[cell] for cell in ordered_cells]
+    return grid_launch_order(drone_count, FORMATION_LEAD_FORWARD_M)
 
 # Domain name (as written in `(define (domain NAME) ...)`) -> plan kind.
 # Anything not listed here defaults to "point_to_point" - the shape every
@@ -489,8 +481,9 @@ class _Worker(QObject):
         own along/cross offset - unlike a V's two symmetric wings, a grid's
         members don't come in matched +-side_m pairs), and the whole swarm
         flies concurrently through `_start_area_coverage_mission`'s
-        per-drone-route path - one drone per cell, nearest-to-the-leader
-        first (`_grid_drone_names` order)."""
+        per-drone-route path - one drone per cell, leader first and then
+        farthest-slot-first (`_grid_drone_names` order), which is also the
+        launch order."""
         rows, cols = grid_dimensions(max(MIN_GRID_DRONES, drone_count))
         leader_col = (cols - 1) // 2
         domain_path, template_path = self._plan_files(plan_name)

@@ -35,15 +35,40 @@ class ProfileStore:
             profiles.append(DroneConfig.model_validate_json(path.read_text(encoding="utf-8")))
         return profiles
 
+    def _profile_path(self, name: str) -> Path | None:
+        """File holding the profile called `name`, or None. Matches on the name
+        stored inside each file, not the slug: a file can be named differently
+        from its profile (d1.json holding "D1"), and on a case-sensitive
+        filesystem the slug alone would miss it."""
+        for path in sorted(self.profiles_dir.glob("*.json")):
+            try:
+                if DroneConfig.model_validate_json(path.read_text(encoding="utf-8")).name == name:
+                    return path
+            except ValueError:
+                continue
+        return None
+
+    def _new_profile_path(self, name: str) -> Path:
+        # Never land on another profile's file ("D 1" and "D_1" share a slug).
+        stem = _slugify(name)
+        path, n = self.profiles_dir / f"{stem}.json", 2
+        while path.exists():
+            path, n = self.profiles_dir / f"{stem}_{n}.json", n + 1
+        return path
+
     def save_profile(self, drone: DroneConfig, previous_name: str | None = None) -> None:
-        if previous_name and previous_name != drone.name:
-            self.delete_profile(previous_name)
-        path = self.profiles_dir / f"{_slugify(drone.name)}.json"
+        # An edit (even a rename) rewrites the profile's existing file in place,
+        # so it stays one profile rather than becoming a copy.
+        path = (
+            (self._profile_path(previous_name) if previous_name else None)
+            or self._profile_path(drone.name)
+            or self._new_profile_path(drone.name)
+        )
         path.write_text(drone.model_dump_json(indent=2), encoding="utf-8")
 
     def delete_profile(self, name: str) -> None:
-        path = self.profiles_dir / f"{_slugify(name)}.json"
-        if path.exists():
+        path = self._profile_path(name)
+        if path is not None:
             path.unlink()
 
     # ---- Swarm presets ----

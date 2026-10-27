@@ -20,6 +20,18 @@ Item {
         PluginParameter { name: "osm.useragent"; value: "DroneSwarmSimulatorGUI/0.1" }
         PluginParameter { name: "osm.mapping.cache.directory"; value: tileCacheDir }
         PluginParameter { name: "osm.mapping.offline.directory"; value: tileCacheDir }
+        // The plugin's default caches are tiny (tens of MB on disk, a few MB
+        // in memory/textures): a densely cached region gets evicted at
+        // startup and panning keeps re-reading and re-decoding tiles, which
+        // shows as blank patches and stutter. Size them for real use, and
+        // pin the strategy to bytes so these numbers are bytes, not tile
+        // counts.
+        PluginParameter { name: "osm.mapping.cache.disk.cost_strategy"; value: "byte" }
+        PluginParameter { name: "osm.mapping.cache.disk.size"; value: "536870912" }       // 512 MB
+        PluginParameter { name: "osm.mapping.cache.memory.cost_strategy"; value: "byte" }
+        PluginParameter { name: "osm.mapping.cache.memory.size"; value: "67108864" }      // 64 MB
+        PluginParameter { name: "osm.mapping.cache.texture.cost_strategy"; value: "byte" }
+        PluginParameter { name: "osm.mapping.cache.texture.size"; value: "134217728" }    // 128 MB
         // The plugin's online provider repository resolves most map types to
         // Thunderforest, which serves "API Key Required" placeholder tiles
         // without a paid key. Disable it and serve the standard (key-free)

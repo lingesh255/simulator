@@ -32,7 +32,7 @@ What happens with two or more drones (`services/fleet_mission.py`):
   point; the rest of the route is unchanged) and the move is logged. This
   catches shared endpoints (the Search base, a shared destination; ~0 m
   apart) and leaves V and grid slots at their designed spacing (20 m and
-  10 m). 5 m because the project spec's formation row requires at least 2 m
+  20 m). 5 m because the project spec's formation row requires at least 2 m
   between drones, and 5 m leaves margin for the 0-2.4 m landing error seen
   in testing.
 - **Flight**: one `MavlinkFlightService` per drone; their telemetry reaches

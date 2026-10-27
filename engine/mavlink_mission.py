@@ -153,6 +153,7 @@ def upload_and_fly(
     on_message: Optional[Callable[[object], None]] = None,
     final_command: Optional[int] = None,
     cruise_speed_mps: Optional[float] = DEFAULT_CRUISE_SPEED_MPS,
+    before_auto: Optional[Callable[[], None]] = None,
 ) -> None:
     """Connect, upload the route as one mission, arm, fly it, and return once
     the final waypoint is reached.
@@ -193,6 +194,14 @@ def upload_and_fly(
     COMMAND_LONG generically, but a real autopilot that genuinely rejects
     the change shouldn't abort an otherwise-flyable mission over its cruise
     speed alone.
+
+    `before_auto`, if given, is called once the mission is uploaded and the
+    vehicle is armed, immediately before it is switched to AUTO - and may
+    block. It lets several vehicles that must leave together (a formation)
+    finish their own, unequal-length upload/arm handshakes first and then
+    all enter AUTO at the same moment, instead of each one departing the
+    instant its own handshake happens to finish (seconds apart, i.e. tens of
+    metres at cruise speed). It may raise (e.g. `FlightAborted`) to cancel.
     """
     report = on_progress or (lambda _msg: None)
     aborted = should_abort or (lambda: False)
@@ -296,6 +305,9 @@ def upload_and_fly(
         raise RuntimeError(
             f"arm never accepted via COMMAND_ACK after {max_arm_attempts} attempts"
         )
+
+    if before_auto is not None:
+        before_auto()
 
     # DO_SET_MODE's own COMMAND_ACK does not guarantee the mode actually
     # took - AUTO mode's init() can reject the switch internally (e.g. a

@@ -51,7 +51,7 @@
         (= (slot-along-offset drone-lead)     0)
         (= (slot-cross-offset drone-lead)     0)
         (= (slot-along-offset drone-member)   0)
-        (= (slot-cross-offset drone-member)  10)
+        (= (slot-cross-offset drone-member)  20)
 
 
         ;; Neighbor communication
