@@ -64,6 +64,11 @@ CRUISE_SPEED_MPS = 15.0
 CLIMB_RATE_MPS = 3.0
 DESCENT_RATE_MPS = 2.0
 ARRIVAL_RADIUS_M = 5.0
+# A loiter item is a "go there and hold" - a real autopilot converges onto
+# the exact point rather than stopping at the waypoint radius, and a
+# formation's slot hold depends on that (every drone's slot is a precise
+# offset from its neighbour's).
+LOITER_ARRIVAL_RADIUS_M = 0.5
 EARTH_RADIUS_M = 6_371_000.0
 _CMD_NAMES = mav2.enums["MAV_CMD"]
 
@@ -255,6 +260,9 @@ def main() -> None:
                 target_lat, target_lon, target_alt, target_name = mission[leg_index]
                 is_land = target_name == "MAV_CMD_NAV_LAND"
                 remaining = _haversine_m(pos_lat, pos_lon, target_lat, target_lon)
+                arrival_radius = (
+                    LOITER_ARRIVAL_RADIUS_M if target_name == "MAV_CMD_NAV_LOITER_UNLIM" else ARRIVAL_RADIUS_M
+                )
                 if remaining <= ARRIVAL_RADIUS_M and is_land:
                     # Like the real firmware: descend, disarm, and send no
                     # MISSION_ITEM_REACHED for the LAND item.
@@ -263,7 +271,7 @@ def main() -> None:
                         flying = False
                         armed = False
                         print("  landed - disarmed")
-                elif remaining <= ARRIVAL_RADIUS_M:
+                elif remaining <= arrival_radius:
                     send(mav.mission_item_reached_encode(leg_index))
                     print(f"  reached waypoint {leg_index}/{len(mission) - 1}  [{target_name}]")
                     leg_index += 1

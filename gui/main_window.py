@@ -166,10 +166,22 @@ class MainWindow(QMainWindow):
         # before it can actually start flying - (PlanRunResult, drones)
         # or None. Consumed by _on_renode_ready().
         self._pending_mavlink_mission: tuple[object, list] | None = None
+        # Connection string the last ready Renode reported - lets
+        # _start_external_mavlink_mission tell "Connect holds Renode's own
+        # address" (Renode is the vehicle) from a SITL/hardware address the
+        # user typed in themselves (leave Renode alone).
+        self._renode_connection: str | None = None
+        # Whether the external-MAVLink mission now flying (or just ended)
+        # uses Renode as its vehicle - only then does its end relaunch Renode.
+        self._mission_uses_renode = False
+        # SYSID of the drone flying the current single external-MAVLink
+        # mission, for its row in the Flight Log table.
+        self._external_sysid: int | None = None
         # Managed by `_start_external_mavlink_mission`/`_stop_mock_vehicle`
-        # when the panel's "Use built-in mock vehicle" box is checked - a
-        # `scripts/mock_sitl.py` subprocess this window owns the lifetime of.
-        self._mock_sitl_proc: subprocess.Popen | None = None
+        # when the panel's "Use built-in mock vehicle" box is checked - the
+        # `scripts/mock_sitl.py` subprocesses (one per drone) this window
+        # owns the lifetime of.
+        self._mock_sitl_procs: list[subprocess.Popen] = []
         # Cleared on Stop so telemetry batches already queued from a worker
         # thread when Stop was pressed can't slip through and repopulate the
         # map after everything has been torn down. Re-armed by each run start.
@@ -1550,7 +1562,9 @@ class MainWindow(QMainWindow):
         args = [
             sys.executable, str(script),
             "--port", str(port),
-            "--home", f"{source.lat},{source.lon}",
+            # `--home=` form: argparse reads a separate "-35.36,149.16" as another
+            # option flag, so a southern-hemisphere Start point failed to launch.
+            f"--home={source.lat},{source.lon}",
             # Real time, NOT thread_sim's 20x time_scale: that used to be
             # passed here so the mock matched the in-process simulator's
             # pace, but it multiplied the cruise speed engine.mavlink_mission
@@ -1887,6 +1901,7 @@ class MainWindow(QMainWindow):
         # once all three were covered.
         self.plan_service.shutdown()
         self.mavlink_flight.shutdown()
+        self.mavlink_swarm.shutdown()
         self.renode_launch.stop()
         self.fleet.shutdown()
         super().closeEvent(event)

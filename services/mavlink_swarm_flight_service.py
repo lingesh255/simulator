@@ -58,6 +58,47 @@ class _VehicleState:
     done: bool = False
 
 
+class _StartGate:
+    """All-ready release gate for a formation's real-route departure.
+
+    Every drone's upload/arm handshake takes a different length of time, so
+    letting each one switch to AUTO as soon as its own handshake finishes
+    sends them off seconds apart (tens of metres at cruise speed) and the
+    formation arrives already skewed. Each drone calls `arrive` once it is
+    armed and ready and then `wait`; they are all released together when the
+    last one arrives. A drone that can never arrive (it failed, or was
+    aborted) must still be counted via `arrive`, or the rest wait for it
+    until the timeout. `arrive` is idempotent per index.
+    """
+
+    def __init__(self, total: int) -> None:
+        self._lock = threading.Lock()
+        self._pending = set(range(total))
+        self._released = threading.Event()
+        if not self._pending:
+            self._released.set()
+
+    def arrive(self, index: int) -> None:
+        with self._lock:
+            self._pending.discard(index)
+            if not self._pending:
+                self._released.set()
+
+    def wait(self, should_abort, timeout_s: float = 60.0, pump=None) -> None:
+        """Block until released. `pump`, if given, is called every 0.1 s while
+        waiting - the caller's chance to keep servicing its vehicle link."""
+        deadline = time.monotonic() + timeout_s
+        while not self._released.wait(0.1):
+            if pump is not None:
+                pump()
+            if should_abort():
+                raise FlightAborted("aborted while waiting for the formation to be released")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out after {timeout_s:.0f}s waiting for every drone in the formation to be ready"
+                )
+
+
 class _SwarmWorker(QObject):
     batch_ready = Signal(object)
     progress = Signal(str)
@@ -160,8 +201,12 @@ class _SwarmWorker(QObject):
         in_slot_events = [threading.Event() for _ in assignments]
         if in_slot_events:
             in_slot_events[0].set()
+        # Release gate for the real-route departure (see `_StartGate`): every
+        # drone is armed with its route uploaded before any of them is
+        # switched to AUTO, so the formation leaves together.
+        start_gate = _StartGate(assembly_total if is_formation else 0)
 
-        def wait_for_formation(sysid: int, name: str, timeout_s: float = 120.0) -> None:
+        def wait_for_formation(sysid: int, name: str, master, timeout_s: float = 120.0) -> None:
             with climbed_lock:
                 climbed.add(sysid)
                 ready = len(climbed) >= assembly_total
@@ -180,6 +225,12 @@ class _SwarmWorker(QObject):
                         f"{name}: timed out after {timeout_s:.0f}s waiting for the rest of the "
                         f"formation to reach cruise altitude"
                     )
+                # Holding drones still stream telemetry. Nobody reads their
+                # socket otherwise, so the backlog overflows the kernel's UDP
+                # buffer (thousands of dropped datagrams over a long hold -
+                # the next mission upload's reply can be among them) and the
+                # map shows the drone frozen at wherever it last reported.
+                self._drain(master, sysid)
                 time.sleep(0.2)
                 waited += 0.2
 
@@ -247,8 +298,13 @@ class _SwarmWorker(QObject):
                             f"{name}: signalling {assignments[index + 1][1]} to take off "
                             f"(after a {launch_stagger_s:g}s settle)."
                         )
-                    wait_for_formation(sysid, name)
+                    wait_for_formation(sysid, name, master)
                     self.progress.emit(f"{name}: formation assembled - proceeding to the real route.")
+
+                def hold_for_release(i: int = index, n: str = name, s: int = sysid) -> None:
+                    self.progress.emit(f"{n}: armed and ready - waiting to depart with the formation.")
+                    start_gate.arrive(i)
+                    start_gate.wait(lambda: self._abort, pump=lambda: self._drain(master, s))
 
                 upload_and_fly(
                     master, pts, altitude_m,
@@ -256,6 +312,7 @@ class _SwarmWorker(QObject):
                     on_progress=lambda m, n=name: self.progress.emit(f"{n}: {m}"),
                     should_abort=lambda: self._abort,
                     on_message=lambda msg, s=sysid: self._on_message(s, msg),
+                    before_auto=hold_for_release if is_formation else None,
                     **speed_kwargs,
                 )
             except FlightAborted:
@@ -273,6 +330,7 @@ class _SwarmWorker(QObject):
                 # for a slot arrival that can no longer happen.
                 if is_formation:
                     in_slot_events[index].set()
+                    start_gate.arrive(index)  # a drone that dropped out must not hold the rest on the gate
                 with self._lock:
                     st = self._states.get(sysid)
                     if st is not None:
@@ -301,6 +359,16 @@ class _SwarmWorker(QObject):
             self.finished.emit()
 
     # ---- per-vehicle MAVLink -> merged batch ----
+
+    def _drain(self, master, sysid: int, limit: int = 200) -> None:
+        """Read and dispatch whatever `master`'s vehicle has sent since the
+        last read, without blocking. For the stretches where no
+        `upload_and_fly` is reading that link (a formation hold)."""
+        for _ in range(limit):
+            message = master.recv_match(blocking=False)
+            if message is None:
+                return
+            self._on_message(sysid, message)
 
     def _on_message(self, sysid: int, message) -> None:
         kind = message.get_type()

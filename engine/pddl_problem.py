@@ -1101,7 +1101,10 @@ def formation_wing_routes(
 # here (expand_grid_drones, writing the descriptive slot-along-offset/
 # slot-cross-offset facts) and in services.plan_service (deriving each
 # member's actual flown track via formation_member_route).
-GRID_SPACING_M = 10.0
+# 20 m, not 10: at 10 m the drones' map markers overlapped at any useful zoom
+# (the front/back pair on one track read as colliding), and the gap left too
+# little room for the formation to hold its shape.
+GRID_SPACING_M = 20.0
 
 _GRID_MEMBER_TOKEN = "drone-member"
 
@@ -1151,6 +1154,43 @@ def grid_cell_names(rows: int, cols: int) -> dict[tuple[int, int], str]:
     for i, cell in enumerate(member_cells):
         names[cell] = _GRID_MEMBER_TOKEN if i == 0 else f"drone-r{cell[0]}c{cell[1]}"
     return names
+
+
+def grid_launch_order(drone_count: int, lead_forward_m: float) -> list[str]:
+    """Every drone name for a `drone_count`-drone grid, in launch order: the
+    leader first, then every other cell farthest-from-the-launch-pad first.
+
+    Every grid drone lifts off the one shared pad and then flies a straight
+    line to its holding slot, one at a time, while the drones already
+    launched sit parked in their slots. Launching nearest-to-the-leader first
+    (the old order) sent each later drone along a line through - or onto -
+    a slot that was already occupied: in a 2x2 at 10 m the last drone climbed
+    straight into the third one parked directly over the pad, and a 3x3 or
+    3x4 had drones flying through each other at any spacing. Filling the
+    farthest slots first means a later drone's slot is always nearer the pad
+    than every parked one, so its path never runs past one (>= 17 m clear
+    for every grid size at GRID_SPACING_M, vs. 0-9 m the other way round).
+
+    A slot sits `lead_forward_m - row * GRID_SPACING_M` ahead of the pad and
+    `(col - leader_col) * GRID_SPACING_M` to its side - the leader moves
+    `lead_forward_m` forward of the source and holds, every other drone holds
+    its cell offset from that spot. Ties (equally far slots) go in row-major
+    order, so the order is the same on every run.
+    """
+    rows, cols = grid_dimensions(drone_count)
+    cell_name = grid_cell_names(rows, cols)
+    leader_cell = next(cell for cell, name in cell_name.items() if name == "drone-lead")
+
+    def distance_from_pad(cell: tuple[int, int]) -> float:
+        forward = lead_forward_m - cell[0] * GRID_SPACING_M
+        side = (cell[1] - leader_cell[1]) * GRID_SPACING_M
+        return math.hypot(forward, side)
+
+    others = sorted(
+        (cell for cell in cell_name if cell != leader_cell),
+        key=lambda cell: (-round(distance_from_pad(cell), 6), cell),
+    )
+    return ["drone-lead", *(cell_name[cell] for cell in others)]
 
 
 def expand_grid_drones(problem_text: str, drone_count: int) -> str:

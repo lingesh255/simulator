@@ -14,6 +14,9 @@ _METRES_PER_DEG_LAT = 111_320.0
 _GLIDE_TICK_MS = 33  # ~30 Hz, smooth without being wasteful
 _FALLBACK_GLIDE_MPS = 8.0  # used only before a drone's first real hop is observed
 _FALLBACK_GLIDE_VPS = 3.0  # vertical equivalent, before a real climb/descent is observed
+_MIN_SPEED_WINDOW_S = 0.1  # a speed sample spans at least this long, so queueing jitter can't fake a huge one
+_MAX_SPEED_WINDOW_S = 1.5  # a longer gap between two distinct fixes was a pause, not a hop interval
+_PATH_FLUSH_MS = 100  # how often grown flight-path trails are pushed to the map
 
 
 class DroneMarkerModel(QAbstractListModel):
@@ -211,21 +214,32 @@ class DroneMarkerModel(QAbstractListModel):
         pace the active flight source (local preview, drone threads, or
         eventually Renode) is already reporting, regardless of that source's
         own internal time-scaling."""
+        fix = (drone.lat, drone.lon, drone.altitude_m)
         prior = self._prior_fix.get(sysid)
-        self._prior_fix[sysid] = ((drone.lat, drone.lon, drone.altitude_m), now)
         if prior is None:
+            self._prior_fix[sysid] = (fix, now)
             return
         (prev_lat, prev_lon, prev_alt), prev_t = prior
-        dt_hop = now - prev_t
-        if dt_hop <= 0.02:
+        if fix == (prev_lat, prev_lon, prev_alt):
+            # Not a new fix: a swarm batch re-carries every drone's last
+            # position whenever ANY drone reports. Keeping the older
+            # timestamp lets the next genuinely new fix be measured over its
+            # true interval - re-stamping here made N drones look N times
+            # faster (distance of one hop over the gap between batches).
             return
+        dt_hop = now - prev_t
+        if dt_hop < _MIN_SPEED_WINDOW_S:
+            return  # keep the old baseline and measure over a longer window
+        self._prior_fix[sysid] = (fix, now)
+        if dt_hop > _MAX_SPEED_WINDOW_S:
+            return  # the drone sat still for a while - that gap isn't a hop interval
         dist_m = _distance_m((prev_lat, prev_lon), (drone.lat, drone.lon))
         observed = dist_m / dt_hop
         if observed > 0.05:  # ignore near-stationary noise so it doesn't zero out the baseline
-            self._observed_mps[sysid] = observed
+            self._observed_mps[sysid] = _smoothed(self._observed_mps.get(sysid), observed)
         observed_v = abs(drone.altitude_m - prev_alt) / dt_hop
         if observed_v > 0.05:
-            self._observed_vps[sysid] = observed_v
+            self._observed_vps[sysid] = _smoothed(self._observed_vps.get(sysid), observed_v)
 
     def _advance_glide(self) -> None:
         now = time.monotonic()
@@ -280,6 +294,12 @@ class DroneMarkerModel(QAbstractListModel):
                 self.index(max(changed_rows)),
                 [self.LAT, self.LON],
             )
+
+
+def _smoothed(previous: Optional[float], sample: float) -> float:
+    """Blend a new speed sample into the running estimate, so one early or
+    late telemetry packet nudges the glide speed instead of jerking it."""
+    return sample if previous is None else 0.5 * previous + 0.5 * sample
 
 
 def _distance_m(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -385,6 +405,15 @@ class PathModel(QAbstractListModel):
         self._order: list[int] = []
         self._colors: dict[int, str] = {}
         self._max_points = max_points
+        # Rows whose trail grew since the map was last told. Telemetry can
+        # arrive far faster than a polyline is worth re-tessellating, so
+        # `append_point` only marks a row dirty and one short timer announces
+        # all of them together.
+        self._dirty: set[int] = set()
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(_PATH_FLUSH_MS)
+        self._flush_timer.timeout.connect(self._flush_dirty)
 
     def roleNames(self):
         return dict(self._ROLE_NAMES)
@@ -405,15 +434,34 @@ class PathModel(QAbstractListModel):
         return None
 
     def append_point(self, sysid: int, lat: float, lon: float) -> None:
-        self.beginResetModel()
-        if sysid not in self._paths:
-            self._paths[sysid] = []
+        points = self._paths.get(sysid)
+        if points is None:
+            row = len(self._order)
+            self.beginInsertRows(QModelIndex(), row, row)
+            self._paths[sysid] = [(lat, lon)]
             self._order.append(sysid)
-        points = self._paths[sysid]
+            self.endInsertRows()
+            return
+        if points[-1] == (lat, lon):
+            # Not a new fix: a swarm batch re-carries every drone's last
+            # position whenever any one of them reports.
+            return
         points.append((lat, lon))
         if len(points) > self._max_points:
             del points[: len(points) - self._max_points]
-        self.endResetModel()
+        # Never a model reset here: that makes the map destroy and rebuild
+        # every drone's polyline delegate for every single point of every
+        # drone - with a few drones that alone saturated the GUI thread.
+        self._dirty.add(sysid)
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _flush_dirty(self) -> None:
+        dirty, self._dirty = self._dirty, set()
+        for sysid in dirty:
+            if sysid in self._paths:
+                row = self._order.index(sysid)
+                self.dataChanged.emit(self.index(row), self.index(row), [self.POINTS])
 
     def set_colors(self, colors: dict[int, str]) -> None:
         """Assign an explicit line color to each `sysid` (e.g. the V-formation's
@@ -427,4 +475,5 @@ class PathModel(QAbstractListModel):
         self._paths = {}
         self._order = []
         self._colors = {}
+        self._dirty = set()
         self.endResetModel()

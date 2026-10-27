@@ -23,9 +23,10 @@ executor behind it is shared: every drone takes off from the one source the
 plan was solved for and climbs out to the cell it holds in the airborne grid
 before the next one leaves the ground. The leader lifts off first, climbs,
 moves `FORMATION_LEAD_FORWARD_M` ahead of the source and holds there; then,
-`--launch-stagger` seconds after it settles, the drone nearest the leader
-follows, then the next nearest, and so on out to the far corners of the grid
-(`grid_drone_names` order - the same one the GUI's grid plan uses). Gating
+`--launch-stagger` seconds after it settles, the drone whose slot is farthest
+from the pad follows, then the next farthest, and so on in to the nearest
+(`grid_drone_names` order - the same one the GUI's grid plan uses), so a drone
+never has to fly past one already parked in its slot. Gating
 each takeoff on the previous drone actually reaching its cell, rather than on
 a fixed clock, is what keeps two drones off the shared launch point at once.
 Once every cell is filled the whole grid is released toward the route
@@ -99,6 +100,7 @@ from engine.pddl_problem import (  # noqa: E402
     formation_member_route,
     grid_cell_names,
     grid_dimensions,
+    grid_launch_order,
     read_locations,
     retarget_grid_problem,
 )
@@ -133,19 +135,13 @@ LEADER = "drone-lead"
 
 
 def grid_drone_names(drone_count: int) -> list[str]:
-    """Every drone name for a `drone_count`-drone grid, leader first then every
-    other cell nearest-to-farthest from it (Manhattan distance in grid steps) -
-    the launch order, and the same one `services.plan_service._grid_drone_names`
-    gives the GUI. Matches the naming `expand_grid_drones` builds into the
-    problem file."""
-    rows, cols = grid_dimensions(drone_count)
-    cell_name = grid_cell_names(rows, cols)
-    leader_cell = next(cell for cell, name in cell_name.items() if name == LEADER)
-
-    def manhattan(cell: tuple[int, int]) -> int:
-        return abs(cell[0] - leader_cell[0]) + abs(cell[1] - leader_cell[1])
-
-    return [cell_name[cell] for cell in sorted(cell_name, key=manhattan)]
+    """Every drone name for a `drone_count`-drone grid in launch order: the
+    leader first, then every other cell farthest-from-the-pad first - the same
+    order `services.plan_service._grid_drone_names` gives the GUI (see
+    `engine.pddl_problem.grid_launch_order` for why a later drone must never
+    fly past one already parked). Matches the naming `expand_grid_drones`
+    builds into the problem file."""
+    return grid_launch_order(drone_count, FORMATION_LEAD_FORWARD_M)
 
 
 def grid_routes_from_lead(
