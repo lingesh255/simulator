@@ -170,4 +170,9 @@ class RenodeLaunchService(QObject):
         """
         self._worker.stop()
         self._thread.quit()
-        self._thread.wait(2000)
+        # A launch stopped in its first seconds is inside pymavlink's own
+        # connect retries ("Connection refused sleeping", about 3 s) before it
+        # can notice Renode is gone; 2 s was too short for that and the app
+        # then aborted on exit with "QThread: Destroyed while thread is
+        # still running". Returns as soon as the thread has finished.
+        self._thread.wait(15000)
