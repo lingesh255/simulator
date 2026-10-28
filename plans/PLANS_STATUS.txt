@@ -1,0 +1,164 @@
+PDDL PLANS - OVERVIEW AND STATUS
+=================================
+(generated 2026-09-16 - reflects plans/ as of this date; run counts will
+keep growing as the app is used, re-check plans/<name>/runs/ for the
+latest numbers)
+
+Each folder under plans/ is one mission template: a domain.pddl (the
+actions/predicates ENHSP reasons over) + a problem file (the template
+instance, retargeted at run time onto whatever source/destination/area
+the user clicks on the map). The GUI's "Named Plan" combo box picks one
+of these folders by name and calls services/plan_service.py, which
+retargets the template, expands it to however many drones are checked,
+and hands it to ENHSP (engine/pddl_planner.py) to solve.
+
+Plan *kind* is decided by the domain name inside domain.pddl (see
+_DOMAIN_KIND in services/plan_service.py), not by folder name:
+
+    swarm-drone-mission        -> point_to_point
+    forest-drone-search        -> area_coverage
+    v-formation-drone-mission  -> formation
+    grid-formation-drone-mission -> grid_formation
+
+
+--------------------------------------------------------------------
+1. plans/travell/   (UI label: "Travell")
+--------------------------------------------------------------------
+Domain:     swarm-drone-mission        Kind: point_to_point
+Files:      domain.pddl, problem.pddl
+What it does:
+    One shared route from a picked source to a picked destination
+    (optionally routed around a marked no-fly/restricted area). The
+    template's single reference drone ("drone1") is cloned to however
+    many drones are checked in the GUI (expand_point_to_point_drones),
+    so the whole checked swarm flies the same route together.
+Status (69 runs on record... see below):
+    83 runs logged. 76 solved, 7 came back unsolvable/no-plan (mostly
+    early testing runs from 2026-09-02, when a route+restricted-area
+    combination left no safe path - not a bug, just a genuinely
+    infeasible click). No open issues.
+
+
+--------------------------------------------------------------------
+2. plans/Search/   (UI label: "Search Forest")
+--------------------------------------------------------------------
+Domain:     forest-drone-search        Kind: area_coverage
+Files:      domain.pddl, SearchProblem.pddl (a differently-named
+            "*problem.pddl" file is accepted - see _find_problem_file)
+What it does:
+    One route per drone (not one shared route) covering a marked
+    forest/search-area polygon from a picked base point
+    (engine/search_problem.py: retarget_search_problem +
+    expand_search_drones). Needs >= 2 drones (MIN_AREA_COVERAGE_DRONES)
+    for two lanes with mutual separation.
+Status:
+    69 runs logged, all 69 solved. The most exercised and most
+    reliable plan of the four - no failures on record.
+
+
+--------------------------------------------------------------------
+3. plans/vformation/   (UI label: "V-Formation")
+--------------------------------------------------------------------
+Domain:     v-formation-drone-mission  Kind: formation
+Files:      domain.pddl, problem.pddl
+What it does:
+    Picked like travell (source + destination + optional restricted
+    area), but ENHSP only plans the apex/leader's own corridor
+    (retarget_formation_problem); the two wing routes are derived
+    parallel to it after the fact (formation_wing_routes), each wing
+    20 m out / 17.32 m back per rank (FORMATION_BACK_M/FORMATION_SIDE_M
+    in plan_service.py - kept in sync with the slot-along-offset /
+    slot-cross-offset numbers baked into problem.pddl). Extra checked
+    drones add further ranks to each wing.
+Status:
+    65 runs logged (as of the fix below). 62 solved, 2 unsolvable
+    (infeasible source/destination/no-fly combos), 1 truncated run
+    (2026-09-15_181254 - log stops right after grounding, looks like
+    the app was closed mid-plan rather than a planner failure). No
+    open code issues.
+
+    CHANGED 2026-09-16: previously each drone's readiness only checked
+    its own single (communication-ok ?d) flag (a link to the ground
+    controller), with no notion of which drones actually sit next to
+    each other in the V. Added a real left/right neighbor model,
+    mirroring what plans/gridformation/ already does:
+      - new pairwise fact (wing-neighbor ?d1 ?d2) - descriptive only,
+        not read by any action (same as grid-formation's
+        grid-neighbor) - recording the actual chain leader<->rank1
+        <->rank2<->... out along each wing.
+      - new per-drone flag (neighbor-comm-ok ?d), checked alongside
+        communication-ok in establish-v-formation, formation-cruise
+        and close-up-wings (domain.pddl), plus a new
+        detect-neighbor-link-loss fault-detection action - all
+        mirroring grid-formation's neighbor-comm-ok usage exactly.
+      - problem.pddl now sets both facts for the template's 3 drones;
+        engine/pddl_problem.py's expand_formation_drones rebuilds the
+        full wing-neighbor chain for any larger odd drone count (the
+        template's own rank-1-only pair would otherwise get wrongly
+        cloned straight onto every further rank instead of chaining
+        rank-to-rank - see that function's step 4).
+    Verified with ENHSP directly: 3, 5 and 7-drone V's (including
+    through the real retarget_formation_problem -> expand_formation_drones
+    pipeline) all still solve cleanly after the change.
+
+
+--------------------------------------------------------------------
+4. plans/gridformation/   (UI label: "Grid-Formation")
+--------------------------------------------------------------------
+Domain:     grid-formation-drone-mission   Kind: grid_formation
+Files:      domain.pddl, problem.pddl
+What it does:
+    Picked the same way as V-formation. ENHSP again plans only the
+    leader's corridor (retarget_grid_problem); every other drone's
+    route is derived parallel to it (formation_member_route), one per
+    grid cell, 10 m apart in every direction (GRID_SPACING_M). A
+    perfect-square drone count forms a square grid; otherwise the
+    most-square rectangle that tiles it exactly (grid_dimensions).
+    Each drone only has to coordinate with its up-to-4 immediate
+    neighbours (front/back/left/right), not the whole swarm. Needs
+    >= 4 drones (MIN_GRID_DRONES) to read as a grid rather than a line.
+Status:
+    19 runs logged. 15 solved, 4 unsolvable - all 4 failures fall on
+    2026-09-16 between 10:06-10:07, immediately before a fix; every
+    run from 10:12 onward the same day solved cleanly (up to at least
+    an 8-drone / 2x4 grid, plan length 41).
+
+    ROOT CAUSE (fixed 2026-09-16): problem.pddl wrote the two
+    hover-altitude facts across 3 lines each:
+        (=
+            (hover-altitude drone-member)
+            2
+        )
+    instead of one line like every other per-drone fluent in the file
+    (e.g. "(= (slot-along-offset drone-member) 0)"). The grid-expansion
+    code (expand_grid_drones -> _clone_named_lines in
+    engine/pddl_problem.py) clones facts line-by-line when growing the
+    template to N drones, so for every extra grid member it only
+    picked up the middle line, producing a malformed, valueless fact
+    like "(hover-altitude drone-r0c2)" with no assigned number. That
+    left hover-altitude undefined for every drone except the original
+    two, which ENHSP's AIBR preprocessing then flagged as an
+    unsolvable problem for any grid bigger than 1x2.
+
+    FIX: rewrote both facts as single lines in problem.pddl, matching
+    the convention plans/vformation/problem.pddl already used
+    correctly. Verified directly against ENHSP: the old template
+    reproduced "Unsolvable Problem" even at 4 drones; the fixed
+    template returns a valid plan for the same scenario, and the
+    in-app runs from 10:12 onward confirm it end-to-end.
+
+    KNOWN LIMITATION (not fixed, just observed): ENHSP's grounding
+    step is memory-hungry for large grids - a 16-drone (4x4) grid blew
+    past a 6 GB heap during grounding in local testing. This is
+    independent of the bug above; if a large swarm ever comes back
+    "Unsolvable"/OOMs again, check drone count and grounding time
+    first before assuming the PDDL itself is wrong again.
+
+
+--------------------------------------------------------------------
+Quick reference: solved / unsolvable / other, all runs on disk today
+--------------------------------------------------------------------
+    Search        69 total  - 69 solved,  0 unsolvable, 0 other
+    travell       83 total  - 76 solved,  7 unsolvable, 0 other
+    vformation    65 total  - 62 solved,  2 unsolvable, 1 other (truncated)
+    gridformation 19 total  - 15 solved,  4 unsolvable, 0 other (pre-fix only)
