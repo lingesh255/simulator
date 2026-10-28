@@ -1,3 +1,4 @@
 {
-  "theme": "dark"
+  "theme": "dark",
+  "fleet_emulation": "per_drone"
 }

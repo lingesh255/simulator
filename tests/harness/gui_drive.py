@@ -376,6 +376,9 @@ def main():
     theme_manager.theme_changed.connect(lambda _n: app.setStyleSheet(build_stylesheet(theme_manager.palette())))
     w = MainWindow()
     w.show()
+    # As main.py does: SIGINT / SIGTERM close the window (so Renode is stopped).
+    from main import _install_signal_handlers
+    signal_pump = _install_signal_handlers(app, w)  # noqa: F841  (kept alive for app.exec())
     d = Driver(w)
     mp = w.mission_planner
     log(f"scenario={scenario} pid={os.getpid()} repo={REPO}")
