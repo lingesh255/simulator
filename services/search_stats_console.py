@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # How close (metres) a drone must get to its next route point before the
 # printed `wp=` cursor ticks over to the following one. Matches the spirit of

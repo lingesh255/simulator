@@ -99,12 +99,12 @@ class Driver:
         w.flight_log.log_event = event
         orig_run = w.mavlink_flight.run_async
 
-        def run_async(waypoints, conn, alt, sysid):
+        def run_async(waypoints, conn, alt, sysid, *rest):
             self.flight_starts += 1
             self.cur = {"n": self.flight_starts, "start": time.monotonic(), "conn": conn,
                         "src": (waypoints[0].lat, waypoints[0].lon)}
             log(f"FLIGHT #{self.flight_starts} START conn={conn} src=({waypoints[0].lat:.6f},{waypoints[0].lon:.6f}) alt={alt}")
-            orig_run(waypoints, conn, alt, sysid)
+            orig_run(waypoints, conn, alt, sysid, *rest)
         w.mavlink_flight.run_async = run_async
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
