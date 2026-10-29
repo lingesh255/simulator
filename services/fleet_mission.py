@@ -384,7 +384,8 @@ class FleetMission(QObject):
             service.failed.connect(lambda text, s=sysid: self._on_drone_ended(s, text))
             self._flights[sysid] = service
             self._outcomes[sysid].state = "flying"
-            service.run_async(route, connections[sysid], drone.cruise_altitude_m, sysid)
+            # The drone's own configured speed, as the single-drone path passes it.
+            service.run_async(route, connections[sysid], drone.cruise_altitude_m, sysid, drone.max_velocity_mps)
         self._watchdog.start()
 
     # ---- flight ----
