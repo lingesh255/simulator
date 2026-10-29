@@ -44,13 +44,21 @@ def position(lat, lon, src_system=VEHICLE_SYSID):
         0, int(lat * 1e7), int(lon * 1e7), 0, 0, 0, 0, 0, 0), src_system=src_system)
 
 
-def upload_handshake(route):
-    """What the autopilot says from mission upload up to AUTO being confirmed."""
+def ack(command, result=mav2.MAV_RESULT_ACCEPTED):
+    return _decode(_ENC.command_ack_encode(command, result))
+
+
+def upload_handshake(route, arm_acks=(mav2.MAV_RESULT_ACCEPTED,)):
+    """What the autopilot says from mission upload up to AUTO being confirmed
+    and the cruise speed acknowledged. `arm_acks`: the result of each arm
+    attempt, in order (upload_and_fly retries until one is ACCEPTED)."""
     items = len(route) + 1  # HOME placeholder + TAKEOFF + the rest
     script = [_decode(_ENC.mission_request_int_encode(255, 0, seq, 0)) for seq in range(items)]
     script.append(_decode(_ENC.mission_ack_encode(255, 0, mav2.MAV_MISSION_ACCEPTED, 0)))
-    script.append(_decode(_ENC.command_ack_encode(mav2.MAV_CMD_DO_SET_MODE, 0)))
+    script.append(ack(mav2.MAV_CMD_DO_SET_MODE))  # GUIDED
+    script += [ack(mav2.MAV_CMD_COMPONENT_ARM_DISARM, result) for result in arm_acks]
     script.append(heartbeat(armed=True))  # confirms AUTO
+    script.append(ack(mav2.MAV_CMD_DO_CHANGE_SPEED))
     return script
 
 
@@ -74,6 +82,8 @@ class FakeMaster:
         for i, message in enumerate(self._script):
             if not wanted or message.get_type() in wanted:
                 return self._script.pop(i)
+        if wanted == ["COMMAND_ACK"]:
+            return None   # an ack that never comes: upload_and_fly times out and retries / reports
         raise AssertionError(f"script exhausted while waiting for {wanted}")
 
 
@@ -82,10 +92,10 @@ class _Sink:
         pass
 
 
-def fly(flying_script, route=ROUTE):
+def fly(flying_script, route=ROUTE, arm_acks=(mav2.MAV_RESULT_ACCEPTED,)):
     progress = []
-    upload_and_fly(FakeMaster(upload_handshake(route) + flying_script), route, 10.0,
-                   on_progress=progress.append)
+    upload_and_fly(FakeMaster(upload_handshake(route, arm_acks) + flying_script), route, 10.0,
+                   on_progress=progress.append, item_timeout_s=0.1)
     return progress
 
 
@@ -129,6 +139,19 @@ class LandingDetection(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             fly([heartbeat(True), reached(1), position(*short), heartbeat(False)], route=TWO_POINT)
         self.assertRegex(str(ctx.exception), r"\b170 m from the LAND point - reached waypoint 1/2\b")
+
+
+class Arming(unittest.TestCase):
+    def test_a_rejected_arm_is_retried(self):
+        progress = fly([heartbeat(True), reached(1), reached(2), AT_LAND, heartbeat(False)],
+                       arm_acks=(mav2.MAV_RESULT_TEMPORARILY_REJECTED, mav2.MAV_RESULT_ACCEPTED))
+        self.assertTrue(any(line.startswith("Arm not confirmed yet (attempt 1/5") for line in progress), progress)
+        self.assertEqual(progress[-1], "Mission complete (landed and disarmed).")
+
+    def test_arm_never_accepted_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            fly([], arm_acks=(mav2.MAV_RESULT_DENIED,) * 5)
+        self.assertIn("arm never accepted", str(ctx.exception))
 
 
 if __name__ == "__main__":
