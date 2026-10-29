@@ -1906,6 +1906,10 @@ class MainWindow(QMainWindow):
         self.mavlink_swarm.shutdown()
         self.renode_launch.stop()
         self.fleet.shutdown()
+        # A mock vehicle (scripts/mock_sitl.py) is its own process: without
+        # this, closing the app mid-flight left it running on its UDP port,
+        # where it then answered the next mock flight alongside the new one.
+        self._stop_mock_vehicle()
         super().closeEvent(event)
 
     # ---- Telemetry wiring ----
