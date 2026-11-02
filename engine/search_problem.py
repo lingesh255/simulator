@@ -1,6 +1,6 @@
 """PDDL problem-file editing for the forest-search mission.
 
-    plans/Search/SearchProblem.pddl (template)
+    Swarm-Planning/Plans/Search/SearchProblem.pddl (template)
         -> substitute the picked base point + forest polygon
         -> ENHSP (engine.pddl_planner)
         -> one full-coverage lawnmower route per drone

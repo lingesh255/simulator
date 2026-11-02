@@ -60,6 +60,11 @@ SEARCH_SEGMENTS = 12
 # Don't speed up past the pace if the drone in front is reported closer than
 # this many spacings ahead.
 FRONT_CAUTION_SPACINGS = 0.7
+# Speed of a drone hovering over its pad until its turn in the train comes
+# (MAVLink can't ask for 0 - that means "no change"). The ordinary minimum
+# speed creeps, which over a long wait - drones spread round a big 8 wait a
+# long time - would bring drones on neighbouring pads together.
+WAIT_MPS = 0.001
 
 
 def local_xy(lat: float, lon: float, origin_lat: float, origin_lon: float) -> tuple[float, float]:
@@ -185,17 +190,29 @@ def train_speed(
         clock = pace.at_m + pace.mps * since_s
         target, slope = schedule_at(slot.schedule, clock)
         target = min(target, end_m)
+        if slope == 0.0 and target <= at_m:
+            # Held in place by the timetable (waiting over its pad for its
+            # turn to go, or holding a shape) and already there: hover,
+            # rather than creep off at the minimum speed - over a long wait
+            # that is metres.
+            return WAIT_MPS
         speed = slope * pace.mps + (target - at_m) / CATCH_UP_S
-        if tick_sim_s > 0:
-            # Never plan to be past where the timetable wants this drone one
-            # tick from now: the autopilot keeps flying at this speed until
-            # the next tick, so a move that ends mid-tick would otherwise
-            # carry it metres past its place - and a timetable drone holding
-            # a shape can't fly back.
-            ahead = min(schedule_at(slot.schedule, clock + pace.mps * tick_sim_s)[0], end_m)
-            speed = min(speed, (ahead - at_m) / tick_sim_s)
+        ahead, ahead_slope = schedule_at(slot.schedule, clock + pace.mps * tick_sim_s)
+        if tick_sim_s > 0 and ahead_slope < slope:
+            # Slowing down or about to stop: never plan to be past where the
+            # timetable wants this drone one tick from now - the autopilot
+            # keeps flying at this speed until the next tick, so a move that
+            # ends mid-tick would otherwise carry it metres past its place,
+            # and a timetable drone holding a shape can't fly back. (Only
+            # then: at a steady speed this cap pulls a drone a little ahead
+            # back far harder than a drone a little behind is pushed on, and
+            # its speed see-saws.)
+            speed = min(speed, (min(ahead, end_m) - at_m) / tick_sim_s)
         return min(slot.max_mps, max(slot.min_mps, speed))
     target = min(pace.at_m + pace.mps * since_s - slot.slot_m, end_m)
+    if at_m < 0.0 and target <= at_m:
+        # Still on its own way off its pad, and its turn hasn't come yet.
+        return WAIT_MPS
     speed = pace.mps + (target - at_m) / CATCH_UP_S
     if pace.front_at_m is not None and 0.0 <= at_m <= end_m:
         front_now = pace.front_at_m + pace.mps * since_s

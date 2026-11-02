@@ -23,7 +23,7 @@ from engine.figure8_problem import MAX_FIGURE8_LAPS
 from engine.pddl_planner import PlanStep
 from services.plan_service import list_plans, plan_kind
 
-# Display-only labels for plan folders under plans/ - the underlying folder
+# Display-only labels for plan folders under Swarm-Planning/Plans/ - the underlying folder
 # name (used everywhere else as the plan identifier) is unchanged.
 PLAN_DISPLAY_NAMES = {
     "travell": "Travell",
@@ -31,10 +31,14 @@ PLAN_DISPLAY_NAMES = {
     "vformation": "V-Formation",
     "gridformation": "Grid-Formation",
     "3dgridformation": "3D-Grid Formation",
+    "parabolaformation": "Parabola Formation",
     "figure8formation": "Figure-8 Formation",
     "starformation": "Star Drone Show",
     "planets": "Planets",
     "Inspect": "Inspect",
+    "BatteryAware": "Battery-Aware Mission",
+    "Formula-4": "Formula-4 (Dynamic Swap)",
+    "Formation-Circle": "Formation-Circle (Spiral)",
 }
 
 
@@ -85,8 +89,8 @@ class MissionPlannerPanel(QWidget):
         laps_row.addWidget(self.laps_spin, stretch=1)
         self.plan_combo.currentIndexChanged.connect(self._on_plan_selection_changed)
 
-        # Only for the drone shows (star, planets): how fast they play. The simulator normally
-        # runs at 20x real time, which turns a show into a blur.
+        # Only for the drone shows (star, planets) and the figure-8: how fast they play. The
+        # simulator normally runs at 20x real time, which turns a formation into a blur.
         self.show_speed_combo = QComboBox()
         for label, scale in (
             ("Real time (1x)", 1.0), ("2x", 2.0), ("5x", 5.0), ("20x (simulator default)", 20.0),
@@ -95,8 +99,8 @@ class MissionPlannerPanel(QWidget):
         self.show_speed_combo.setCurrentIndex(1)
         self.show_speed_combo.setToolTip(
             "How fast the drone show plays: 1x is real time - the drones fly at "
-            "their real show speed (the star's tips about 6-7 m/s). The rest of "
-            "the simulator runs at 20x."
+            "their real show speed (the star's tips about 6-7 m/s, the figure-8 "
+            "5 m/s). The rest of the simulator runs at 20x."
         )
         self.show_speed_label = QLabel("Show speed:")
         show_speed_row = QHBoxLayout()
@@ -136,7 +140,7 @@ class MissionPlannerPanel(QWidget):
             "port would run two vehicles at once)."
         )
 
-        plan_group = QGroupBox("Named Plan (plans/<name>/)")
+        plan_group = QGroupBox("Named Plan (Swarm-Planning/Plans/<name>/)")
         plan_layout = QVBoxLayout(plan_group)
         plan_layout.addLayout(pick_row)
         plan_layout.addWidget(self.restricted_check)
@@ -180,24 +184,35 @@ class MissionPlannerPanel(QWidget):
         has_laps = kind in ("figure8_formation", "star_formation", "planets_formation")
         self.laps_label.setVisible(has_laps)
         self.laps_spin.setVisible(has_laps)
-        is_show = kind in ("star_formation", "planets_formation")
+        is_show = kind in (
+            "star_formation", "planets_formation", "figure8_formation", "formula4_formation",
+            "circle_formation",
+        )
         self.show_speed_label.setVisible(is_show)
         self.show_speed_combo.setVisible(is_show)
         # A figure-8 is picked from points of its own and never detours; a
-        # drone show stays in one place; an inspection follows the road.
-        self.restricted_check.setEnabled(not has_laps and kind != "road_inspection")
+        # drone show stays in one place; an inspection follows the road; a
+        # battery-aware mission's detours are its charging stations; Formula-4's
+        # drones fly their formulas in a straight line.
+        self.restricted_check.setEnabled(
+            not has_laps
+            and kind not in ("road_inspection", "battery_aware", "formula4_formation", "circle_formation", "task_allocation")
+        )
 
     def figure8_laps(self) -> int:
         return self.laps_spin.value()
 
     def show_time_scale(self) -> float:
-        """How many times real time a drone show (star, planets) plays at."""
+        """How many times real time a drone show (star, planets) or the
+        figure-8 plays at."""
         return float(self.show_speed_combo.currentData())
 
     def _on_plan_clicked(self) -> None:
         name = self.plan_combo.currentData()
         if not name:
-            self.set_status("No plans found under plans/ - add a domain.pddl + problem.pddl folder.")
+            self.set_status(
+                "No plans found under Swarm-Planning/Plans/ - add a domain.pddl + problem.pddl folder."
+            )
             return
         self.plan_requested.emit(name)
 

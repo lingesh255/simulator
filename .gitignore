@@ -46,4 +46,4 @@ data/presets/*.json
 tools/enhsp/
 
 # Per-run generated PDDL problems and ENHSP output
-plans/*/runs/
+Swarm-Planning/Results/

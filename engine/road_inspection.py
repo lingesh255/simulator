@@ -3,7 +3,7 @@
     picked source + destination (anywhere on a road)
         -> fetch_road_route: the road's exact path between them, from an
            OSRM routing server over OpenStreetMap roads
-        -> plans/Inspect/problem.pddl (template) -> retarget_inspection_problem
+        -> Swarm-Planning/Plans/Inspect/problem.pddl (template) -> retarget_inspection_problem
         -> ENHSP plans: inspect every road segment source -> destination,
            fly back along the same road, land at the source
         -> the drone flies the road's FULL geometry, every curve, out and back

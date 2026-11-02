@@ -1,6 +1,6 @@
 """GUI-facing PDDL mission planning.
 
-    plans/<name>/<problem file> (template)
+    Swarm-Planning/Plans/<name>/<problem file> (template)
         -> substitute the picked source/destination (or base + search area)
         -> ENHSP (engine.pddl_planner)
         -> the ordered waypoint route a drone should fly - or, for an
@@ -10,26 +10,26 @@ Runs on a worker thread - `run_enhsp` shells out to Java and blocks - and
 reports back through Qt signals, the same shape as `MavlinkSwarmBackend`'s
 worker in `services/mavlink_backend.py`.
 
-Nine plan *kinds* are supported, told apart by which domain a plan folder's
+Thirteen plan *kinds* are supported, told apart by which domain a plan folder's
 `domain.pddl` declares (see `plan_kind`) rather than by folder name, so any
 future plan sharing one of these domains works with no further wiring:
 
-- point-to-point (`swarm-drone-mission`, e.g. `plans/travell/`): one shared
+- point-to-point (`swarm-drone-mission`, e.g. `Swarm-Planning/Plans/travell/`): one shared
   route, retargeted from a picked source/destination (+ optional restricted
   area) via `engine.pddl_problem.retarget_problem`. The template's single
   reference drone is then expanded to as many identical drones as the caller
   has checked (`expand_point_to_point_drones`), so the solved plan carries a
   travel sequence per drone and the whole swarm flies the route together.
-- area-coverage (`forest-drone-search`, e.g. `plans/Search/`): one route per
+- area-coverage (`forest-drone-search`, e.g. `Swarm-Planning/Plans/Search/`): one route per
   drone, retargeted from a picked base point + a marked search-area polygon
   via `engine.search_problem.retarget_search_problem`.
-- formation (`v-formation-drone-mission`, e.g. `plans/vformation/`): picked
+- formation (`v-formation-drone-mission`, e.g. `Swarm-Planning/Plans/vformation/`): picked
   like a point-to-point plan (source + destination, + optional restricted
   area), but ENHSP plans only the apex's corridor
   (`engine.pddl_problem.retarget_formation_problem`) and the two wing routes
   are derived parallel to it - three drones, one per V slot, flown
   concurrently like the area-coverage per-drone routes.
-- grid formation (`grid-formation-drone-mission`, e.g. `plans/gridformation/`):
+- grid formation (`grid-formation-drone-mission`, e.g. `Swarm-Planning/Plans/gridformation/`):
   picked the same way as a V-formation (source + destination, + optional
   restricted area), and likewise ENHSP plans only the leader's corridor
   (`engine.pddl_problem.retarget_grid_problem`); every other drone's route is
@@ -38,9 +38,9 @@ future plan sharing one of these domains works with no further wiring:
   else the most-square rectangle that tiles it exactly (see
   `engine.pddl_problem.grid_dimensions`), 10 m apart in every direction, each
   drone coordinating with only the up to 4 neighbors actually next to it
-  (front/back/left/right - see `plans/gridformation/domain.pddl`).
+  (front/back/left/right - see `Swarm-Planning/Plans/gridformation/domain.pddl`).
 - 3-D grid / cube (`cube-grid-formation-drone-mission`, e.g.
-  `plans/3dgridformation/`): the grid formation extended into the vertical.
+  `Swarm-Planning/Plans/3dgridformation/`): the grid formation extended into the vertical.
   Picked the same way, and again only the leader's corridor is planned
   (`engine.pddl_problem.retarget_cube_problem`), but the swarm forms a block
   of stacked horizontal layers - 8 drones a full 2x2x2 cube, any larger count
@@ -51,7 +51,17 @@ future plan sharing one of these domains works with no further wiring:
   one plan whose drones do NOT all fly the same altitude: its layers are
   separated vertically, so it also returns a per-drone altitude offset (see
   `PlanRunResult.per_drone_altitude_offset_m`).
-- figure-8 (`figure8-formation-drone-mission`, e.g. `plans/figure8formation/`):
+- parabola (`parabola-formation-drone-mission`, e.g. `Swarm-Planning/Plans/parabolaformation/`):
+  picked like a V-formation (source + destination, + optional restricted
+  area). Exactly three drones fly side by side on one line across the
+  route, `PARABOLA_SPACING_M` apart - the middle drone (the vertex) at the
+  plan's 50 m cruise altitude and the two arm drones `PARABOLA_ARM_RISE_M`
+  higher - so from behind they form an upward-opening parabola. Every drone
+  keeps a link with both of the others (`parabola-neighbor`/`link-up` in
+  the domain). ENHSP plans the vertex's corridor; the arms' tracks are
+  derived parallel to it and their extra height is carried, like a cube's
+  layers, in `PlanRunResult.per_drone_altitude_offset_m`.
+- figure-8 (`figure8-formation-drone-mission`, e.g. `Swarm-Planning/Plans/figure8formation/`):
   picked differently from every other plan - four clicks: the BASE, then
   the 8's LEFT end, the MIDDLE point where its lobes cross, and its RIGHT
   end. The drones fly as a train - one behind another, 10 m apart, each
@@ -61,31 +71,59 @@ future plan sharing one of these domains works with no further wiring:
   waypoints; every drone flies the same dense path started one spacing
   further back. `plan_figure8_mission` says when the layout can't take the
   checked number of drones.
-- star show (`star-formation-drone-mission`, e.g. `plans/starformation/`): a
-  drone show round one picked SOURCE - no destination. The drones take off
-  from pads there, form a circle, and every lap form a star, a circle, spin
-  the circle, form a star, spin the star and form a circle again; then land
-  back on their pads (see `engine.star_problem`). ENHSP plans the show's
-  sequence of shapes; every drone flies its own timed track, so each shape
-  change and spin starts and ends together.
-- planets (`planets-formation-drone-mission`, e.g. `plans/planets/`): a
-  solar-system show round one picked SOURCE (the sun) - no destination. Drone
-  k flies its own circular orbit, 50 m further out than the one inside it
-  (up to 8 drones, mercury to neptune), neighbouring orbits turning in
-  opposite directions; a lap is one turn of the outermost drone, and every
-  lap ends with all drones lined up again, then they land on their pads (see
-  `engine.planets_problem`). ENHSP plans enter-orbits, the laps and the
-  landing; every drone flies its own timed track, like the star show.
-- road inspection (`road-inspection-drone-mission`, e.g. `plans/Inspect/`):
+- star show (`star-formation-drone-mission`, e.g. `Swarm-Planning/Plans/starformation/`): a
+  picked SOURCE and DESTINATION. The drones take off from pads at the
+  source and ONE BY ONE fly to the destination, each taking its place on
+  the show's circle; then every lap form a star, a circle, spin the circle,
+  form a star, spin the star and form a circle again; then ONE BY ONE fly
+  back and land on their pads (see `engine.star_problem`). ENHSP plans the
+  drones' turns and the show's sequence of shapes; every drone flies its
+  own timed track, so each shape change and spin starts and ends together.
+- planets (`planets-formation-drone-mission`, e.g. `Swarm-Planning/Plans/planets/`): a
+  picked SOURCE and DESTINATION (the sun). The drones take off from pads at
+  the source and ONE BY ONE fly to the destination, each to the start of
+  its own circular orbit, 50 m further out than the one inside it (up to 8
+  drones, mercury to neptune), neighbouring orbits turning in opposite
+  directions. Every drone turns at the same angular speed - its speed in
+  proportion to its radius - so the drones turning each way stay in one
+  straight line out from the sun; a lap is one turn, and every lap ends
+  with all drones lined up again. Then ONE BY ONE they fly back and land on
+  their pads (see `engine.planets_problem`). ENHSP plans the drones' turns,
+  the laps and the landing; every drone flies its own timed track, like the
+  star show.
+- road inspection (`road-inspection-drone-mission`, e.g. `Swarm-Planning/Plans/Inspect/`):
   source + destination clicked ON A ROAD. The road's exact path between
   them comes from an OSRM routing server (`engine.road_inspection`); one
   drone follows it, every curve, to the destination, flies the same road
   back and lands at the source. No road route (roads not connected, a click
   off the road, no connection to the routing service) fails the plan with
   the reason, before anything flies.
+- battery-aware (`battery-aware-drone-mission`, e.g. `Swarm-Planning/Plans/BatteryAware/`):
+  a picked SOURCE, DESTINATION and `CHARGING_STATION_COUNT` charging
+  stations for ONE drone (the first checked). If its current charge covers
+  the trip it flies straight there; otherwise ENHSP's optimal search picks
+  the shortest chain of hops through the stations that the battery allows.
+  The drone lands at every station on that chain, charges only what the
+  next hop needs plus a 10% margin, and takes off again
+  (`services.thread_backend.ThreadSwarmBackend.start_charging_mission`).
+- Formula-4 (`formula4-drone-mission`, e.g. `Swarm-Planning/Plans/Formula-4/`): a picked
+  SOURCE and DESTINATION; four drones in two lines of two fly there while
+  the front and back drone of each lane keep swapping places - the front one
+  slowing and dipping to 50 m, the back one speeding up and passing over at
+  60 m. Each drone flies its own closed-form formula of one shared clock
+  (`engine.formula4_problem`), which keeps every two drones >= 11.6 m apart
+  without any of them knowing where the others are.
+- Formation-Circle (`circle-formation-drone-mission`, e.g.
+  `Swarm-Planning/Plans/Formation-Circle/`): a picked SOURCE and DESTINATION; four drones
+  on a vertical circle across the route (bottom 40 m, left and right 50 m,
+  top 60 m) that keeps turning as it flies, every drone moving bottom ->
+  left -> top -> right - a spiral. Each drone flies its own closed-form
+  formula of one shared clock (`engine.circle_formation_problem`); the
+  circle turns rigidly, so neighbours stay 14.1 m apart without talking.
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -121,6 +159,7 @@ from engine.pddl_problem import (
     formation_wing_routes,
     grid_cell_names,
     grid_dimensions,
+    haversine_m,
     read_locations,
     retarget_cube_problem,
     retarget_formation_problem,
@@ -138,6 +177,28 @@ from engine.figure8_problem import (
     plan_figure8_mission,
     retarget_figure8_problem,
 )
+from engine.battery_mission import (
+    best_station_route,
+    check_plan_charges,
+    hop_estimate,
+    plan_stops,
+    retarget_battery_problem,
+)
+from engine.circle_formation_problem import (
+    DRONE_NAMES as CIRCLE_DRONE_NAMES,
+    expected_actions as circle_expected_actions,
+    plan_actions as circle_plan_actions,
+    plan_circle_formation,
+    retarget_circle_problem,
+)
+from engine.formula4_problem import (
+    DRONE_NAMES as FORMULA4_DRONE_NAMES,
+    MID_ALT_M as FORMULA4_MID_ALT_M,
+    expected_actions as formula4_expected_actions,
+    plan_formula4,
+    plan_swaps as formula4_plan_swaps,
+    retarget_formula4_problem,
+)
 from engine.road_inspection import (
     fetch_road_route,
     inspection_road_names,
@@ -146,23 +207,48 @@ from engine.road_inspection import (
 from engine.planets_problem import (
     expand_planet_drones,
     plan_planets_show,
+    planets_distance_error,
     planets_drone_count_error,
     retarget_planets_problem,
 )
+from engine.train_keeping import SCHEDULE_UNIT_MPS
 from engine.search_problem import expand_search_drones, retarget_search_problem
+from engine.terrain import plan_terrain_profile
 from engine.star_problem import (
     MIN_STAR_DRONES,
     expand_star_drones,
     plan_star_show,
     retarget_star_show_problem,
     star_drone_count_error,
+    star_show_distance_error,
 )
 
-PLANS_DIR = Path(__file__).resolve().parent.parent / "plans"
+# Swarm-Planning/Plans/<plan>/        each plan's domain + problem files
+# Swarm-Planning/Results/ENHSP/<plan>/runs/<timestamp>/   what each run of
+#     the ENHSP planner produced: the concrete problem.pddl and plan.txt
+SWARM_PLANNING_DIR = Path(__file__).resolve().parent.parent / "Swarm-Planning"
+PLANS_DIR = SWARM_PLANNING_DIR / "Plans"
+RESULTS_DIR = SWARM_PLANNING_DIR / "Results" / "ENHSP"
 PLAN_DRONE_OBJECT = "drone1"  # ENHSP solves the point-to-point route for this reference drone
 MIN_AREA_COVERAGE_DRONES = 2  # the Search domain needs >= 2 drones (two lanes, mutual separation)
 MIN_GRID_DRONES = 4  # smallest shape that reads as a grid rather than a line (a 2x2 square)
 MIN_CUBE_DRONES = 8  # smallest shape that reads as a cube rather than a plane (a 2x2x2 block)
+PARABOLA_DRONES = 3  # a vertex and one arm either side
+
+# The parabola's shape, in metres: each arm sits this far to the side of the
+# vertex, level with it along the route, and this much higher - with the
+# flat 50 m cruise altitude (engine.terrain.FLAT_CRUISE_ALT_M) that is the
+# vertex at 50 m and both arms at 60 m. Must be kept in sync with the
+# slot-cross-offset / target-altitude / arm-rise / link-distance numbers in
+# Swarm-Planning/Plans/parabolaformation/problem.pddl - they describe the same geometry.
+PARABOLA_SPACING_M = 10.0
+PARABOLA_ARM_RISE_M = 10.0
+PARABOLA_DRONE_NAMES = ("drone-vertex", "drone-left", "drone-right")
+# Longest leg of a parabola drone's flown route: the corridor is split into
+# legs no longer than this, so every drone has intermediate waypoints (the
+# drone threads only fly a route as a timed formation when it has some) and
+# the three are checked against each other at least this often.
+PARABOLA_LEG_M = 200.0
 
 
 def _area_drone_names(count: int) -> list[str]:
@@ -179,11 +265,12 @@ def _area_drone_names(count: int) -> list[str]:
 # previous one (`formation_wing_routes` called again with `back_m`/`side_m`
 # scaled by the rank number). Must be kept in sync with the
 # `slot-along-offset`/`slot-cross-offset` numbers in
-# plans/vformation/problem.pddl - they describe the same geometry, but
+# Swarm-Planning/Plans/vformation/problem.pddl - they describe the same geometry, but
 # aren't read from the PDDL file directly (formation_wing_routes works from
 # the apex's actual flown path, not the problem's numeric fluents).
 FORMATION_BACK_M = 17.320508
 FORMATION_SIDE_M = 10.0
+FORMULA4_DRONES = 4  # Formula-4: two lines of two
 
 
 def _formation_drone_names(ranks: int) -> list[str]:
@@ -251,10 +338,15 @@ _DOMAIN_KIND = {
     "v-formation-drone-mission": "formation",
     "grid-formation-drone-mission": "grid_formation",
     "cube-grid-formation-drone-mission": "cube_formation",
+    "parabola-formation-drone-mission": "parabola_formation",
     "figure8-formation-drone-mission": "figure8_formation",
     "star-formation-drone-mission": "star_formation",
     "planets-formation-drone-mission": "planets_formation",
     "road-inspection-drone-mission": "road_inspection",
+    "battery-aware-drone-mission": "battery_aware",
+    "formula4-drone-mission": "formula4_formation",
+    "circle-formation-drone-mission": "circle_formation",
+    "task-allocation": "task_allocation",
 }
 _DOMAIN_NAME = re.compile(r"\(define\s*\(domain\s+(\S+)\)")
 
@@ -303,6 +395,7 @@ class PlanRunResult:
     waypoints: list[LatLon]
     location_names: list[str]
     run_dir: Path
+    task_initial_drone: Optional[str] = None
     # Set only for an area-coverage plan: each drone object name
     # ("drone1".."droneN", one per checked drone) mapped to its own lane
     # route. `None` for an ordinary point-to-point plan, where `waypoints`
@@ -392,13 +485,33 @@ class _Worker(QObject):
         else:
             self.finished.emit(result)
 
-    @Slot(str, object, int, int)
-    def run_show(self, plan_name: str, source: object, drone_count: int, laps: int = 1) -> None:
+    @Slot(str, object, object, object, object)
+    def run_battery(
+        self, plan_name: str, source: object, destination: object, stations: object, drone: object
+    ) -> None:
+        try:
+            result = self._run_battery_aware(plan_name, source, destination, stations, drone)
+        except PlanNotFound as exc:
+            self._save_stdout(plan_name, exc.stdout)
+            self.failed.emit(str(exc))
+        except PlannerError as exc:
+            self.failed.emit(str(exc))
+        except OSError as exc:
+            self.failed.emit(f"Could not read/write plan files: {exc}")
+        except ValueError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+    @Slot(str, object, object, int, int)
+    def run_show(
+        self, plan_name: str, source: object, destination: object, drone_count: int, laps: int = 1
+    ) -> None:
         try:
             if plan_kind(plan_name) == "planets_formation":
-                result = self._run_planets_show(plan_name, source, drone_count, laps)
+                result = self._run_planets_show(plan_name, source, destination, drone_count, laps)
             else:
-                result = self._run_star_show(plan_name, source, drone_count, laps)
+                result = self._run_star_show(plan_name, source, destination, drone_count, laps)
         except PlanNotFound as exc:
             self._save_stdout(plan_name, exc.stdout)
             self.failed.emit(str(exc))
@@ -440,6 +553,9 @@ class _Worker(QObject):
         no_fly_zone: Optional[list[LatLon]],
         drone_count: int = 1,
     ) -> PlanRunResult:
+        if plan_kind(plan_name) == "task_allocation":
+            return self._run_task_allocation(plan_name, source, destination, drone_count)
+
         if plan_kind(plan_name) == "formation":
             # Collected on the same clicks as a point-to-point plan, so it
             # arrives through the same `run` slot - it just retargets and
@@ -465,6 +581,18 @@ class _Worker(QObject):
             # Same click/parameter shape again; `drone_count` picks the
             # block's layers x rows x columns (see `_run_cube_formation`).
             return self._run_cube_formation(plan_name, source, destination, no_fly_zone, drone_count)
+
+        if plan_kind(plan_name) == "parabola_formation":
+            # Same click shape again; always exactly three drones.
+            return self._run_parabola_formation(plan_name, source, destination, no_fly_zone)
+
+        if plan_kind(plan_name) == "formula4_formation":
+            # Same clicks, no restricted area; always exactly four drones.
+            return self._run_formula4(plan_name, source, destination)
+
+        if plan_kind(plan_name) == "circle_formation":
+            # Same clicks, no restricted area; always exactly four drones.
+            return self._run_circle_formation(plan_name, source, destination)
 
         domain_path, template_path = self._plan_files(plan_name)
         template_text = template_path.read_text(encoding="utf-8")
@@ -508,6 +636,50 @@ class _Worker(QObject):
             location_names=location_names,
             run_dir=run_dir,
         )
+
+    def _run_task_allocation(self, plan_name, source, destination, drone_count, drones=None):
+        if drone_count != 4:
+            raise ValueError("Task-Allocation needs exactly four checked drones.")
+        if haversine_m(source, destination) < 30:
+            raise ValueError("Task-Allocation source and destination must be at least 30 metres apart.")
+        domain, template = self._plan_files(plan_name)
+        concrete = template.read_text(encoding="utf-8")
+        for name, point in (("source", source), ("destination", destination)):
+            for axis, value in (("latitude", point.lat), ("longitude", point.lon)):
+                concrete = re.sub(
+                    rf"\(=\s*\({axis}\s+{name}\)\s+[^)]+\)",
+                    f"(= ({axis} {name}) {value:.7f})", concrete,
+                )
+        if drones is not None:
+            from services.local_flight import plan_route_flights
+            route, _ = plan_terrain_profile([source, destination])
+            flights = plan_route_flights(drones, route)
+            if not any(f.feasible for f in flights):
+                raise ValueError("None of the four drones has enough battery for this route.")
+            for i, flight in enumerate(flights, 1):
+                if not flight.feasible:
+                    concrete = concrete.replace(f"(capable drone{i})", "")
+        run_dir = self._start_run(plan_name, concrete)
+        steps, stdout = run_enhsp(domain, run_dir / "problem.pddl")
+        (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
+        starts = [s for s in steps if s.action == "start-mission"]
+        arrivals = [s for s in steps if s.action == "travel-to-destination"]
+        if len(starts) != 1 or len(arrivals) != 1:
+            raise PlanNotFound("Task-Allocation must launch one initial drone and reach the destination.")
+        return PlanRunResult(
+            plan_name=plan_name, steps=steps, waypoints=[source, destination],
+            location_names=["source", "destination"], run_dir=run_dir,
+            task_initial_drone=starts[0].args[0],
+        )
+
+    @Slot(str, object, object, object)
+    def run_task(self, plan_name, source, destination, drones):
+        try:
+            result = self._run_task_allocation(plan_name, source, destination, len(drones), drones)
+        except (PlannerError, PlanNotFound, ValueError, OSError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
 
     def _run_formation(
         self,
@@ -641,7 +813,7 @@ class _Worker(QObject):
         # ENHSP's default ("internal") grounder was found in practice to
         # blow up - a multi-minute, multi-gigabyte `OutOfMemoryError` inside
         # its own combination-building, well before search even starts -
-        # on a formation-style domain (this one, and plans/vformation's, are
+        # on a formation-style domain (this one, and Swarm-Planning/Plans/vformation's, are
         # both affected) once the drone count climbs past a dozen-odd,
         # regardless of how much JVM heap it's given. Its "naive" grounder
         # (`-gro naive`) does not share that blowup - a 36-drone (6x6) grid
@@ -759,7 +931,7 @@ class _Worker(QObject):
         )
 
         run_dir = self._start_run(plan_name, concrete_text)
-        # `-gro naive` for the same reason plans/gridformation/ needs it: the
+        # `-gro naive` for the same reason Swarm-Planning/Plans/gridformation/ needs it: the
         # default grounder blows up on a formation-style domain once the
         # drone count climbs past a dozen-odd. The timeout scales with the
         # cell count, and more generously than the 2-D grid's, because a cube
@@ -791,6 +963,17 @@ class _Worker(QObject):
         def _as_gui(route: list[PddlLatLon]) -> list[LatLon]:
             return [LatLon(lat=p.lat, lon=p.lon) for p in route]
 
+        # Split every corridor leg into equal pieces of at most
+        # PARABOLA_LEG_M, as the parabola does, so the timetable below has
+        # frequent checkpoints keeping the layers locked together.
+        dense_route = [lead_route[0]]
+        for a, b in zip(lead_route, lead_route[1:]):
+            pieces = max(1, math.ceil(haversine_m(a, b) / PARABOLA_LEG_M))
+            for k in range(1, pieces + 1):
+                f = k / pieces
+                dense_route.append(PddlLatLon(lat=a.lat + (b.lat - a.lat) * f, lon=a.lon + (b.lon - a.lon) * f))
+        lead_route = dense_route
+
         filled = max(MIN_CUBE_DRONES, drone_count)
         cell_name = cube_cell_names(layers, rows, cols, filled)
         leader_cell = next(cell for cell, name in cell_name.items() if name == "drone-lead")
@@ -817,6 +1000,32 @@ class _Worker(QObject):
         per_drone_waypoints = {name: routes[name] for name in ordered}
         per_drone_altitude_offset_m = {name: altitude_offsets[name] for name in ordered}
 
+        def _cumulative_m(route: list[LatLon]) -> list[float]:
+            out = [0.0]
+            for a, b in zip(route, route[1:]):
+                out.append(out[-1] + haversine_m(
+                    PddlLatLon(lat=a.lat, lon=a.lon), PddlLatLon(lat=b.lat, lon=b.lon)
+                ))
+            return out
+
+        # One shared timetable (schedule mode, as for the parabola): every
+        # drone is due at its matching waypoint at the same clock time, and
+        # the clock only starts once all have climbed. Flown independently,
+        # the bottom layer - 10 m less to climb - would set off first and run
+        # ahead, so a drone would no longer be directly beneath the one
+        # stacked above it on the same lateral track.
+        clock = [m / SCHEDULE_UNIT_MPS for m in _cumulative_m(per_drone_waypoints["drone-lead"])]
+        train_routes = {}
+        for name, route in per_drone_waypoints.items():
+            train_routes[name] = TrainRoute(
+                start=route[0],
+                approach=list(route[1:-1]),
+                loop=[],
+                laps=1,
+                depart=[route[-1]],
+                schedule=tuple(zip(clock, _cumulative_m(route))),
+            )
+
         return PlanRunResult(
             plan_name=plan_name,
             steps=steps,
@@ -825,6 +1034,132 @@ class _Worker(QObject):
             run_dir=run_dir,
             per_drone_waypoints=per_drone_waypoints,
             per_drone_altitude_offset_m=per_drone_altitude_offset_m,
+            train_routes=train_routes,
+        )
+
+    def _run_parabola_formation(
+        self,
+        plan_name: str,
+        source: LatLon,
+        destination: LatLon,
+        no_fly_zone: Optional[list[LatLon]] = None,
+    ) -> PlanRunResult:
+        """Parabola plan: three drones abreast on one line across the route -
+        the vertex in the middle at the plan's cruise altitude, an arm drone
+        `PARABOLA_SPACING_M` to either side and `PARABOLA_ARM_RISE_M` higher.
+
+        ENHSP plans the vertex's corridor (bent around `no_fly_zone` if one
+        is marked and actually in the way) and sets up every drone-to-drone
+        link before the shape is allowed to form; the arms' tracks are then
+        derived parallel to the corridor by `formation_member_route`, with no
+        offset along the route so all three stay on one line. Like the
+        cube's layers, the arms' extra height is returned in
+        `per_drone_altitude_offset_m` and added to the cruise altitude when
+        the drones fly.
+
+        The three also fly one shared timetable (`train_routes`, schedule
+        mode - see `engine.train_keeping`): each drone is due at every
+        corridor waypoint at the same clock time, and the clock only starts
+        once all three have climbed. Flown independently the vertex, with
+        10 m less to climb, would set off first and run ~25 m ahead of the
+        arms instead of staying on their line.
+        """
+        domain_path, template_path = self._plan_files(plan_name)
+        template_text = template_path.read_text(encoding="utf-8")
+        # The grid's retarget does exactly what is needed - relocate and
+        # re-cost the corridor, detour round the zone - with no V-specific
+        # slot-direction bookkeeping.
+        concrete_text = retarget_grid_problem(
+            template_text,
+            PddlLatLon(lat=source.lat, lon=source.lon),
+            PddlLatLon(lat=destination.lat, lon=destination.lon),
+            no_fly_zone=(
+                [PddlLatLon(lat=p.lat, lon=p.lon) for p in no_fly_zone] if no_fly_zone else None
+            ),
+            # The arms ride PARABOLA_SPACING_M out to either side of the
+            # vertex's centreline - pad the buffer so they clear it too.
+            no_fly_buffer_m=NO_FLY_BUFFER_M + PARABOLA_SPACING_M,
+        )
+
+        run_dir = self._start_run(plan_name, concrete_text)
+        steps, stdout = run_enhsp(domain_path, run_dir / "problem.pddl")
+        (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
+
+        corridor = extract_formation_corridor(steps)
+        if not corridor:
+            raise PlanNotFound(
+                "ENHSP found a plan but it contains no 'formation-cruise' legs."
+            )
+        locations = read_locations(concrete_text)
+        try:
+            vertex_route = [
+                PddlLatLon(lat=locations[name].lat, lon=locations[name].lon)
+                for name in corridor
+            ]
+        except KeyError as exc:
+            raise PlanNotFound(
+                f"Plan references location {exc} with no coordinates in problem.pddl"
+            ) from exc
+
+        def _as_gui(route: list[PddlLatLon]) -> list[LatLon]:
+            return [LatLon(lat=p.lat, lon=p.lon) for p in route]
+
+        # Split every corridor leg into equal pieces of at most
+        # PARABOLA_LEG_M. The extra points are on the straight leg, so the
+        # arms (derived below) still run exactly parallel to it.
+        dense_route = [vertex_route[0]]
+        for a, b in zip(vertex_route, vertex_route[1:]):
+            pieces = max(1, math.ceil(haversine_m(a, b) / PARABOLA_LEG_M))
+            for k in range(1, pieces + 1):
+                f = k / pieces
+                dense_route.append(PddlLatLon(lat=a.lat + (b.lat - a.lat) * f, lon=a.lon + (b.lon - a.lon) * f))
+        vertex_route = dense_route
+
+        vertex, left, right = PARABOLA_DRONE_NAMES
+        per_drone_waypoints = {
+            vertex: _as_gui(vertex_route),
+            # `cross_m` is metres to the LEFT of the direction of travel.
+            left: _as_gui(formation_member_route(vertex_route, along_m=0.0, cross_m=PARABOLA_SPACING_M)),
+            right: _as_gui(formation_member_route(vertex_route, along_m=0.0, cross_m=-PARABOLA_SPACING_M)),
+        }
+        per_drone_altitude_offset_m = {
+            vertex: 0.0,
+            left: PARABOLA_ARM_RISE_M,
+            right: PARABOLA_ARM_RISE_M,
+        }
+
+        def _cumulative_m(route: list[LatLon]) -> list[float]:
+            out = [0.0]
+            for a, b in zip(route, route[1:]):
+                out.append(out[-1] + haversine_m(
+                    PddlLatLon(lat=a.lat, lon=a.lon), PddlLatLon(lat=b.lat, lon=b.lon)
+                ))
+            return out
+
+        # Clock time at each waypoint is the vertex's own distance there (in
+        # nominal seconds); every drone is due at its own matching waypoint
+        # then, so on a bend the outer arm simply flies a little faster.
+        clock = [m / SCHEDULE_UNIT_MPS for m in _cumulative_m(per_drone_waypoints[vertex])]
+        train_routes = {}
+        for name, route in per_drone_waypoints.items():
+            train_routes[name] = TrainRoute(
+                start=route[0],
+                approach=list(route[1:-1]),
+                loop=[],
+                laps=1,
+                depart=[route[-1]],
+                schedule=tuple(zip(clock, _cumulative_m(route))),
+            )
+
+        return PlanRunResult(
+            plan_name=plan_name,
+            steps=steps,
+            waypoints=_as_gui(vertex_route),
+            location_names=corridor,
+            run_dir=run_dir,
+            per_drone_waypoints=per_drone_waypoints,
+            per_drone_altitude_offset_m=per_drone_altitude_offset_m,
+            train_routes=train_routes,
         )
 
     def _run_figure8(
@@ -837,10 +1172,10 @@ class _Worker(QObject):
         drone_count: int = MIN_FIGURE8_DRONES,
         laps: int = 1,
     ) -> PlanRunResult:
-        """Figure-8 plan: `drone_count` drones, as a train
-        `FIGURE8_SPACING_M` apart, flying from `base` to the middle of the 8
-        built through the other three clicked points, round it `laps` times,
-        and back to `base` (see `engine.figure8_problem`).
+        """Figure-8 plan: `drone_count` drones flying from `base` to the
+        middle of the 8 built through the other three clicked points, spread
+        evenly round it for `laps` laps, and back to `base` (see
+        `engine.figure8_problem`).
 
         `plan_figure8_mission` validates the layout first and raises
         `ValueError` with the same operator-facing message `MainWindow`
@@ -902,6 +1237,8 @@ class _Worker(QObject):
                 depart=[_gui(p) for p in r.depart],
                 shared_from_m=r.shared_from_m,
                 slot_m=r.slot_m,
+                cruise_mps=r.cruise_mps,
+                loop_alt_offsets=r.loop_alt_offsets,
             )
             for name, r in routes.items()
         }
@@ -921,25 +1258,31 @@ class _Worker(QObject):
         self,
         plan_name: str,
         source: LatLon,
+        destination: LatLon,
         drone_count: int = MIN_STAR_DRONES,
         laps: int = 1,
     ) -> PlanRunResult:
-        """Star show round `source`, `laps` laps - see `engine.star_problem`.
+        """Star show at `destination`, flown from and back to `source`,
+        `laps` laps - see `engine.star_problem`.
 
-        ENHSP plans the show's sequence (form circle, then per lap: star,
-        circle, spin circle, star, spin star, circle; then land) and the
-        result is checked against exactly that; `plan_star_show` gives
-        every drone its own timed track."""
+        ENHSP plans the drones flying out one by one, the show's sequence
+        (form circle, then per lap: star, circle, spin circle, star, spin
+        star, circle; end the show) and the drones flying back one by one,
+        and the result is checked against exactly that - in the turns
+        `plan_star_show` gave the drones, along with their timed tracks."""
         problem = star_drone_count_error(drone_count)
         if problem:
             raise ValueError(problem)
+        if destination is None:
+            raise ValueError("A star show needs a destination - click the source, then the destination.")
         source_pddl = PddlLatLon(lat=source.lat, lon=source.lon)
-        show = plan_star_show(source_pddl, drone_count, laps)
+        destination_pddl = PddlLatLon(lat=destination.lat, lon=destination.lon)
+        show = plan_star_show(source_pddl, destination_pddl, drone_count, laps)
 
         domain_path, template_path = self._plan_files(plan_name)
         template_text = template_path.read_text(encoding="utf-8")
         concrete_text = retarget_star_show_problem(
-            expand_star_drones(template_text, drone_count), source_pddl, laps
+            expand_star_drones(template_text, drone_count), source_pddl, destination_pddl, laps, show
         )
         run_dir = self._start_run(plan_name, concrete_text)
         # `-gro naive` for the same reason the grid plans need it.
@@ -952,11 +1295,18 @@ class _Worker(QObject):
         (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
 
         lap = ["form-star", "form-circle-in-lap", "spin-circle", "form-star-again", "spin-star", "close-lap"]
-        expected = ["form-circle", *(lap * laps), "land-show"]
-        sequence = [
-            step.action for step in sorted(steps, key=lambda s: s.index)
-            if step.action in ("form-circle", "land-show", *lap)
+        expected = [
+            *(f"fly-to-formation {name}" for name in show.arrival_order),
+            "form-circle", *(lap * laps), "end-show",
+            *(f"return-to-source {name}" for name in show.return_order),
+            "complete-show",
         ]
+        sequence = []
+        for step in sorted(steps, key=lambda s: s.index):
+            if step.action in ("fly-to-formation", "return-to-source"):
+                sequence.append(f"{step.action} {step.args[0]}")
+            elif step.action in ("form-circle", "end-show", "complete-show", *lap):
+                sequence.append(step.action)
         if sequence != expected:
             raise PlanNotFound(
                 "ENHSP's plan does not fly the show in order: "
@@ -982,7 +1332,7 @@ class _Worker(QObject):
             plan_name=plan_name,
             steps=steps,
             waypoints=[_gui(p) for p in show.circle],
-            location_names=["source"],
+            location_names=["source", "destination"],
             run_dir=run_dir,
             per_drone_waypoints=per_drone_waypoints,
             train_routes=train_routes,
@@ -990,24 +1340,28 @@ class _Worker(QObject):
         )
 
     def _run_planets_show(
-        self, plan_name: str, source: LatLon, drone_count: int, laps: int = 1
+        self, plan_name: str, source: LatLon, destination: LatLon, drone_count: int, laps: int = 1
     ) -> PlanRunResult:
-        """Planets show round `source`, `laps` laps of the outermost orbit -
-        see `engine.planets_problem`.
+        """Planets show round `destination` (the sun), flown from and back
+        to `source`, `laps` laps - see `engine.planets_problem`.
 
-        ENHSP plans enter-orbits, one fly-lap per lap and land-planets, and
-        the result is checked against exactly that; `plan_planets_show`
-        gives every drone its own timed track."""
+        ENHSP plans the drones flying out one by one, enter-orbits, one
+        fly-lap per lap, end-show and the drones flying back one by one, and
+        the result is checked against exactly that - in the turns
+        `plan_planets_show` gave the drones, along with their timed tracks."""
         problem = planets_drone_count_error(drone_count)
         if problem:
             raise ValueError(problem)
+        if destination is None:
+            raise ValueError("The planets show needs a destination - click the source, then the destination (the sun).")
         source_pddl = PddlLatLon(lat=source.lat, lon=source.lon)
-        show = plan_planets_show(source_pddl, drone_count, laps)
+        destination_pddl = PddlLatLon(lat=destination.lat, lon=destination.lon)
+        show = plan_planets_show(source_pddl, destination_pddl, drone_count, laps)
 
         domain_path, template_path = self._plan_files(plan_name)
         template_text = template_path.read_text(encoding="utf-8")
         concrete_text = retarget_planets_problem(
-            expand_planet_drones(template_text, drone_count), source_pddl, laps
+            expand_planet_drones(template_text, drone_count), source_pddl, destination_pddl, laps, show
         )
         run_dir = self._start_run(plan_name, concrete_text)
         # `-gro naive` for the same reason the grid plans need it.
@@ -1019,11 +1373,18 @@ class _Worker(QObject):
         )
         (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
 
-        expected = ["enter-orbits", *(["fly-lap"] * laps), "land-planets"]
-        sequence = [
-            step.action for step in sorted(steps, key=lambda s: s.index)
-            if step.action in expected
+        expected = [
+            *(f"fly-to-orbit {name}" for name in show.arrival_order),
+            "enter-orbits", *(["fly-lap"] * laps), "end-show",
+            *(f"return-to-source {name}" for name in show.return_order),
+            "complete-planets",
         ]
+        sequence = []
+        for step in sorted(steps, key=lambda s: s.index):
+            if step.action in ("fly-to-orbit", "return-to-source"):
+                sequence.append(f"{step.action} {step.args[0]}")
+            elif step.action in ("enter-orbits", "fly-lap", "end-show", "complete-planets"):
+                sequence.append(step.action)
         if sequence != expected:
             raise PlanNotFound(
                 "ENHSP's plan does not fly the planets show in order: "
@@ -1049,11 +1410,132 @@ class _Worker(QObject):
             plan_name=plan_name,
             steps=steps,
             waypoints=[_gui(p) for p in show.preview_shape()],
-            location_names=["source"],
+            location_names=["source", "destination"],
             run_dir=run_dir,
             per_drone_waypoints=per_drone_waypoints,
             train_routes=train_routes,
             laps=laps,
+        )
+
+    def _run_formula4(self, plan_name: str, source: LatLon, destination: LatLon) -> PlanRunResult:
+        """Formula-4: four drones from `source` to `destination`, swapping
+        places all the way, each on its own formula of the shared clock - see
+        `engine.formula4_problem`.
+
+        ENHSP checks the formula's numbers keep every pair >= min-separation
+        apart (check-formula) and plans each drone on its own; the result
+        must be exactly: take off, its N swaps alternating (front drones slow
+        first), arrive, land - for every drone."""
+        mission = plan_formula4(
+            PddlLatLon(lat=source.lat, lon=source.lon),
+            PddlLatLon(lat=destination.lat, lon=destination.lon),
+        )
+        domain_path, template_path = self._plan_files(plan_name)
+        concrete_text = retarget_formula4_problem(template_path.read_text(encoding="utf-8"), mission)
+        run_dir = self._start_run(plan_name, concrete_text)
+        steps, stdout = run_enhsp(domain_path, run_dir / "problem.pddl", timeout_s=60.0)
+        (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
+
+        if not any(s.action == "check-formula" for s in steps):
+            raise PlanNotFound("ENHSP's plan never checks the formula is collision-free.")
+        flown = formula4_plan_swaps(steps)
+        for name in FORMULA4_DRONE_NAMES:
+            if flown[name] != formula4_expected_actions(name, mission.swaps):
+                raise PlanNotFound(
+                    f"ENHSP's plan for {name} is not its {mission.swaps} swaps from its "
+                    f"source slot to its destination slot: " + " -> ".join(flown[name] or ["-"])
+                )
+
+        def _gui(p: PddlLatLon) -> LatLon:
+            return LatLon(lat=p.lat, lon=p.lon)
+
+        train_routes = {
+            name: TrainRoute(
+                start=_gui(r.start),
+                approach=[],
+                loop=[_gui(p) for p in r.loop],
+                laps=1,
+                depart=[_gui(p) for p in r.depart],
+                schedule=r.schedule,
+                loop_alt_offsets=r.loop_alt_offsets,
+            )
+            for name, r in mission.routes.items()
+        }
+        # The tracks' heights are offsets from Z0: lift each drone's cruise
+        # altitude from the terrain profile's to exactly Z0.
+        _points, altitudes = plan_terrain_profile([source, destination])
+        lift = FORMULA4_MID_ALT_M - max(altitudes)
+        return PlanRunResult(
+            plan_name=plan_name,
+            steps=steps,
+            waypoints=[source, destination],
+            location_names=["source", "destination"],
+            run_dir=run_dir,
+            per_drone_waypoints={name: r.expanded() for name, r in train_routes.items()},
+            per_drone_altitude_offset_m={name: lift for name in train_routes},
+            train_routes=train_routes,
+        )
+
+    def _run_circle_formation(self, plan_name: str, source: LatLon, destination: LatLon) -> PlanRunResult:
+        """Formation-Circle: four drones on a turning vertical circle, flying
+        a spiral from `source` to `destination`, each on its own formula of
+        the shared clock - see `engine.circle_formation_problem`.
+
+        ENHSP checks the formula's numbers keep every pair >= min-separation
+        apart (check-formula) and plans each drone on its own; the result
+        must be exactly: take off, join the circle at its starting place,
+        one turn-quarter per quarter turn round bottom -> left -> top ->
+        right, leave the circle, land - for every drone."""
+        mission = plan_circle_formation(
+            PddlLatLon(lat=source.lat, lon=source.lon),
+            PddlLatLon(lat=destination.lat, lon=destination.lon),
+        )
+        domain_path, template_path = self._plan_files(plan_name)
+        concrete_text = retarget_circle_problem(template_path.read_text(encoding="utf-8"), mission)
+        run_dir = self._start_run(plan_name, concrete_text)
+        steps, stdout = run_enhsp(domain_path, run_dir / "problem.pddl", timeout_s=60.0)
+        (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
+
+        if not any(s.action == "check-formula" for s in steps):
+            raise PlanNotFound("ENHSP's plan never checks the formula is collision-free.")
+        flown = circle_plan_actions(steps)
+        for name in CIRCLE_DRONE_NAMES:
+            if flown[name] != circle_expected_actions(name, mission.quarter_turns):
+                raise PlanNotFound(
+                    f"ENHSP's plan for {name} is not its {mission.quarter_turns} quarter turns "
+                    f"round the circle from its pad to its destination pad: "
+                    + " -> ".join(a[0] for a in flown[name][:12]) + " ..."
+                )
+
+        def _gui(p: PddlLatLon) -> LatLon:
+            return LatLon(lat=p.lat, lon=p.lon)
+
+        train_routes = {
+            name: TrainRoute(
+                start=_gui(r.start),
+                approach=[],
+                loop=[_gui(p) for p in r.loop],
+                laps=1,
+                depart=[_gui(p) for p in r.depart],
+                schedule=r.schedule,
+                loop_alt_offsets=r.loop_alt_offsets,
+            )
+            for name, r in mission.routes.items()
+        }
+        # Each drone takes off to its own height on the circle (40/50/60/50 m);
+        # its track's heights are offsets from that.
+        _points, altitudes = plan_terrain_profile([source, destination])
+        return PlanRunResult(
+            plan_name=plan_name,
+            steps=steps,
+            waypoints=[source, destination],
+            location_names=["source", "destination"],
+            run_dir=run_dir,
+            per_drone_waypoints={name: r.expanded() for name, r in train_routes.items()},
+            per_drone_altitude_offset_m={
+                name: mission.start_alt_m[name] - max(altitudes) for name in train_routes
+            },
+            train_routes=train_routes,
         )
 
     def _run_road_inspection(
@@ -1104,6 +1586,71 @@ class _Worker(QObject):
             run_dir=run_dir,
             per_drone_waypoints={"drone1": path},
             train_routes={"drone1": inspection},
+        )
+
+    def _run_battery_aware(
+        self,
+        plan_name: str,
+        source: LatLon,
+        destination: LatLon,
+        stations: list[LatLon],
+        drone,
+    ) -> PlanRunResult:
+        """Battery-aware: `drone` from `source` to `destination`, through as
+        few metres of the `stations` as its battery allows - none if it can
+        fly straight there (see `engine.battery_mission`).
+
+        `best_station_route` raises `BatteryRouteError` (a ValueError) with
+        the reason when no chain of hops is flyable, before ENHSP runs.
+        ENHSP's optimal search (metric: metres flown) must come back with a
+        route exactly as short as that check's, landing and charging at
+        every station on it."""
+        pddl = [PddlLatLon(lat=p.lat, lon=p.lon) for p in (source, destination, *stations)]
+        src, dst, pads = pddl[0], pddl[1], pddl[2:]
+        expected = best_station_route(drone, src, dst, pads)
+        domain_path, template_path = self._plan_files(plan_name)
+        concrete_text = retarget_battery_problem(
+            template_path.read_text(encoding="utf-8"), drone, src, dst, pads
+        )
+
+        run_dir = self._start_run(plan_name, concrete_text)
+        steps, stdout = run_enhsp(
+            domain_path, run_dir / "problem.pddl", timeout_s=60.0,
+            extra_args=["-planner", "opt-hrmax"],
+        )
+        (run_dir / "plan.txt").write_text(stdout, encoding="utf-8")
+
+        stops = plan_stops(steps)
+        points = read_locations(concrete_text)
+
+        def route_cost(route: list[str]) -> float:
+            # The plan's metric: metres flown, plus 1 per station landed at.
+            return len(route) - 2 + sum(
+                hop_estimate(drone, points[a], points[b]).distance_m
+                for a, b in zip(route, route[1:])
+            )
+
+        if not stops or stops[0] != "source" or stops[-1] != "destination":
+            raise PlanNotFound(
+                "ENHSP's plan does not fly the drone from the source to the destination: "
+                + " -> ".join(stops or ["-"])
+            )
+        if route_cost(stops) > route_cost(expected) + 0.5:
+            raise PlanNotFound(
+                "ENHSP's route is not the shortest one the battery allows: "
+                + " -> ".join(stops) + " instead of " + " -> ".join(expected)
+            )
+        check_plan_charges(steps, stops)
+        if not any(s.action == "complete-mission" for s in steps):
+            raise PlanNotFound("ENHSP's plan never lands the drone at the destination.")
+
+        waypoints = [LatLon(lat=points[name].lat, lon=points[name].lon) for name in stops]
+        return PlanRunResult(
+            plan_name=plan_name,
+            steps=steps,
+            waypoints=waypoints,
+            location_names=stops,
+            run_dir=run_dir,
         )
 
     def _run_area(
@@ -1167,7 +1714,7 @@ class _Worker(QObject):
         )
 
     def _start_run(self, plan_name: str, concrete_text: str) -> Path:
-        run_dir = PLANS_DIR / plan_name / "runs" / time.strftime("%Y-%m-%d_%H%M%S")
+        run_dir = RESULTS_DIR / plan_name / "runs" / time.strftime("%Y-%m-%d_%H%M%S")
         run_dir.mkdir(parents=True, exist_ok=True)
         self._last_run_dir = run_dir
         (run_dir / "problem.pddl").write_text(concrete_text, encoding="utf-8")
@@ -1184,7 +1731,9 @@ class PlanService(QObject):
     _run_requested = Signal(str, object, object, object, int)
     _run_area_requested = Signal(str, object, object, int)
     _run_figure8_requested = Signal(str, object, object, object, object, int, int)
-    _run_show_requested = Signal(str, object, int, int)
+    _run_show_requested = Signal(str, object, object, int, int)
+    _run_battery_requested = Signal(str, object, object, object, object)
+    _run_task_requested = Signal(str, object, object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1197,7 +1746,12 @@ class PlanService(QObject):
         self._run_area_requested.connect(self._worker.run_area)
         self._run_figure8_requested.connect(self._worker.run_figure8)
         self._run_show_requested.connect(self._worker.run_show)
+        self._run_battery_requested.connect(self._worker.run_battery)
+        self._run_task_requested.connect(self._worker.run_task)
         self._thread.start()
+
+    def run_task_async(self, plan_name, source, destination, drones):
+        self._run_task_requested.emit(plan_name, source, destination, list(drones))
 
     def run_async(
         self,
@@ -1219,9 +1773,28 @@ class PlanService(QObject):
         self._run_area_requested.emit(plan_name, base, corners, drone_count)
 
     def run_show_async(
-        self, plan_name: str, source: LatLon, drone_count: int = MIN_STAR_DRONES, laps: int = 1
+        self,
+        plan_name: str,
+        source: LatLon,
+        drone_count: int = MIN_STAR_DRONES,
+        laps: int = 1,
+        destination: Optional[LatLon] = None,
     ) -> None:
-        self._run_show_requested.emit(plan_name, source, drone_count, laps)
+        """A drone show (the star show or the planets) flown from `source`
+        to `destination`."""
+        self._run_show_requested.emit(plan_name, source, destination, drone_count, laps)
+
+    def run_battery_async(
+        self,
+        plan_name: str,
+        source: LatLon,
+        destination: LatLon,
+        stations: list[LatLon],
+        drone,
+    ) -> None:
+        """A battery-aware mission for one `drone` (a DroneConfig): straight
+        there if its battery allows, otherwise via the `stations`."""
+        self._run_battery_requested.emit(plan_name, source, destination, list(stations), drone)
 
     def run_figure8_async(
         self,

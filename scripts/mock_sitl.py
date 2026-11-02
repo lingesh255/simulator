@@ -30,7 +30,7 @@ takeoff leg but still flies every leg after it correctly.
 Then in the GUI: check "Fly via real MAVLink (SITL/hardware)", leave the
 connection field at its default `udp:127.0.0.1:14550` (or match --port), and
 click Plan Mission. Everything the GUI sends prints here, live - compare the
-lat/lon against `plans/<name>/runs/<timestamp>/problem.pddl` for that run to
+lat/lon against `Swarm-Planning/Results/ENHSP/<name>/runs/<timestamp>/problem.pddl` for that run to
 confirm they match exactly.
 
 This also proves the *internal* pipeline (services.thread_backend /

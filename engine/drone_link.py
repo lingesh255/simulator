@@ -29,6 +29,7 @@ from engine.protocol import (
     AckMessage,
     CommandMessage,
     CommandName,
+    FragmentAssembler,
     HeartbeatMessage,
     MAX_DATAGRAM,
     ProtocolError,
@@ -38,6 +39,7 @@ from engine.protocol import (
 
 HEARTBEAT_INTERVAL_S = 1.0
 TELEMETRY_INTERVAL_S = 0.5
+RECEIVE_BUFFER_BYTES = 8 * 1024 * 1024
 
 # Wire command -> internal command. NAVIGATE expands to a small sequence,
 # handled separately below.
@@ -52,6 +54,7 @@ _DIRECT_COMMANDS = {
     CommandName.ABORT: CommandType.ABORT,
     CommandName.PING: CommandType.HEARTBEAT,
     CommandName.SHUTDOWN: CommandType.SHUTDOWN,
+    CommandName.TASK_DATA: CommandType.TASK_DATA,
 }
 
 
@@ -81,6 +84,9 @@ class DroneLink:
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Room for a whole fragmented command to wait between two polls.
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECEIVE_BUFFER_BYTES)
+        self._fragments = FragmentAssembler()
         self._sock.bind((host, self.port))
         self._sock.setblocking(False)
 
@@ -114,6 +120,15 @@ class DroneLink:
                 return commands
             except OSError:
                 return commands
+
+            if FragmentAssembler.is_fragment(raw):
+                try:
+                    raw = self._fragments.add(raw)
+                except ProtocolError as exc:
+                    self._send(AckMessage(self.sysid, "?", 0, False, str(exc)).to_json())
+                    continue
+                if raw is None:
+                    continue  # more pieces to come
 
             try:
                 message = CommandMessage.from_json(raw)
@@ -192,6 +207,12 @@ class DroneLink:
 
         if name is CommandName.SET_SPEED:
             return [Command(CommandType.SET_SPEED, {"speed_mps": float(message.params.get("speed_mps", 0.0))})]
+
+        if name is CommandName.CHARGE:
+            return [Command(CommandType.CHARGE, {
+                "rate_pct_per_s": float(message.params.get("rate_pct_per_s", 0.0)),
+                "to_pct": float(message.params.get("to_pct", 100.0)),
+            })]
 
         if name is CommandName.SET_GPS:
             available = bool(message.params.get("available", True))

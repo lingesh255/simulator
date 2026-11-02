@@ -60,6 +60,7 @@ class FirmwareState:
     mission_seq: int = 0
     mission_complete: bool = False
     landed: bool = False
+    charging: bool = False   # on the ground, plugged into a charging station
 
     @property
     def mode_name(self) -> str:
@@ -140,6 +141,9 @@ class SimulatedFlightController(FlightController):
 
         self.st = FirmwareState(lat=home_lat, lon=home_lon)
         self._consumed_mah = 0.0
+        # Charging at a station (see `charge`): percent per simulated second.
+        self._charge_rate_pct_s = 0.0
+        self._charge_to_pct = 100.0
         self._outbox: list = []
 
         # Mission storage and the upload conversation.
@@ -207,6 +211,8 @@ class SimulatedFlightController(FlightController):
                 self.st.armed = want_armed
                 if not want_armed:
                     self.st.ground_speed_mps = 0.0
+                else:
+                    self._stop_charging()  # unplugged for takeoff
             self.commands_seen.append(
                 f"ARM_DISARM({int(want_armed)})"
                 + ("" if result == mav2.MAV_RESULT_ACCEPTED else " DENIED")
@@ -221,7 +227,8 @@ class SimulatedFlightController(FlightController):
         elif command == mav2.MAV_CMD_DO_CHANGE_SPEED:
             # param2 = target speed (m/s); -1 / 0 means "no change".
             if message.param2 > 0:
-                self.cruise_speed_mps = max(0.1, float(message.param2))
+                # As low as a drone holding over its pad asks for (train_keeping.WAIT_MPS).
+                self.cruise_speed_mps = max(0.001, float(message.param2))
             self.commands_seen.append(f"DO_CHANGE_SPEED({message.param2:.1f})")
         elif command == mav2.MAV_CMD_NAV_RETURN_TO_LAUNCH:
             self.st.mode = MODE_RTL
@@ -293,6 +300,8 @@ class SimulatedFlightController(FlightController):
                 st.ground_speed_mps = 0.0
 
         if not st.armed:
+            if st.charging:
+                self._charge_step(dt)
             self._telemetry_burst()
             return
 
@@ -361,11 +370,17 @@ class SimulatedFlightController(FlightController):
                 continue
 
             remaining = _haversine_m(st.lat, st.lon, item.lat, item.lon)
+            # Height changes between waypoints are flown along the way, the
+            # way ArduPilot slopes between waypoints of different altitude.
+            # The level-off target follows, so the climb/descend-in-place
+            # check above doesn't stop the drone to chase the old height.
+            item_alt = item.alt if item.alt > 0 else st.relative_alt_m
             if remaining <= budget or remaining <= 1e-3:
                 budget -= remaining
                 if remaining > 1e-3:
                     st.heading_deg = _bearing_deg(st.lat, st.lon, item.lat, item.lon)
                 st.lat, st.lon = item.lat, item.lon
+                self._fly_to_alt(item_alt, dt)
                 st.mission_seq += 1
                 if st.mission_seq >= len(self._mission):
                     st.mission_complete = True
@@ -384,8 +399,17 @@ class SimulatedFlightController(FlightController):
             st.heading_deg = _bearing_deg(st.lat, st.lon, item.lat, item.lon)
             st.lat += (item.lat - st.lat) * fraction
             st.lon += (item.lon - st.lon) * fraction
+            self._fly_to_alt(st.relative_alt_m + (item_alt - st.relative_alt_m) * fraction, dt)
             st.ground_speed_mps = self.cruise_speed_mps
             return
+
+    def _fly_to_alt(self, alt: float, dt: float) -> None:
+        """Move to height `alt` while flying a mission leg."""
+        st = self.st
+        if dt > 0:
+            st.vertical_speed_mps = (alt - st.relative_alt_m) / dt
+        st.relative_alt_m = alt
+        self._target_alt_m = alt
 
     def _descend(self, dt: float) -> None:
         st = self.st
@@ -416,6 +440,30 @@ class SimulatedFlightController(FlightController):
             0, st.gps_fix_type, int(st.lat * 1e7), int(st.lon * 1e7),
             int(st.relative_alt_m * 1000), 100, 100,
             int(st.ground_speed_mps * 100), int(st.heading_deg * 100), 12))
+
+    # ---- Charging at a station ----
+
+    def charge(self, rate_pct_per_s: float, to_pct: float = 100.0) -> None:
+        """Plug a charger in: while landed and disarmed the battery rises by
+        `rate_pct_per_s` per simulated second, up to `to_pct`. Refused in
+        the air - the drone has to land at the station first."""
+        if self.st.armed or not self.st.landed or rate_pct_per_s <= 0:
+            return
+        self._charge_rate_pct_s = float(rate_pct_per_s)
+        self._charge_to_pct = max(0.0, min(100.0, float(to_pct)))
+        self.st.charging = self.st.battery_pct < self._charge_to_pct
+        self.commands_seen.append(f"CHARGE({rate_pct_per_s:.3f}%/s)")
+
+    def _charge_step(self, dt: float) -> None:
+        st = self.st
+        st.battery_pct = min(self._charge_to_pct, st.battery_pct + self._charge_rate_pct_s * dt)
+        self._consumed_mah = self.battery_capacity_mah * (1.0 - st.battery_pct / 100.0)
+        if st.battery_pct >= self._charge_to_pct:
+            self._stop_charging()
+
+    def _stop_charging(self) -> None:
+        self.st.charging = False
+        self._charge_rate_pct_s = 0.0
 
     # ---- Fault injection against the firmware, not the model above it ----
 

@@ -1,15 +1,19 @@
 """Star drone show: geometry, timed tracks and PDDL problem editing.
 
-    plans/starformation/problem.pddl (template)
+    Swarm-Planning/Plans/starformation/problem.pddl (template)
         -> expand_star_drones          (one formation slot per checked drone)
-        -> retarget_star_show_problem  (the picked source, the lap count)
-        -> ENHSP plans the show's sequence of shapes
+        -> retarget_star_show_problem  (source, destination, lap count and
+                                        every drone's turn to go and return)
+        -> ENHSP plans the drones' turns and the show's sequence of shapes
         -> plan_star_show: every drone's own timed track
 
-A drone show in one place, round the picked source - no destination:
+A drone show flown from the picked SOURCE to the picked DESTINATION:
 
-    take off       from a compact ring of 10 m pads round the source
-    form circle    spread out from the pads into a circle
+    take off       from a grid of 10 m pads in rows at the source
+    fly out        ONE BY ONE: each drone leaves its pad, flies out of the
+                   pad block to the corridor's source end, along the
+                   corridor to just short of the show and on to its own
+                   place on the circle round the destination
     then, every lap:
         form star      every drone slides to its place on a star
         form circle    ... and back to the circle
@@ -18,8 +22,17 @@ A drone show in one place, round the picked source - no destination:
         form star      into the star again
         spin star      the whole star turns once round its centre
         form circle    back to the circle, ready for the next lap
-    land           spread back in from the circle onto the pads and land
-                   exactly where each drone took off
+    fly back       ONE BY ONE, the same way in reverse: each drone leaves
+                   its place, flies the corridor back to the source and
+                   lands on the pad it took off from
+
+ONE BY ONE. Every drone flies the same corridor between the pad block's
+front (the side facing the destination) and the circle's near side, one
+`TRANSIT_GAP_M` behind the one before. The front pads leave first - so no
+drone flies over a pad still waiting - and the circle fills from its FAR
+side: a drone flying in to its place only ever crosses places still empty.
+The way back is exactly the way out played backwards: near side of the
+circle first, landing on the back pads first.
 
 THE SHAPES keep every drone in the same ORDER round the centre: the
 circle's drones are evenly spaced round it, in the same order as their
@@ -28,19 +41,19 @@ matching place without the order ever changing. The star has
 `star_points` tips (5 from 10 drones up, fewer for a smaller swarm, so it
 still reads as a star); its tips and inner corners are filled first, any
 further drones spread evenly along its edges. The circle runs through the
-star's tips. Take-off pads are laid out in rings round the source, so every
-drone has a clear direction to spread out in. The whole show is sized up
-from the smallest it could be until every two drones are at least
-`STAR_SPACING_M` apart on the circle and on the star, and at least 90% of
-that at every moment of the moves between pads, circle and star
-(`_size_formation`). A spin turns the whole shape rigidly - every drone at
-the same angular speed round the centre - so the gaps never change.
+star's tips. The whole show is sized up from the smallest it could be until
+every two drones are at least `STAR_SPACING_M` apart on the circle and on
+the star, and at least 90% of that at every moment of the moves between
+circle and star (`_size_formation`). A spin turns the whole shape rigidly -
+every drone at the same angular speed round the centre - so the gaps never
+change.
 
 TIMING. Every drone flies a timetable against one shared clock (see
 `engine.train_keeping`): keyframes "at clock time t, be s metres along my
-route". Every phase has the same start and end time for every drone - so
-each shape forms all at once, each spin turns as one, and they all land
-together. Clock units are nominal seconds at `SCHEDULE_UNIT_MPS`; the
+route". Flying out and back each drone has its own times, one gap after
+the one before; every show phase has the same start and end time for
+every drone - so each shape forms all at once and each spin turns as
+one. Clock units are nominal seconds at `SCHEDULE_UNIT_MPS`; the
 ground station runs the clock as fast as the slowest drone allows. One lap
 is uploaded once and repeated on board (`TrainRoute.loop` x laps), so even
 many laps are one short mission upload.
@@ -73,7 +86,8 @@ MAX_STAR_POINTS = 5
 STAR_INNER_RATIO = 0.45        # inner corners' radius, as a fraction of the tips'
 CIRCLE_HOLD_S = 6.0            # nominal seconds each circle is held
 STAR_HOLD_S = 4.0              # ... and each star
-SPREAD_SPEED = 0.6             # pads <-> circle, as a fraction of full speed
+TRANSIT_SPEED = 0.8            # source <-> destination, as a fraction of full speed
+TRANSIT_GAP_M = 3 * STAR_SPACING_M  # one drone behind the next, flying out and back
 MORPH_SPEED = 0.5              # circle <-> star, as a fraction of full speed
 SPIN_SPEED = 0.6               # spins: the outermost drones' speed, as a fraction of full speed
 SPIN_STEP_DEG = 10.0           # a spin is flown as waypoints this many degrees apart
@@ -152,35 +166,41 @@ def _min_distance_moving(a: list, b: list, steps: int = 20) -> float:
     return best
 
 
-def _pad_offsets(drone_count: int) -> list[tuple[float, float]]:
-    """Take-off pads in rings round the source (east, north metres): ring k
-    at k spacings out, holding as many pads as fit a spacing apart - so
-    every pad has its own direction from the centre to spread out along."""
+def grid_pad_offsets(
+    drone_count: int, toward: tuple[float, float] = (0.0, 1.0), spacing: float = STAR_SPACING_M
+) -> list[tuple[float, float]]:
+    """Take-off pads as a ground crew lays them out: a roughly square grid
+    of rows, `spacing` apart, centred on the source (east, north metres),
+    its rows square to `toward` (a unit vector, the way the drones head
+    off). The column count is odd, so a column of pads runs straight down
+    the centre line. Rows fill from the front (the `toward` side), each from
+    the centre outwards, so a partly filled back row sits centred."""
+    cols = max(1, math.ceil(math.sqrt(drone_count)))
+    cols += 1 - cols % 2
+    rows = math.ceil(drone_count / cols)
+    left = (-toward[1], toward[0])
+    centre = (cols - 1) / 2.0
     pads: list[tuple[float, float]] = []
-    k = 1
-    while len(pads) < drone_count:
-        take = min(int(2 * math.pi * k), drone_count - len(pads))
-        twist = 0.5 * (k % 2)
-        r = k * STAR_SPACING_M
-        pads += [
-            (r * math.cos(2 * math.pi * (j + twist) / take), r * math.sin(2 * math.pi * (j + twist) / take))
-            for j in range(take)
-        ]
-        k += 1
-    return pads
+    for row in range(rows):
+        along = ((rows - 1) / 2.0 - row) * spacing
+        for c in sorted((c - centre for c in range(cols)), key=lambda c: (abs(c), c)):
+            across = c * spacing
+            pads.append((toward[0] * along + left[0] * across, toward[1] * along + left[1] * across))
+    return pads[:drone_count]
 
 
-def _size_formation(drone_count: int, pads_local: list[tuple[float, float]],
-                    to_world) -> tuple[float, list, list, list]:
+def grid_pad_reach(drone_count: int, spacing: float = STAR_SPACING_M) -> float:
+    """How far the furthest pad of `grid_pad_offsets` is from the source -
+    the same whichever way the grid faces."""
+    return max(math.hypot(*p) for p in grid_pad_offsets(drone_count, spacing=spacing))
+
+
+def _size_formation(drone_count: int) -> tuple[float, list, list]:
     """Smallest tip radius at which the star and the circle keep every two
-    drones `STAR_SPACING_M` apart, and the moves pads -> circle -> star keep
-    them at least `_MIN_FRACTION` of that apart. Pads are matched to circle
-    places in angle order, at whichever rotation of that matching keeps the
-    spread-out widest. Returns (radius, star, circle, pad index per slot)."""
+    drones `STAR_SPACING_M` apart, and the moves circle <-> star keep them
+    at least `_MIN_FRACTION` of that apart. Returns (radius, star, circle)."""
     n = drone_count
-    pad_reach = max((math.hypot(*p) for p in pads_local), default=0.0)
-    radius = max(STAR_SPACING_M / (2 * math.sin(math.pi / n)), pad_reach + STAR_SPACING_M, 2 * STAR_SPACING_M)
-    pads_by_angle = sorted(range(n), key=lambda i: math.atan2(pads_local[i][1], pads_local[i][0]))
+    radius = max(STAR_SPACING_M / (2 * math.sin(math.pi / n)), 2 * STAR_SPACING_M)
     while True:
         star = _star_slots(n, radius)
         circle = _circle_slots(star, radius)
@@ -189,19 +209,34 @@ def _size_formation(drone_count: int, pads_local: list[tuple[float, float]],
             and _min_distance(circle) >= STAR_SPACING_M - 1e-6
             and _min_distance_moving(circle, star) >= _MIN_FRACTION * STAR_SPACING_M
         ):
-            circle_world = [to_world(p) for p in circle]
-            slots_by_angle = sorted(range(n), key=lambda i: math.atan2(circle_world[i][1], circle_world[i][0]))
-            best = None
-            for shift in range(n):
-                pad_of = [0] * n
-                for k, slot in enumerate(slots_by_angle):
-                    pad_of[slot] = pads_by_angle[(k + shift) % n]
-                spread = _min_distance_moving([pads_local[pad_of[i]] for i in range(n)], circle_world, 12)
-                if best is None or spread > best[0]:
-                    best = (spread, pad_of)
-            if best[0] >= _MIN_FRACTION * STAR_SPACING_M:
-                return radius, star, circle, best[1]
+            return radius, star, circle
         radius += 2.0
+
+
+def _pad_reach(drone_count: int) -> float:
+    return grid_pad_reach(drone_count)
+
+
+def star_show_min_distance_m(drone_count: int) -> float:
+    """How far the destination must be from the source for this many
+    drones: the pad block and the show's circle clear of each other, with
+    the corridor between them at least a gap long."""
+    radius = _size_formation(drone_count)[0]
+    return _pad_reach(drone_count) + radius + 2 * STAR_SPACING_M + TRANSIT_GAP_M
+
+
+def star_show_distance_error(source: LatLon, destination: LatLon, drone_count: int) -> str | None:
+    """The operator-facing reason the destination is too close to the
+    source for this many drones, or None."""
+    span = math.hypot(*_to_local(destination, source))
+    needed = star_show_min_distance_m(drone_count)
+    if span >= needed:
+        return None
+    return (
+        f"The destination is {span:.0f} m from the source - a star show with "
+        f"{drone_count} drones needs it at least {math.ceil(needed)} m away, so the "
+        f"take-off pads and the show's circle are well clear of each other."
+    )
 
 
 # ---- The show -------------------------------------------------------------------
@@ -218,6 +253,8 @@ class StarShow:
     pads: list[LatLon]                  # each drone's take-off and landing pad, same order
     circle: list[LatLon]
     star: list[LatLon]
+    arrival_order: list[str]            # drone names in the order they fly out
+    return_order: list[str]             # ... and the order they fly back
 
     def preview_shape(self) -> list[LatLon]:
         """The star, for drawing on the map."""
@@ -256,26 +293,33 @@ def _arc(centre_angle_from: float, radius: float, turns_deg: float) -> list[tupl
     ]
 
 
-def plan_star_show(source: LatLon, drone_count: int, laps: int = 1) -> StarShow:
-    """Every drone's timed track for a star show round `source` - see the
-    module doc. Raises ValueError for an unflyable drone or lap count."""
+def plan_star_show(source: LatLon, destination: LatLon, drone_count: int, laps: int = 1) -> StarShow:
+    """Every drone's timed track for a star show at `destination`, flown
+    out from and back to pads at `source` - see the module doc. Raises
+    ValueError for an unflyable drone or lap count, or a destination too
+    close to the source."""
     problem = star_drone_count_error(drone_count)
     if problem:
         raise ValueError(problem)
     if not 1 <= laps <= MAX_SHOW_LAPS:
         raise ValueError(f"Laps must be between 1 and {MAX_SHOW_LAPS}, got {laps}.")
 
-    # The star stands with a tip pointing north: formation frame (x forward,
-    # y left) -> local (east, north).
-    def to_world(p):
-        return (-p[1], p[0])
-
+    # Everything in local (east, north) metres from the source. The star
+    # stands with a tip pointing north: formation frame (x forward, y left)
+    # -> local, round the destination.
+    problem = star_show_distance_error(source, destination, drone_count)
+    if problem:
+        raise ValueError(problem)
     n = drone_count
-    pads = _pad_offsets(n)
-    radius, star_f, circle_f, pad_of = _size_formation(n, pads, to_world)
+    centre = _to_local(destination, source)
+    span = math.hypot(*centre)
+
+    def to_world(p):
+        return (centre[0] - p[1], centre[1] + p[0])
+
+    radius, star_f, circle_f = _size_formation(n)
     star = [to_world(p) for p in star_f]
     circle = [to_world(p) for p in circle_f]
-    pad_xy = [pads[pad_of[i]] for i in range(n)]
     unit = SCHEDULE_UNIT_MPS
 
     def dist(a, b):
@@ -284,16 +328,61 @@ def plan_star_show(source: LatLon, drone_count: int, laps: int = 1) -> StarShow:
     def polyline_m(points):
         return sum(dist(a, b) for a, b in zip(points, points[1:]))
 
-    # Shared phase lengths (nominal seconds) - the same for every drone.
-    t_spread = max(dist(a, b) for a, b in zip(pad_xy, circle)) / (SPREAD_SPEED * unit)
+    # The corridor: from just ahead of the pad block to just short of the
+    # circle, on the line source -> destination.
+    ux, uy = centre[0] / span, centre[1] / span
+    pads = grid_pad_offsets(n, (ux, uy))
+
+    def ahead(p):
+        return p[0] * ux + p[1] * uy
+
+    def across(p):
+        return p[1] * ux - p[0] * uy
+
+    corridor_start = (ux * (_pad_reach(n) + 2 * STAR_SPACING_M), uy * (_pad_reach(n) + 2 * STAR_SPACING_M))
+    corridor_end = (centre[0] - ux * (radius + STAR_SPACING_M), centre[1] - uy * (radius + STAR_SPACING_M))
+
+    # Out: the pads nearest the corridor first - so every pad still waiting
+    # is further from the corridor than the drone leaving, and never on its
+    # way - into the circle's far side first. The k-th drone to leave takes
+    # the k-th place to fill.
+    pads_out = sorted(range(n), key=lambda j: (dist(pads[j], corridor_start), across(pads[j])))
+    slots_in = sorted(range(n), key=lambda i: (-ahead((circle[i][0] - centre[0], circle[i][1] - centre[1])),
+                                               across((circle[i][0] - centre[0], circle[i][1] - centre[1]))))
+    pad_of = [0] * n
+    turn_of = [0] * n
+    for k, (slot, pad) in enumerate(zip(slots_in, pads_out)):
+        pad_of[slot] = pad
+        turn_of[slot] = k
+    pad_xy = [pads[pad_of[i]] for i in range(n)]
+
+    v = TRANSIT_SPEED * unit
+    gap_t = TRANSIT_GAP_M / v
+    to_corridor = [dist(pad_xy[i], corridor_start) for i in range(n)]
+    corridor_m = dist(corridor_start, corridor_end)
+    to_slot = [dist(corridor_end, circle[i]) for i in range(n)]
+    # Drone k (in turn) enters the corridor at k gaps after the first.
+    enter_0 = max(to_corridor) / v
+    show_start = max(enter_0 + turn_of[i] * gap_t + (corridor_m + to_slot[i]) / v for i in range(n)) + CIRCLE_HOLD_S
+
+    # Shared show phase lengths (nominal seconds) - the same for every drone.
     t_morph = max(dist(a, b) for a, b in zip(circle, star)) / (MORPH_SPEED * unit)
     t_spin = 2 * math.pi * radius / (SPIN_SPEED * unit)   # one full turn, tips at spin speed
+    lap_times = [t_morph, t_morph, t_spin, t_morph, t_spin, t_morph]
+    holds = [STAR_HOLD_S, CIRCLE_HOLD_S, CIRCLE_HOLD_S, STAR_HOLD_S, STAR_HOLD_S, CIRCLE_HOLD_S]
+    show_end = show_start + laps * (sum(lap_times) + sum(holds))
+    # Back: the last in leaves first, drone k (in its return turn) entering
+    # the corridor k gaps after the first.
+    leave_0 = show_end + max(to_slot) / v
 
     routes: dict[str, TrainRoute] = {}
-    for i, name in enumerate(star_drone_names(n)):
+    names = star_drone_names(n)
+    for i, name in enumerate(names):
         c, st = circle[i], star[i]
-        circle_spin = _arc(math.atan2(c[1], c[0]), radius, 360.0)
-        star_spin = _arc(math.atan2(st[1], st[0]), math.hypot(*st), 360.0)
+        circle_spin = _arc(math.atan2(c[1] - centre[1], c[0] - centre[0]), radius, 360.0)
+        star_spin = _arc(math.atan2(st[1] - centre[1], st[0] - centre[0]), dist(centre, st), 360.0)
+        circle_spin = [(centre[0] + x, centre[1] + y) for x, y in circle_spin]
+        star_spin = [(centre[0] + x, centre[1] + y) for x, y in star_spin]
         star_spin[-1] = st           # exactly back on its place
         circle_spin[-1] = c
         # One lap, starting and ending on the drone's place on the circle.
@@ -306,14 +395,21 @@ def plan_star_show(source: LatLon, drone_count: int, laps: int = 1) -> StarShow:
             polyline_m([st, *star_spin]),      # spin star
             dist(st, c),                       # form circle
         ]
-        lap_times = [t_morph, t_morph, t_spin, t_morph, t_spin, t_morph]
-        holds = [STAR_HOLD_S, CIRCLE_HOLD_S, CIRCLE_HOLD_S, STAR_HOLD_S, STAR_HOLD_S, CIRCLE_HOLD_S]
 
+        # Out, in its turn: wait over the pad, then pad -> corridor -> place.
+        enter = enter_0 + turn_of[i] * gap_t
         keys = [(0.0, 0.0)]
-        t = t_spread
-        s_m = dist(pad_xy[i], c)
-        keys.append((t, s_m))
-        t += CIRCLE_HOLD_S
+        s_m = 0.0
+        for t, length in (
+            (enter - to_corridor[i] / v, 0.0),
+            (enter, to_corridor[i]),
+            (enter + corridor_m / v, corridor_m),
+            (enter + (corridor_m + to_slot[i]) / v, to_slot[i]),
+        ):
+            s_m += length
+            if t > keys[-1][0]:
+                keys.append((t, s_m))
+        t = show_start
         keys.append((t, s_m))
         for _lap in range(laps):
             for length, move_t, hold in zip(lap_lengths, lap_times, holds):
@@ -322,19 +418,28 @@ def plan_star_show(source: LatLon, drone_count: int, laps: int = 1) -> StarShow:
                 keys.append((t, s_m))
                 t += hold
                 keys.append((t, s_m))
-        s_m += dist(c, pad_xy[i])
-        t += t_spread
-        keys.append((t, s_m))
+        # Back, in its turn: wait in place, then place -> corridor -> pad.
+        leave = leave_0 + (n - 1 - turn_of[i]) * gap_t
+        for t, length in (
+            (leave - to_slot[i] / v, 0.0),
+            (leave, to_slot[i]),
+            (leave + corridor_m / v, corridor_m),
+            (leave + (corridor_m + to_corridor[i]) / v, to_corridor[i]),
+        ):
+            s_m += length
+            if t > keys[-1][0]:
+                keys.append((t, s_m))
 
         routes[name] = TrainRoute(
             start=_from_local(pad_xy[i], source),
-            approach=[_from_local(c, source)],
+            approach=[_from_local(p, source) for p in (corridor_start, corridor_end, c)],
             loop=[_from_local(p, source) for p in lap],
             laps=laps,
-            depart=[_from_local(pad_xy[i], source)],
+            depart=[_from_local(p, source) for p in (corridor_end, corridor_start, pad_xy[i])],
             schedule=tuple(keys),
         )
 
+    arrival_order = [names[slot] for slot in slots_in]
     return StarShow(
         drone_count=n,
         laps=laps,
@@ -343,6 +448,8 @@ def plan_star_show(source: LatLon, drone_count: int, laps: int = 1) -> StarShow:
         pads=[_from_local(p, source) for p in pad_xy],
         circle=[_from_local(p, source) for p in circle],
         star=[_from_local(p, source) for p in star],
+        arrival_order=arrival_order,
+        return_order=arrival_order[::-1],
     )
 
 
@@ -401,7 +508,19 @@ def _set_scalar_fluent(problem_text: str, fluent: str, value: float) -> str:
     return result
 
 
-def retarget_star_show_problem(problem_text: str, source: LatLon, laps: int) -> str:
+def retarget_star_show_problem(problem_text: str, source: LatLon, destination: LatLon,
+                               laps: int, show: StarShow) -> str:
     """Put an (already expanded) star-show problem at the picked source and
-    ask for `laps` laps."""
-    return _set_scalar_fluent(_set_latlon(problem_text, "source", source), "laps-required", laps)
+    destination, ask for `laps` laps, and give every drone its turn to fly
+    out and back in `show`'s order."""
+    result = _set_latlon(_set_latlon(problem_text, "source", source), "destination", destination)
+    # The template's (and its cloned) turns only describe the smallest
+    # case - rebuild both chains: first drone's turn, then who follows whom.
+    facts = []
+    for turn, after, order in (("out-turn", "out-after", show.arrival_order),
+                               ("back-turn", "back-after", show.return_order)):
+        result = re.sub(rf"[ \t]*\({turn}\s+\S+\)\n?", "", _strip_pair_facts(result, after))
+        facts.append(f"\n        ({turn} {order[0]})")
+        facts += [f"\n        ({after} {a} {b})" for a, b in zip(order, order[1:])]
+    result = _add_init_facts(result, "".join(facts))
+    return _set_scalar_fluent(result, "laps-required", laps)

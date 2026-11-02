@@ -201,7 +201,7 @@ def extract_multi_route(steps: list[PlanStep], drones: list[str]) -> dict[str, l
 def extract_formation_corridor(steps: list[PlanStep]) -> list[str]:
     """The ordered location chain a V-formation flies, from its
     `(formation-cruise <lead> <from> <to>)` legs (the `v-formation-drone-mission`
-    domain - see `plans/vformation/`).
+    domain - see `Swarm-Planning/Plans/vformation/`).
 
     Only the apex leg is planned in PDDL; both wings hold station off it, so
     the plan carries just this one corridor and the wings' parallel tracks

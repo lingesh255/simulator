@@ -254,8 +254,11 @@ class CommandInterpreter:
         items = [self._item(0, mav2.MAV_CMD_NAV_TAKEOFF, altitude_m=altitude_m)]
 
         def add(points: list[Position]) -> None:
+            # A point may carry its own height (e.g. the figure-8 dipping
+            # under its own crossing); otherwise the route's altitude.
             for point in points:
-                items.append(self._item(len(items), mav2.MAV_CMD_NAV_WAYPOINT, point.lat, point.lon, altitude_m))
+                alt = point.alt_m if point.alt_m and point.alt_m > 0 else altitude_m
+                items.append(self._item(len(items), mav2.MAV_CMD_NAV_WAYPOINT, point.lat, point.lon, alt))
 
         add(approach)
         loop_start = len(items)

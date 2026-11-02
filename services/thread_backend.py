@@ -27,6 +27,7 @@ from contracts.gui_orchestration import (
     LatLon,
     SwarmTelemetryBatch,
 )
+from engine.battery_mission import FULL_CHARGE_S, MAX_BATTERY_PCT
 from engine.drone_link import DroneLink
 from engine.drone_thread import (
     ARRIVAL_RADIUS_M,
@@ -43,10 +44,15 @@ from engine.fleet import DroneFleet
 from engine.gcs import GroundControlStation
 from engine.protocol import CommandName
 from engine.terrain import plan_terrain_profile
+from engine.task_allocation import TaskAllocation
 from engine.train_keeping import SCHEDULE_UNIT_MPS, RouteTracker, schedule_at
-from services.local_flight import EmergencyLanding, nearest_point, plan_flights
+from services.local_flight import EmergencyLanding, nearest_point, plan_flights, plan_route_flights
 
 POLL_MS = 100
+
+# A battery-aware mission (start_charging_mission) only counts a landing as
+# reaching its charging station if it is this close to it.
+CHARGE_STOP_RADIUS_M = 30.0
 
 # Train formation keeping (see ThreadSwarmBackend._keep_train_spacing).
 TRAIN_CRUISE_FRACTION = 0.8   # train speed, as a fraction of its slowest drone's top speed
@@ -204,6 +210,12 @@ class ThreadSwarmBackend(QObject):
     gps_restored = Signal(int)
     retargeted = Signal(int)
     link_failed = Signal(str)
+    # A battery-aware mission (start_charging_mission): sysid, station name,
+    # battery percent, and the percent it is being charged to - on landing
+    # at a station, and once charged and taking off.
+    charging_started = Signal(int, str, float, float)
+    charging_finished = Signal(int, str, float, float)
+    task_event = Signal(str)
 
     def __init__(self, parent=None, time_scale: float = 20.0, use_firmware: bool = True):
         super().__init__(parent)
@@ -226,6 +238,15 @@ class ThreadSwarmBackend(QObject):
         # mission, so it's computed once in start_mission_path.
         self._altitudes: dict[int, list[float]] = {}
         self._train: Optional[_TrainState] = None
+        self._task: Optional[TaskAllocation] = None
+        # A battery-aware mission: per drone, the stops still ahead of it as
+        # (name, point, percent to charge to there - None at the
+        # destination) - the first is the one it is flying to now - and
+        # which drones are on the ground charging (sysid -> station name) or
+        # have left the ground since their current hop was sent.
+        self._charge_stops: dict[int, list[tuple[str, LatLon, Optional[float]]]] = {}
+        self._charging: dict[int, str] = {}
+        self._hop_airborne: set[int] = set()
         self._time_scale = time_scale
         self._default_time_scale = time_scale
         self._elapsed_s = 0.0
@@ -246,7 +267,19 @@ class ThreadSwarmBackend(QObject):
         return self._timer.isActive()
 
     def is_active(self) -> bool:
-        return bool(self._views) and not all(v.is_done for v in self._views.values())
+        return bool(self._views) and not all(self._mission_over(s) for s in self._views)
+
+    def _mission_over(self, sysid: int) -> bool:
+        """Down and going nowhere else - not just landed at a charging station
+        with more of its route still to fly."""
+        view = self._views[sysid]
+        if self._task is not None:
+            if not self._task.done:
+                return False
+            return view.is_done or view._snap.mission_state is MissionState.IDLE
+        if not view.is_done:
+            return False
+        return view.is_lost or not self._charge_stops.get(sysid)
 
     @property
     def time_scale(self) -> float:
@@ -310,6 +343,266 @@ class ThreadSwarmBackend(QObject):
             flags.clear()
         self._timer.start()
         return True
+
+    def start_task_allocation(self, drones, waypoints, initial_drone="drone1") -> bool:
+        """Spawn all four at source; send flight commands only to the owner."""
+        self.stop()
+        if len(drones) != 4 or len({d.sysid for d in drones}) != 4 or len(waypoints) < 2:
+            return False
+        points, _ = plan_terrain_profile(waypoints)
+        eligible = {f.config.sysid for f in plan_route_flights(drones, points) if f.feasible}
+        initial = drones[int(initial_drone.removeprefix("drone")) - 1].sysid
+        if initial not in eligible:
+            self.link_failed.emit("The planned initial drone cannot fly this route; plan the mission again.")
+            return False
+        self._gcs = GroundControlStation(verbose=False)
+        self._gcs.start()
+        self._fleet = DroneFleet()
+        self._destination = waypoints[-1]
+        for drone in drones:
+            if not self._spawn_drone(drone, waypoints[0]):
+                self.stop()
+                return False
+        self._gcs.register_many(self._views)
+        self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
+        self._task = TaskAllocation(
+            source=waypoints[0], destination=waypoints[-1], active=initial,
+            standby=[d.sysid for d in drones if d.sysid != initial], eligible=eligible,
+        )
+        self._task.data = {
+            "generation": 0, "source": [waypoints[0].lat, waypoints[0].lon],
+            "destination": [waypoints[-1].lat, waypoints[-1].lon], "owner": initial,
+        }
+        self._send(initial, CommandName.TASK_DATA, **self._task.data)
+        self._fly_hop(initial, waypoints[0], waypoints[-1])
+        self._elapsed_s = 0.0
+        self._tick = 0
+        self._paused = False
+        for flags in (self._flagged_low, self._flagged_gps, self._flagged_lost, self._emergency):
+            flags.clear()
+        self._task_log(f"Task-Allocation: SYSID {initial} launched; three drones wait at the source.")
+        self._timer.start()
+        return True
+
+    def _task_log(self, message):
+        self._task.message = message
+        self.task_event.emit(message)
+
+    def _task_issue(self, sysid, snap):
+        if sysid in self._task.faults:
+            return self._task.faults[sysid][0].value
+        if snap.mission_state in (MissionState.FAILED, MissionState.ABORTED):
+            return "drone unavailable"
+        if not snap.gps_available:
+            return "GPS loss"
+        if snap.battery <= LOW_BATTERY_PCT:
+            return "low battery"
+        return None
+
+    def _standby_unavailable_reason(self, sysid, snapshots) -> str:
+        """Why standby `sysid` can't take the task over, for the operator."""
+        task = self._task
+        snap = snapshots.get(sysid)
+        if sysid not in task.eligible:
+            flight = plan_route_flights(
+                [self._views[sysid].config], [task.source, task.destination]
+            )[0]
+            return (
+                f"SYSID {sysid}'s battery ({flight.config.battery_capacity_mah:,.0f} mAh) flies "
+                f"about {flight.range_m / 1000:.1f} km, the route from the source needs "
+                f"{flight.distance_m / 1000:.1f} km"
+            )
+        if snap is None:
+            return f"SYSID {sysid} is not reporting"
+        issue = self._task_issue(sysid, snap)
+        if issue:
+            return f"SYSID {sysid} has {issue}"
+        if snap.mission_state not in (MissionState.IDLE, MissionState.LANDED):
+            return f"SYSID {sysid} is not on the ground at the source"
+        return f"SYSID {sysid} no longer has the charge to reach the destination"
+
+    def _retire_task_drone(self, sysid):
+        self._task.retired.add(sysid)
+        self._paths.pop(sysid, None)
+        self._leg_index.pop(sysid, None)
+        if not self._views[sysid].is_done:
+            self._send(sysid, CommandName.LAND)
+
+    def _service_task_allocation(self, snapshots):
+        task = self._task
+        if task.done:
+            return
+        for sysid, (fault, until) in list(task.faults.items()):
+            if until is not None and self._elapsed_s >= until:
+                del task.faults[sysid]
+                if fault is FaultType.GPS_LOSS:
+                    self._send(sysid, CommandName.SET_GPS, available=True)
+        snap = snapshots.get(task.active)
+        if snap is None:
+            return
+        target = Position(lat=task.destination.lat, lon=task.destination.lon)
+        # Close allocation as soon as the owner reaches the destination.
+        if (task.pending is None and task.active not in task.retired
+                and snap.mission_state in (MissionState.LANDING, MissionState.LANDED)
+                and engine_haversine(snap.position, target) <= CHARGE_STOP_RADIUS_M):
+            task.done = True
+            task.winner = task.active
+            self._task_log(f"Task-Allocation complete: SYSID {task.active} reached the destination. No more drones will launch.")
+            return
+        if task.pending is not None:
+            new = snapshots.get(task.pending)
+            if new is None:
+                return
+            issue = self._task_issue(task.pending, new)
+            if issue or time.monotonic() - task.pending_since > 20:
+                self._task_log(f"SYSID {task.pending} could not take over ({issue or 'handoff timeout'}); selecting another standby.")
+                self._retire_task_drone(task.pending)
+                task.pending = None
+            elif new.position.alt_m > 1.0:
+                # Relay the old drone's latest state over UDP while the
+                # replacement is airborne; wait for its stored receipt.
+                if new.task_data.get("generation") != task.generation:
+                    self._send(task.pending, CommandName.TASK_DATA, **task.data)
+                    return
+                old, replacement = task.active, task.pending
+                task.active, task.pending = replacement, None
+                self._retire_task_drone(old)
+                self._fly_hop(replacement, task.source, task.destination)
+                self._task_log(f"SYSID {old} -> SYSID {replacement}: mission data received in flight; responsibility transferred. SYSID {old} lands.")
+                return
+            else:
+                return
+        issue = self._task_issue(task.active, snap)
+        if task.active not in task.retired and not issue:
+            return
+        candidates = [s for s in task.standby if s in task.eligible
+                      and s in snapshots and not self._task_issue(s, snapshots[s])
+                      and snapshots[s].mission_state in (MissionState.IDLE, MissionState.LANDED)
+                      and self._views[s].can_reach(task.destination)]
+        if not candidates:
+            task.done = True
+            self._retire_task_drone(task.active)
+            reasons = "; ".join(self._standby_unavailable_reason(s, snapshots) for s in task.standby)
+            self._task_log(
+                f"Task-Allocation failed: SYSID {task.active} reports {issue or 'a failed handoff'} and "
+                f"no standby can take over - " + (reasons or "every drone has already been used") + "."
+            )
+            return
+        new = candidates[0]
+        task.retired.add(task.active)  # never reuse an owner after a fault
+        task.standby.remove(new)
+        task.pending = new
+        task.pending_since = time.monotonic()
+        task.generation += 1
+        task.data = {
+            **task.data, "generation": task.generation, "owner": new,
+            "previous_owner": task.active,
+            "last_position": [snap.position.lat, snap.position.lon, snap.position.alt_m],
+            "reason": issue or "previous handoff failed",
+        }
+        self._paths.pop(task.active, None)
+        if not self._views[task.active].is_done:
+            self._send(task.active, CommandName.HOLD)
+        # Take off vertically at source; continue only after receiving data.
+        self._gcs.navigate(new, [task.source.lat, task.source.lon, 0.0],
+                           [task.source.lat, task.source.lon, 5.0], final=False)
+        cached = issue in ("comms_loss", "drone unavailable")
+        self._task_log(f"SYSID {task.active} reports {issue}; SYSID {new} launches from source. "
+                       + ("Using the controller's cached mission data." if cached else "Preparing airborne data transfer."))
+
+    def start_charging_mission(
+        self,
+        drone: DroneConfig,
+        stops: list[LatLon],
+        stop_names: list[str],
+        charge_to_pct: list[float],
+    ) -> bool:
+        """One drone flies `stops` (source, charging stations..., destination)
+        hop by hop - the battery-aware plan (engine.battery_mission). Every
+        hop is its own takeoff-to-landing mission: the drone lands at each
+        station, is charged on the ground to that station's
+        `charge_to_pct` - what the next hop needs plus a margin, not full -
+        (`_service_charge_stops` sends CHARGE, then waits for the battery to
+        get there) and only then takes off for the next hop. The last hop
+        lands at the destination."""
+        self.stop()
+        if len(stops) < 2 or len(stop_names) != len(stops) or len(charge_to_pct) != len(stops) - 2:
+            return False
+        self._gcs = GroundControlStation(verbose=False)
+        self._gcs.start()
+        self._fleet = DroneFleet()
+        self._destination = stops[-1]
+        if not self._spawn_drone(drone, stops[0]):
+            self.stop()
+            return False
+        self._gcs.register_many(self._views)
+        self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
+
+        self._charge_stops[drone.sysid] = list(
+            zip(stop_names[1:], stops[1:], [*charge_to_pct, None])
+        )
+        self._fly_hop(drone.sysid, stops[0], stops[1])
+
+        self._elapsed_s = 0.0
+        self._tick = 0
+        self._paused = False
+        for flags in (self._flagged_low, self._flagged_gps, self._flagged_lost, self._emergency):
+            flags.clear()
+        self._timer.start()
+        return True
+
+    def _fly_hop(self, sysid: int, start: LatLon, end: LatLon) -> None:
+        """Take off from `start` and fly to `end`, landing there - one hop of
+        a battery-aware mission, routed and chained like any planned path."""
+        points, altitudes = plan_terrain_profile([start, end])
+        self._paths[sysid] = list(points)
+        self._altitudes[sysid] = list(altitudes)
+        self._leg_index[sysid] = 1
+        self._hop_airborne.discard(sysid)
+        self._gcs.navigate(
+            sysid,
+            [points[0].lat, points[0].lon, 0.0],
+            [points[1].lat, points[1].lon, altitudes[1]],
+            final=len(points) <= 2,
+        )
+
+    def _service_charge_stops(self, snapshots: dict[int, DroneSnapshot]) -> None:
+        """A battery-aware mission's ground stops: once a drone is down at
+        the station it was flying to, charge it; once charged, send it on."""
+        for sysid, stops in self._charge_stops.items():
+            snap = snapshots.get(sysid)
+            if snap is None or not stops:
+                continue
+            if snap.mission_state is not MissionState.LANDED:
+                self._hop_airborne.add(sysid)
+                continue
+            if sysid not in self._hop_airborne and sysid not in self._charging:
+                continue  # still the stale "landed" from before this hop's takeoff
+            name, station, target = stops[0]
+            if len(stops) == 1:
+                stops.clear()  # down at the destination - the mission is over
+                continue
+            if sysid not in self._charging:
+                off_m = engine_haversine(snap.position, Position(lat=station.lat, lon=station.lon))
+                if off_m > CHARGE_STOP_RADIUS_M:
+                    # Came down somewhere else (an emergency landing) - the
+                    # rest of the route no longer applies.
+                    stops.clear()
+                    continue
+                self._hop_airborne.discard(sysid)
+                self._charging[sysid] = name
+                self._send(
+                    sysid, CommandName.CHARGE,
+                    rate_pct_per_s=MAX_BATTERY_PCT / FULL_CHARGE_S, to_pct=target,
+                )
+                self.charging_started.emit(sysid, name, snap.battery, target)
+                continue
+            if snap.battery < target - 0.05:
+                continue
+            del self._charging[sysid]
+            stops.pop(0)
+            self.charging_finished.emit(sysid, name, snap.battery, target)
+            self._fly_hop(sysid, station, stops[0][1])
 
     def start_mission_paths(
         self,
@@ -401,7 +694,14 @@ class ThreadSwarmBackend(QObject):
         self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
 
         if train_routes:
-            self._start_train(assignments, per_drone, train_routes)
+            try:
+                self._start_train(assignments, per_drone, train_routes)
+            except OSError as exc:
+                # The route couldn't be sent to the drones - say so, rather
+                # than leaving half a swarm with a mission and half without.
+                self.link_failed.emit(f"could not send the formation's routes to the drones ({exc})")
+                self.stop()
+                return False
         else:
             for sysid in self._views:
                 points, altitudes = per_drone[sysid]
@@ -431,6 +731,10 @@ class ThreadSwarmBackend(QObject):
         order = [d.sysid for d, _r in assignments if d.sysid in self._views]
         configs = {d.sysid: d for d, _r in assignments}
         cruise = TRAIN_CRUISE_FRACTION * min(configs[s].max_velocity_mps for s in order)
+        # A formation may ask to fly slower than its drones could (the 8).
+        caps = [r.cruise_mps for r in train_routes if getattr(r, "cruise_mps", 0.0) > 0.0]
+        if caps:
+            cruise = min(cruise, min(caps))
         origin = per_drone[order[0]][0][0]
         tracks = {
             sysid: RouteTracker([_local_xy(p, origin) for p in per_drone[sysid][0]])
@@ -478,8 +782,16 @@ class ThreadSwarmBackend(QObject):
             route = route_of[sysid]
             altitude = max(altitudes)
 
-            def wire(seq) -> list[list[float]]:
-                return [[p.lat, p.lon, altitude] for p in seq]
+            def wire(seq, offsets=()) -> list[list[float]]:
+                # Per-point height changes, if the route has them (the 8's
+                # dip at its crossing) - otherwise level at `altitude`.
+                # Rounded to ~1 cm (7 decimals of a degree) - full float
+                # digits only make a whole route's command bigger to send.
+                return [
+                    [round(p.lat, 7), round(p.lon, 7),
+                     round(altitude + (offsets[i] if i < len(offsets) else 0.0), 2)]
+                    for i, p in enumerate(seq)
+                ]
 
             self._paths[sysid] = list(points)
             self._altitudes[sysid] = list(altitudes)
@@ -492,7 +804,7 @@ class ThreadSwarmBackend(QObject):
                 [landing.lat, landing.lon, altitude],
                 final=True,
                 approach=wire(route.approach),
-                loop=wire(route.loop),
+                loop=wire(route.loop, getattr(route, "loop_alt_offsets", ())),
                 laps=route.laps,
                 depart=wire(route.depart[:-1]),
                 train={
@@ -501,7 +813,7 @@ class ThreadSwarmBackend(QObject):
                     "spacing_m": spacing,
                     "max_mps": min(configs[sysid].max_velocity_mps, TRAIN_MAX_BOOST * cruise),
                     "min_mps": TRAIN_MIN_MPS,
-                    "schedule": [list(k) for k in schedules.get(sysid, ())],
+                    "schedule": [[round(t, 3), round(m, 2)] for t, m in schedules.get(sysid, ())],
                 },
             )
         # A first, standing-still pace, so every drone knows from its very
@@ -630,6 +942,10 @@ class ThreadSwarmBackend(QObject):
         self._leg_index.clear()
         self._altitudes.clear()
         self._train = None
+        self._task = None
+        self._charge_stops.clear()
+        self._charging.clear()
+        self._hop_airborne.clear()
         self._time_scale = self._default_time_scale
 
     def pause(self) -> None:
@@ -641,7 +957,11 @@ class ThreadSwarmBackend(QObject):
     def resume(self) -> None:
         self._paused = False
         for sysid, view in self._views.items():
-            if not view.is_done and sysid not in self._emergency and not view.gps_hold:
+            # `_flagged_gps` as well as the snapshot: right after a GPS-loss
+            # pause the drone's snapshot may not show it holding yet, and
+            # resuming it then would send it on without GPS.
+            gps_lost = view.gps_hold or sysid in self._flagged_gps
+            if not view.is_done and sysid not in self._emergency and not gps_lost:
                 self._send(sysid, CommandName.RESUME)
         if self._views:
             self._timer.start()
@@ -649,12 +969,16 @@ class ThreadSwarmBackend(QObject):
     # ---- Commands ----
 
     def retarget_all(self, destination: LatLon) -> int:
+        if self._task is not None:
+            self._task_log("Task-Allocation destination is fixed for this mission. Stop and plan again to change it.")
+            return 0
         active = [s for s, v in self._views.items() if not v.is_done]
         self._destination = destination
         altitude = next(iter(self._views.values())).config.cruise_altitude_m if self._views else 50.0
         for sysid in active:
             # A diversion overrides whatever route was planned - the drone now
             # flies straight to the new point, so there is no "next leg".
+            self._charge_stops.pop(sysid, None)
             self._paths.pop(sysid, None)
             self._leg_index.pop(sysid, None)
             self._send(
@@ -672,6 +996,7 @@ class ThreadSwarmBackend(QObject):
         if view is None or view.is_done:
             return None
         self._emergency.add(sysid)
+        self._charge_stops.pop(sysid, None)
         self._paths.pop(sysid, None)
         self._leg_index.pop(sysid, None)
         if view.can_reach(view.start):
@@ -691,6 +1016,7 @@ class ThreadSwarmBackend(QObject):
         if view is None or view.is_done:
             return None
         self._emergency.add(sysid)
+        self._charge_stops.pop(sysid, None)
         self._paths.pop(sysid, None)
         self._leg_index.pop(sysid, None)
         reachable = [p for p in candidates if view.can_reach(p)]
@@ -713,6 +1039,19 @@ class ThreadSwarmBackend(QObject):
     def inject_fault(self, command: InjectFault) -> list[int]:
         """GPS loss is injected through the command link, as the nodes are
         simulated. Other fault types are not modelled here."""
+        if self._task is not None:
+            if self._task.done:
+                return []
+            affected = []
+            for sysid in command.sysids:
+                if sysid not in self._views or sysid in self._task.retired:
+                    continue
+                until = self._elapsed_s + command.duration_s if command.duration_s else None
+                self._task.faults[sysid] = (command.fault_type, until)
+                if command.fault_type is FaultType.GPS_LOSS:
+                    self._send(sysid, CommandName.SET_GPS, available=False)
+                affected.append(sysid)
+            return affected
         if command.fault_type is not FaultType.GPS_LOSS:
             return []
         affected = []
@@ -727,7 +1066,14 @@ class ThreadSwarmBackend(QObject):
         restored = []
         for sysid in targets:
             if sysid in self._views:
+                if self._task is not None:
+                    self._task.faults.pop(sysid, None)
                 self._send(sysid, CommandName.SET_GPS, available=True)
+                # A drone left holding for its GPS picks its mission back up
+                # (one diverting or landing in an emergency carries on with that).
+                view = self._views[sysid]
+                if not self._paused and sysid not in self._emergency and not view.is_done:
+                    self._send(sysid, CommandName.RESUME)
                 restored.append(sysid)
         return restored
 
@@ -778,7 +1124,11 @@ class ThreadSwarmBackend(QObject):
             )
         self.progress.emit(self._elapsed_s, self._elapsed_s + remaining)
 
-        if all(v.is_done for v in self._views.values()):
+        if self._charge_stops:
+            self._service_charge_stops(snapshots)
+        if self._task is not None:
+            self._service_task_allocation(snapshots)
+        if all(self._mission_over(s) for s in self._views):
             self._timer.stop()
             self.finished.emit(self._elapsed_s)
             return
@@ -786,7 +1136,8 @@ class ThreadSwarmBackend(QObject):
         self._advance_legs(snapshots)
         if self._train is not None and not self._paused:
             self._keep_train_spacing(snapshots)
-        self._check_exceptions(snapshots)
+        if self._task is None:
+            self._check_exceptions(snapshots)
 
     def _advance_legs(self, snapshots: dict[int, DroneSnapshot]) -> None:
         """Chain a PDDL-planned route: as soon as a drone reaches the
@@ -837,8 +1188,12 @@ class ThreadSwarmBackend(QObject):
                 self.gps_restored.emit(sysid)
                 return
 
+            # A battery-aware hop is planned to land with only its charge
+            # margin left - below the usual prompt - so it is only asked
+            # about if the battery gets down to critical.
+            planned_hop = bool(self._charge_stops.get(sysid))
             if (
-                snap.battery <= LOW_BATTERY_PCT
+                snap.battery <= (CRITICAL_BATTERY_PCT if planned_hop else LOW_BATTERY_PCT)
                 and sysid not in self._flagged_low
                 and sysid not in self._emergency
                 and snap.mission_state not in (MissionState.LANDED, MissionState.FAILED)
@@ -850,7 +1205,9 @@ class ThreadSwarmBackend(QObject):
 
     def _telemetry_of(self, snap: DroneSnapshot) -> DroneTelemetry:
         faults: list[FaultType] = []
-        if not snap.gps_available:
+        if self._task is not None and snap.drone_id in self._task.faults:
+            faults.append(self._task.faults[snap.drone_id][0])
+        if not snap.gps_available and FaultType.GPS_LOSS not in faults:
             faults.append(FaultType.GPS_LOSS)
         if snap.health_status is HealthStatus.FAILED:
             faults.append(FaultType.BATTERY_FAIL)

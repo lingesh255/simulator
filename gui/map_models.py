@@ -35,6 +35,7 @@ class DroneMarkerModel(QAbstractListModel):
     HEADING = Qt.UserRole + 4
     STATUS = Qt.UserRole + 5
     HAS_FAULT = Qt.UserRole + 6
+    ALTITUDE = Qt.UserRole + 7
 
     _ROLE_NAMES = {
         SYSID: b"sysid",
@@ -43,6 +44,7 @@ class DroneMarkerModel(QAbstractListModel):
         HEADING: b"heading",
         STATUS: b"status",
         HAS_FAULT: b"hasFault",
+        ALTITUDE: b"altitude",
     }
 
     def __init__(self, parent=None):
@@ -86,6 +88,10 @@ class DroneMarkerModel(QAbstractListModel):
             return drone.status.value
         if role == self.HAS_FAULT:
             return bool(drone.active_faults)
+        if role == self.ALTITUDE:
+            # The same smoothed height the marker is drawn at - the map
+            # stacks overlapping markers by it, highest drone on top.
+            return self._displayed_alt.get(sysid, drone.altitude_m)
         return None
 
     def set_glide_speed(self, speed: float) -> None:
@@ -278,7 +284,7 @@ class DroneMarkerModel(QAbstractListModel):
             self.dataChanged.emit(
                 self.index(min(changed_rows)),
                 self.index(max(changed_rows)),
-                [self.LAT, self.LON],
+                [self.LAT, self.LON, self.ALTITUDE],
             )
 
 
@@ -292,7 +298,9 @@ def _distance_m(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 class PointMarkerModel(QAbstractListModel):
-    """Click-to-set start (green) / destination (red) markers."""
+    """Click-to-set start (green) / destination (red) markers - and a
+    battery-aware plan's charging stations (`charging_station:N`, drawn as a
+    battery; `charging_station_used:N` once the route stops there)."""
 
     ROLE_KIND = Qt.UserRole + 1
     LAT = Qt.UserRole + 2
@@ -325,6 +333,11 @@ class PointMarkerModel(QAbstractListModel):
     def set_point(self, kind: str, lat: float, lon: float) -> None:
         self.beginResetModel()
         self._points = [p for p in self._points if p[0] != kind] + [(kind, lat, lon)]
+        self.endResetModel()
+
+    def remove_point(self, kind: str) -> None:
+        self.beginResetModel()
+        self._points = [p for p in self._points if p[0] != kind]
         self.endResetModel()
 
     def clear(self) -> None:

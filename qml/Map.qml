@@ -82,10 +82,25 @@ Item {
             }
         }
 
-        // Live drone positions (§3.2.2) - color reflects fault/flight state
+        // A planned route drawn as an open line (a battery-aware plan's hops
+        // from the source through its charging stations to the destination)
+        MapItemView {
+            model: plannedRouteModel
+            delegate: MapPolyline {
+                line.width: 3
+                line.color: "#8e44ad"
+                opacity: 0.8
+                path: model.points
+            }
+        }
+
+        // Live drone positions (§3.2.2) - color reflects fault/flight state.
+        // Overlapping markers are stacked by height: the drone physically
+        // highest is drawn on top (a turning formation's top changes drone).
         MapItemView {
             model: droneModel
             delegate: MapQuickItem {
+                z: 100 + model.altitude
                 coordinate: QtPositioning.coordinate(model.lat, model.lon)
                 anchorPoint: Qt.point(droneDot.width / 2, droneDot.height / 2)
 
@@ -120,20 +135,80 @@ Item {
         }
 
         // Click-to-set start (green) / destination (red) / restricted-area
-        // centre (amber) markers (§3.2.2)
+        // centre (amber) markers (§3.2.2). A battery-aware plan's charging
+        // stations ("charging_station:N") are drawn as a battery instead,
+        // numbered, turning green once the planned route stops there
+        // ("charging_station_used:N").
         MapItemView {
             model: markerModel
             delegate: MapQuickItem {
+                id: marker
+                property bool isStation: model.role.indexOf("charging_station") === 0
+                property bool stationUsed: model.role.indexOf("charging_station_used") === 0
                 coordinate: QtPositioning.coordinate(model.lat, model.lon)
-                anchorPoint: Qt.point(pin.width / 2, pin.height)
-                sourceItem: Rectangle {
-                    id: pin
-                    width: 16; height: 16; radius: 8
-                    color: model.role === "start" ? "#2ecc71"
-                           : ((model.role === "no_fly_zone" || model.role === "figure8_crossing")
-                              ? "#f39c12" : "#e74c3c")
-                    border.color: "black"
-                    border.width: 1
+                // A pin points at its spot with its tip; a battery sits centred on it.
+                anchorPoint: isStation ? Qt.point(markerBody.width / 2, 8)
+                                       : Qt.point(markerBody.width / 2, markerBody.height)
+                sourceItem: Item {
+                    id: markerBody
+                    width: marker.isStation ? 34 : 16
+                    height: marker.isStation ? 30 : 16
+
+                    Rectangle {
+                        id: pin
+                        visible: !marker.isStation
+                        anchors.fill: parent
+                        radius: 8
+                        color: model.role === "start" ? "#2ecc71"
+                               : ((model.role === "no_fly_zone" || model.role === "figure8_crossing")
+                                  ? "#f39c12" : "#e74c3c")
+                        border.color: "black"
+                        border.width: 1
+                    }
+
+                    // Battery: body, terminal nub, charge bar and a lightning bolt.
+                    Item {
+                        visible: marker.isStation
+                        width: 30; height: 16
+                        x: 0; y: 0
+                        Rectangle {
+                            id: batteryBody
+                            width: 27; height: 16; radius: 3
+                            color: "white"
+                            border.color: "#2c3e50"
+                            border.width: 2
+                            Rectangle {
+                                x: 3; y: 3
+                                width: parent.width - 6; height: parent.height - 6
+                                radius: 1
+                                color: marker.stationUsed ? "#2ecc71" : "#f1c40f"
+                            }
+                            Text {
+                                anchors.centerIn: parent
+                                text: "⚡"
+                                font.pixelSize: 11
+                                font.bold: true
+                                color: "#2c3e50"
+                            }
+                        }
+                        Rectangle {
+                            x: batteryBody.width; y: 5
+                            width: 3; height: 6; radius: 1
+                            color: "#2c3e50"
+                        }
+                    }
+                    Text {
+                        visible: marker.isStation
+                        x: 0; y: 17
+                        width: 27
+                        horizontalAlignment: Text.AlignHCenter
+                        text: "C" + (model.role.split(":")[1] || "")
+                        font.pixelSize: 10
+                        font.bold: true
+                        color: marker.stationUsed ? "#1e8449" : "#2c3e50"
+                        style: Text.Outline
+                        styleColor: "white"
+                    }
                 }
             }
         }

@@ -703,7 +703,7 @@ def expand_point_to_point_drones(problem_text: str, count: int) -> str:
 
 # ---- V-formation retargeting -------------------------------------------------
 
-# The 8 compass objects declared in plans/vformation/problem.pddl's
+# The 8 compass objects declared in Swarm-Planning/Plans/vformation/problem.pddl's
 # :objects, in bearing order starting from north (0 deg) and stepping 45 deg
 # clockwise - index i is the nearest compass point to a bearing of i * 45 deg.
 _COMPASS_POINTS = (

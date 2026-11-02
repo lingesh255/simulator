@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Optional
 
-from engine.train_keeping import Pace, RouteTracker, TrainSlot, local_xy, train_speed
+from engine.train_keeping import WAIT_MPS, Pace, RouteTracker, TrainSlot, local_xy, train_speed
 
 EARTH_RADIUS_M = 6_371_000.0
 DEFAULT_TICK_S = 0.1          # 10 Hz loop
@@ -91,6 +91,8 @@ class CommandType(str, Enum):
     SET_GPS = "SET_GPS"                   # fault injection
     SET_SPEED = "SET_SPEED"               # change cruise speed in flight
     TRAIN_PACE = "TRAIN_PACE"             # formation keeping (engine.train_keeping)
+    CHARGE = "CHARGE"                     # landed at a charging station (engine.battery_mission)
+    TASK_DATA = "TASK_DATA"
     HEARTBEAT = "HEARTBEAT"
     SHUTDOWN = "SHUTDOWN"
 
@@ -137,6 +139,7 @@ class DroneSnapshot:
     # time.monotonic() of the tick `position` was computed on - lets a reader
     # comparing several drones line their snapshots up in time.
     wall_s: float = 0.0
+    task_data: dict = field(default_factory=dict)
 
 
 def haversine_m(a: Position, b: Position) -> float:
@@ -217,6 +220,11 @@ class DroneThread(threading.Thread):
         self._train_origin: Optional[Position] = None
         self._train_pace = None
         self._train_sent_mps: Optional[float] = None
+        # Charging while landed at a station (engine.battery_mission): percent
+        # per simulated second, up to `_charge_to_pct`; 0 when not charging.
+        self._charge_rate_pct_s = 0.0
+        self._charge_to_pct = 100.0
+        self._task_data: dict = {}
         self.mission_state = MissionState.IDLE
 
         # ---- internals ----
@@ -279,6 +287,7 @@ class DroneThread(threading.Thread):
                 elapsed_s=self.elapsed_s,
                 note=self._note,
                 wall_s=self._last_tick_s or 0.0,
+                task_data=dict(self._task_data),
             )
 
     @property
@@ -337,8 +346,12 @@ class DroneThread(threading.Thread):
             self._running.clear()
         elif kind is CommandType.HEARTBEAT:
             pass  # timestamp already refreshed
+        elif kind is CommandType.TASK_DATA:
+            with self._lock:
+                self._task_data = dict(payload)
         elif kind is CommandType.ARM:
-            if self.mission_state is MissionState.IDLE:
+            # LANDED too: a drone that landed at a charging station takes off again.
+            if self.mission_state in (MissionState.IDLE, MissionState.LANDED):
                 with self._lock:
                     self.armed_status = True
                     self.mission_state = MissionState.ARMED
@@ -375,11 +388,17 @@ class DroneThread(threading.Thread):
                 stamp_s=float(payload.get("stamp_s", time.time())),
                 front_at_m=None if front is None else float(front),
             )
+        elif kind is CommandType.CHARGE:
+            if not self._airborne():
+                with self._lock:
+                    self._charge_rate_pct_s = max(0.0, float(payload.get("rate_pct_per_s", 0.0)))
+                    self._charge_to_pct = min(100.0, float(payload.get("to_pct", 100.0)))
+                    self._note = "charging" if self._charge_rate_pct_s > 0 else self._note
         elif kind is CommandType.SET_SPEED:
             speed = payload.get("speed_mps")
             if speed:
                 with self._lock:
-                    self.cruise_speed_mps = max(0.1, float(speed))
+                    self.cruise_speed_mps = max(WAIT_MPS, float(speed))
         elif kind in (CommandType.GOTO, CommandType.SET_DESTINATION):
             destination = payload.get("destination")
             route: list[Position] = []
@@ -443,6 +462,15 @@ class DroneThread(threading.Thread):
             if setter is not None:
                 setter(bool(command.payload.get("available", True)))
             return
+        if command.type is CommandType.CHARGE:
+            # So is the battery - a charger plugs into the airframe.
+            charge = getattr(self.flight_controller, "charge", None)
+            if charge is not None:
+                charge(
+                    float(command.payload.get("rate_pct_per_s", 0.0)),
+                    float(command.payload.get("to_pct", 100.0)),
+                )
+            return
         for frame in self.interpreter.interpret(command):
             self.flight_controller.send(frame)
 
@@ -467,7 +495,7 @@ class DroneThread(threading.Thread):
         # instant the climb finished - one tick before this keeper takes
         # over - and a drone whose turn hasn't come yet would dart across
         # the pads of the drones still waiting ahead of it.
-        self._train_sent_mps = self._train_slot.min_mps
+        self._train_sent_mps = WAIT_MPS
         hold = Command(CommandType.SET_SPEED, {"speed_mps": self._train_sent_mps})
         self._apply_command(hold)
         self._dispatch_to_firmware(hold)
@@ -490,7 +518,7 @@ class DroneThread(threading.Thread):
             tick_sim_s=self.tick_s * self.time_scale,
         )
         last = self._train_sent_mps
-        if last is not None and abs(speed - last) <= 0.02 * max(last, 0.1):
+        if last is not None and abs(speed - last) <= 0.02 * max(last, WAIT_MPS):
             return
         self._train_sent_mps = speed
         command = Command(CommandType.SET_SPEED, {"speed_mps": speed})
@@ -552,6 +580,10 @@ class DroneThread(threading.Thread):
             self._service_firmware(dt)
             return
 
+        if self.mission_state is MissionState.LANDED and self._charge_rate_pct_s > 0:
+            self._charge(dt)
+            return
+
         if self.mission_finished or self.mission_state is MissionState.IDLE:
             return
 
@@ -571,6 +603,16 @@ class DroneThread(threading.Thread):
         elif self.mission_state is MissionState.HOLDING:
             with self._lock:
                 self.velocity = Velocity(0.0, self.velocity.heading_deg, 0.0)
+
+    def _charge(self, dt: float) -> None:
+        """Landed at a charging station: the battery fills at the charger's rate."""
+        with self._lock:
+            self.elapsed_s += dt
+            self.battery = min(self._charge_to_pct, self.battery + self._charge_rate_pct_s * dt)
+            self._consumed_mah = self.battery_capacity_mah * (1.0 - self.battery / 100.0)
+            if self.battery >= self._charge_to_pct:
+                self._charge_rate_pct_s = 0.0
+                self._note = "charged"
 
     def _climb(self, dt: float) -> None:
         with self._lock:
@@ -593,6 +635,9 @@ class DroneThread(threading.Thread):
             # them, not stay at the highest altitude it ever needed.
             current_alt = self.position.alt_m
             target_alt = self.cruise_altitude_m
+            if self._train_slot is not None and self.destination.alt_m > 0:
+                # A formation route's own per-point height (the 8's dip).
+                target_alt = self.destination.alt_m
             if current_alt < target_alt:
                 new_alt = min(target_alt, current_alt + CLIMB_RATE_MPS * dt)
             else:
@@ -673,7 +718,7 @@ class DroneThread(threading.Thread):
             if st.landed:
                 self.mission_state = MissionState.LANDED
                 self.current_operation = Operation.NONE
-                self._note = "landed"
+                self._note = "charging" if st.charging else "landed"
             elif self.battery <= 0.0:
                 self.mission_state = MissionState.FAILED
                 self._note = "battery exhausted - drone lost"

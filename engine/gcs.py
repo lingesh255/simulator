@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from engine.protocol import (
+    fragment,
     DRONE_BASE_PORT,
     GCS_PORT,
     CommandMessage,
@@ -142,7 +143,9 @@ class GroundControlStation:
             params=params,
             seq=seq,
         )
-        self._sock.sendto(message.to_json(), record.address)
+        # A big command (a formation's whole timed track) goes as fragments.
+        for datagram in fragment(message.to_json(), drone_id, seq):
+            self._sock.sendto(datagram, record.address)
         if self.verbose:
             print(f"GCS -> drone {drone_id}: {command.value} (seq {seq})")
         return seq

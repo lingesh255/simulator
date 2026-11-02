@@ -1,6 +1,6 @@
 """Figure-8 formation: geometry, capacity check and PDDL problem editing.
 
-    plans/figure8formation/problem.pddl (template)
+    Swarm-Planning/Plans/figure8formation/problem.pddl (template)
         -> expand_figure8_drones   (one train slot per checked drone)
         -> retarget_figure8_problem (the operator's 4 clicked points)
         -> ENHSP plans the leader's trip: base -> 8's middle -> laps -> base
@@ -25,11 +25,28 @@ is wide, and the lobes may differ in size if the middle isn't clicked half
 way. The same shape can be flown four ways (either lobe first, either way
 round); `plan_figure8_mission` picks the one that suits the base.
 
-THE TRAIN. The drones fly one behind another, `FIGURE8_SPACING_M` apart
-along the path, each one talking only to the drone directly in front of it
-and directly behind it. Between leaving its pad and reaching its landing
-pad, every drone flies the same SHARED path - base -> 8 -> base - one
-spacing behind the drone in front:
+THE SPREAD. The drones are spread EVENLY round the whole 8: the lap is cut
+into `slot_count` equal slots (`slot_spacing_m` = lap length / slots) and
+every drone holds its own slot, so while they are all on the 8 they fill it
+at equal distances instead of following one another in a bunch. They still
+talk only to the drone directly in front of and behind them, and between
+leaving its pad and reaching its landing pad every drone flies the same
+SHARED path - base -> 8 -> base - one slot behind the drone in front. Each
+drone flies `laps + 1` laps: the extra lap is the time it takes the drones
+to fill the 8 one after another and to leave it again, so the whole 8 is
+held fully spread for at least the `laps` the operator asked for.
+
+The slot count is the drone count when that is safe, else one or more
+slots more (`figure8_slot_count`). The 8 crosses itself in the middle, so
+two drones whose slots are a lobe-length apart along the path would reach
+the crossing together - e.g. any even number of drones on an 8 with equal
+lobes. The slot spacing is chosen so that at the crossing any two drones
+are at least `FIGURE8_CROSSING_CLEARANCE_M` apart along the path, which on
+two branches crossing at right angles is `FIGURE8_SPACING_M` (10 m) apart
+in a straight line. When an extra slot is needed it is left empty, as one
+larger gap between the last drone and the leader.
+
+The way out to the 8 and back:
 
     pads         a compact block of landing pads at the base, 10 m apart,
                  just behind the base point (on the side away from the 8)
@@ -48,21 +65,17 @@ spacing behind the drone in front:
                  no drone ever flies over a pad that is already taken
 
 Entering and leaving the 8 tangentially, then turning back to the base,
-means one of the base legs generally crosses one loop of the 8. That loop
-is always empty at that moment - the train is shorter than a lobe - and the
-path check below proves it for the actual layout rather than assuming it.
+means one of the base legs generally crosses one loop of the 8 while other
+drones are still flying it.
 
-CAPACITY. A train occupies a stretch of the path `(N-1) * spacing` long,
-so two drones can only meet where the path comes back near itself within
-that stretch. On the 8 that is the crossing (the head comes back round to
-it after one lobe), which gives the simple rule that the whole train plus
-`FIGURE8_CROSSING_CLEARANCE_M` must fit inside the SMALLER lobe
-(`figure8_max_drones` - the same inequality is in domain.pddl). The base
-legs add their own cases (an outbound curve swinging close to a lobe the
-head of the train is already on), so `plan_figure8_mission` also checks
-the whole path directly: any two points of it close enough together along
-the path to be occupied at the same time must stay far enough apart in
-space (`_closest_conflict`).
+CAPACITY. Every pair of drones is a whole number of slots apart along the
+shared path, always. So `plan_figure8_mission` checks the whole path
+directly (`_closest_conflict`): for every point of it and every pair
+distance j * slot_spacing_m that some two drones have, the two points must
+be at least `FIGURE8_SPACING_M` apart in space - the crossing, the base legs
+cutting across a lobe, the slide off the pads, all of it. The crossing rule
+above (the same inequality is in domain.pddl) is what makes the 8 itself
+pass; `figure8_max_drones` is the most drones it allows.
 """
 from __future__ import annotations
 
@@ -84,29 +97,40 @@ from engine.pddl_problem import (
     _to_local,
 )
 
-# Distance between consecutive drones in the train, along the path.
+# Closest any two drones may ever come, in a straight line - and the
+# spacing of the landing pads.
 FIGURE8_SPACING_M = 10.0
-# Extra length the smaller lobe needs beyond the train itself, so the head
-# coming back into the crossing stays clear of the tail leaving it. Two
-# drones approaching a right-angle crossing on different branches, whose
-# arc positions differ by d, are never closer than d / sqrt(2) - so this
-# keeps them at least one full spacing apart.
+# Gap along the path two drones must have when they reach the middle
+# crossing on its two branches. Drones approaching a right-angle crossing
+# whose arc positions differ by d are never closer than d / sqrt(2) - so
+# this keeps them at least FIGURE8_SPACING_M apart.
 FIGURE8_CROSSING_CLEARANCE_M = FIGURE8_SPACING_M * math.sqrt(2.0)
+# Smallest slot spacing that can keep the crossing clear at all (the gap at
+# the crossing is never more than half a slot).
+MIN_FIGURE8_SLOT_M = 2.0 * FIGURE8_CROSSING_CLEARANCE_M
 # Smallest crossing->end distance a lobe may have: anything tighter is not
-# a flyable loop at this spacing (and not two separate clicks, really).
+# a flyable loop (and not two separate clicks, really).
 MIN_FIGURE8_LOBE_M = 2.0 * FIGURE8_SPACING_M
 # Smallest base->middle distance.
 MIN_FIGURE8_BASE_M = 3.0 * FIGURE8_SPACING_M
-# Tightest turn on the base legs. Drones 10 m apart round a 25 m radius
-# stay 9.9 m apart in a straight line.
+# Tightest turn on the base legs.
 FIGURE8_TURN_RADIUS_M = 2.5 * FIGURE8_SPACING_M
+# How finely the flown path follows the true curve: one waypoint every this
+# many metres, so the drones trace the 8 itself rather than a polygon.
+FIGURE8_SAMPLE_M = 2.0
+# Speed the formation flies at - an 8 is about shape, not getting anywhere.
+FIGURE8_CRUISE_MPS = 5.0
+# Vertical separation at the middle crossing: every drone flies the SECOND
+# pass through the crossing (the branch from the first lobe into the second)
+# this much lower, so the two streams crossing there are apart in height as
+# well as along the path. Full depth within FIGURE8_DIP_FLAT_M of the
+# crossing, easing back to cruise height over FIGURE8_DIP_RAMP_M either side.
+FIGURE8_CROSSING_DIP_M = 10.0
+FIGURE8_DIP_FLAT_M = 25.0
+FIGURE8_DIP_RAMP_M = 40.0
 MIN_FIGURE8_DRONES = 2  # a leader plus at least one follower to talk to
 FIGURE8_LAPS = 1  # default times round the 8
 MAX_FIGURE8_LAPS = 50
-# Two points of the path that could be occupied at the same time, `d`
-# metres apart along it, must be at least this fraction of min(d, spacing)
-# apart in space - i.e. drones never bunch below ~70% of their spacing.
-_MIN_SEPARATION_FRACTION = 0.7
 # The PDDL battery is abstract (100 units) and the real per-drone battery
 # check runs on each drone's own profile before flight (see
 # MainWindow._start_area_coverage_mission), so the whole mission - however
@@ -179,17 +203,46 @@ class Figure8Geometry:
 
     @property
     def max_drones(self) -> int:
-        return figure8_max_drones(self.right_lobe_m, self.left_lobe_m, self.step_m)
+        return figure8_max_drones(self.loop_length_m, self.right_lobe_m)
 
 
-def figure8_max_drones(right_lobe_m: float, left_lobe_m: float, step_m: float = FIGURE8_SPACING_M) -> int:
-    """Most drones a train `step_m` apart can hold on an 8 with these lobe
-    lengths without the head meeting the tail at the crossing - see the
-    module doc's CAPACITY note. 0 if not even a single drone fits."""
-    usable = min(right_lobe_m, left_lobe_m) - FIGURE8_CROSSING_CLEARANCE_M
-    if usable < 0:
-        return 0
-    return int(math.floor(usable / step_m + 1e-9)) + 1
+def figure8_crossing_gap(loop_m: float, lobe_m: float, slots: int) -> float:
+    """Smallest gap along the path between two of `slots` equally spaced
+    slots when one of them is at the middle crossing: the crossing is passed
+    at 0 and again one lobe (`lobe_m`) later, so two slots meet there when
+    a whole number of slots is close to a lobe length. Either lobe gives the
+    same answer."""
+    slot_m = loop_m / slots
+    r = lobe_m % slot_m
+    return min(r, slot_m - r)
+
+
+def _slot_counts(loop_m: float, lobe_m: float, drone_count: int):
+    """Slot counts that keep the crossing clear for `drone_count` drones,
+    fewest first (fewest = the most even spread)."""
+    slots = max(drone_count, MIN_FIGURE8_DRONES)
+    while loop_m / slots >= MIN_FIGURE8_SLOT_M:
+        if figure8_crossing_gap(loop_m, lobe_m, slots) >= FIGURE8_CROSSING_CLEARANCE_M - 1e-9:
+            yield slots
+        slots += 1
+
+
+def figure8_slot_count(loop_m: float, lobe_m: float, drone_count: int) -> int | None:
+    """Fewest slots, at least `drone_count`, that keep the crossing clear -
+    None if the 8 is too small for that many drones."""
+    return next(_slot_counts(loop_m, lobe_m, drone_count), None)
+
+
+def figure8_max_drones(loop_m: float, lobe_m: float) -> int:
+    """Most drones an 8 this size can hold spread evenly, one per slot, with
+    the crossing clear - see the module doc. 0 if not even two fit."""
+    best = 0
+    slots = MIN_FIGURE8_DRONES
+    while loop_m / slots >= MIN_FIGURE8_SLOT_M:
+        if figure8_crossing_gap(loop_m, lobe_m, slots) >= FIGURE8_CROSSING_CLEARANCE_M - 1e-9:
+            best = slots
+        slots += 1
+    return best
 
 
 def _curve(t: float, frames) -> tuple[float, float]:
@@ -231,7 +284,7 @@ def figure8_geometry(
     crossing: LatLon,
     right: LatLon,
     *,
-    spacing_m: float = FIGURE8_SPACING_M,
+    sample_m: float = FIGURE8_SAMPLE_M,
     mirror: bool = False,
     reverse: bool = False,
 ) -> Figure8Geometry:
@@ -281,9 +334,9 @@ def figure8_geometry(
     loop_m = cum[-1]
     right_lobe_m, left_lobe_m = (loop_m - first_lobe_m, first_lobe_m) if reverse else (first_lobe_m, loop_m - first_lobe_m)
 
-    # Equal steps as close to the spacing as the loop length allows, so the
+    # Equal steps as close to `sample_m` as the loop length allows, so the
     # ring closes exactly.
-    n_steps = max(8, round(loop_m / spacing_m))
+    n_steps = max(8, round(loop_m / sample_m))
     step_m = loop_m / n_steps
     ring_xy = _resample(pts, cum, step_m)[:n_steps]
     ring = [_from_local(p, crossing) for p in ring_xy]
@@ -318,21 +371,21 @@ def figure8_capacity_error(geometry: Figure8Geometry, drone_count: int) -> str |
             f"(a leader and a follower to keep spacing with). "
             f"{drone_count} {'is' if drone_count == 1 else 'are'} checked."
         )
-    fit = geometry.max_drones
-    if drone_count <= fit:
+    if figure8_slot_count(geometry.loop_length_m, geometry.right_lobe_m, drone_count) is not None:
         return None
-    smaller = min(geometry.right_lobe_m, geometry.left_lobe_m)
-    needed = (drone_count - 1) * geometry.step_m + FIGURE8_CROSSING_CLEARANCE_M
+    fit = geometry.max_drones
     return (
         f"This operation can't be done with {drone_count} drones on this figure-8.\n\n"
-        f"The drones fly one behind another {geometry.step_m:.1f} m apart, so a "
-        f"train of {drone_count} needs about {needed:.0f} m of the smaller lobe "
-        f"(including {FIGURE8_CROSSING_CLEARANCE_M:.0f} m of clearance at the "
-        f"crossing). The smaller lobe of this 8 is only {smaller:.0f} m around, "
-        f"so the front of the train would reach the middle crossing point while "
-        f"the back is still passing through it.\n\n"
-        f"This 8 fits at most {fit} drone{'s' if fit != 1 else ''}. Uncheck "
-        f"drones, or click the left and right end points further from the middle."
+        f"The drones are spread evenly round the 8, which is "
+        f"{geometry.loop_length_m:.0f} m around - {geometry.loop_length_m / drone_count:.0f} m "
+        f"each for {drone_count} drones. To keep every two drones at least "
+        f"{FIGURE8_SPACING_M:.0f} m apart where the 8 crosses itself, each drone "
+        f"needs at least {MIN_FIGURE8_SLOT_M:.0f} m of the 8.\n\n"
+        + (
+            f"This 8 fits at most {fit} drones. " if fit >= MIN_FIGURE8_DRONES
+            else "This 8 can't fit even two drones. "
+        )
+        + "Uncheck drones, or click the left and right end points further from the middle."
     )
 
 
@@ -448,6 +501,12 @@ class TrainRoute:
     # this route) keyframes - see engine.train_keeping. Used by formations
     # that change shape (the star plan).
     schedule: tuple[tuple[float, float], ...] = ()
+    # Fastest the formation should cruise (m/s), below the drones' own top
+    # speed - 0 for no limit.
+    cruise_mps: float = 0.0
+    # Height change (metres, negative = lower) at each `loop` point, same
+    # length as `loop` - empty for a loop flown level.
+    loop_alt_offsets: tuple[float, ...] = ()
 
     def expanded(self) -> list[LatLon]:
         return [self.start, *self.approach, *(self.loop * self.laps), *self.depart]
@@ -460,7 +519,8 @@ class Figure8Mission:
     geometry: Figure8Geometry
     base: LatLon
     drone_count: int
-    laps: int
+    laps: int                  # laps flown with the whole 8 filled, as asked
+    slot_count: int            # equal slots round the 8 (>= drone_count)
     # Pads in landing order: drone k (0 = leader) lands on landing_pads[k]
     # and takes off from takeoff_pads[k] (the same pads, reversed).
     landing_pads: list[LatLon]
@@ -472,30 +532,37 @@ class Figure8Mission:
     outbound_m: float
     inbound_m: float
 
+    @property
+    def slot_spacing_m(self) -> float:
+        """Distance along the path between neighbouring drones."""
+        return self.geometry.loop_length_m / self.slot_count
+
+    @property
+    def flown_laps(self) -> int:
+        """Laps every drone flies: one more than asked, to fill and empty the 8."""
+        return self.laps + 1
+
     def preview_path(self) -> list[LatLon]:
         """Base -> 8 -> base, for drawing on the map."""
         return [self.base, *self.outbound, *self.geometry.ring[1:], self.geometry.crossing, *self.inbound]
 
 
 def _closest_conflict(
-    path: list[tuple[float, float]], h: float, span_m: float, step_m: float
+    path: list[tuple[float, float]], stride: int, drone_count: int
 ) -> float | None:
     """Worst separation shortfall (metres) on `path` - a polyline sampled
-    every `h` metres - between two points close enough along it (<= span)
-    to be occupied by the same train at the same time; None if every such
-    pair keeps at least `_MIN_SEPARATION_FRACTION * min(d, step)` apart."""
-    window = int(span_m / h + 1e-9)
+    so that `stride` samples are exactly one slot - between two points that
+    two of the drones occupy at the same moment (a whole number of slots
+    apart, up to the train's length); None if every such pair stays at
+    least `FIGURE8_SPACING_M` apart."""
     worst = None
-    for i in range(len(path)):
-        xi, yi = path[i]
-        for k in range(1, window + 1):
-            j = i + k
-            if j >= len(path):
-                break
-            need = _MIN_SEPARATION_FRACTION * min(k * h, step_m)
-            dist = math.hypot(path[j][0] - xi, path[j][1] - yi)
-            if dist < need and (worst is None or need - dist > worst):
-                worst = need - dist
+    for j in range(1, drone_count):
+        offset = j * stride
+        for i in range(len(path) - offset):
+            (xi, yi), (xj, yj) = path[i], path[i + offset]
+            short = FIGURE8_SPACING_M - math.hypot(xj - xi, yj - yi)
+            if short > 1e-6 and (worst is None or short > worst):
+                worst = short
     return worst
 
 
@@ -514,7 +581,7 @@ def _base_legs_cross_pattern(mission: "Figure8Mission") -> bool:
     check is what guarantees separation), but a leg that swings through a
     loop to come in from the far side is not the trip anyone expects."""
     crossing = mission.geometry.crossing
-    near = 1.5 * mission.geometry.step_m
+    near = 1.5 * FIGURE8_SPACING_M
     ring = [_to_local(p, crossing) for p in mission.geometry.ring]
     ring.append(ring[0])
     for leg in ([mission.base, *mission.outbound], [crossing, *mission.inbound]):
@@ -571,12 +638,13 @@ def _line(a, b, step: float) -> list[tuple[float, float]]:
 
 def _build_mission(
     left: LatLon, crossing: LatLon, right: LatLon, base: LatLon,
-    drone_count: int, laps: int, *, mirror: bool, reverse: bool,
-) -> tuple[Figure8Mission, list[tuple[float, float]], float]:
+    drone_count: int, laps: int, slot_count: int, *, mirror: bool, reverse: bool,
+) -> tuple[Figure8Mission, list[tuple[float, float]], int]:
     """One orientation's mission, plus its whole path (densely, local
-    metres) for the conflict check and that sampling's step."""
+    metres) for the conflict check and how many samples of it make a slot."""
     geometry = figure8_geometry(left, crossing, right, mirror=mirror, reverse=reverse)
-    step = geometry.step_m
+    step = FIGURE8_SAMPLE_M     # waypoint spacing of the base legs
+    pad = FIGURE8_SPACING_M     # landing pad spacing
     b = _to_local(base, crossing)
     dist = math.hypot(*b)
     toward = (-b[0] / dist, -b[1] / dist)          # base -> middle
@@ -602,7 +670,7 @@ def _build_mission(
     side = (-away[1], away[0])                      # left, facing away from the 8
     order, rows, cols = _pad_offsets(drone_count)
     pads_xy = [
-        (b[0] + away[0] * r * step + side[0] * c * step, b[1] + away[1] * r * step + side[1] * c * step)
+        (b[0] + away[0] * r * pad + side[0] * c * pad, b[1] + away[1] * r * pad + side[1] * c * pad)
         for r, c in order
     ]
 
@@ -611,6 +679,7 @@ def _build_mission(
         base=base,
         drone_count=drone_count,
         laps=laps,
+        slot_count=slot_count,
         landing_pads=[_from_local(p, crossing) for p in pads_xy],
         takeoff_pads=[_from_local(p, crossing) for p in reversed(pads_xy)],
         pad_rows=rows,
@@ -621,15 +690,17 @@ def _build_mission(
         inbound_m=in_cum[-1],
     )
 
-    # The whole path the train's stretch slides along: the pads' centre
-    # line in, the outbound leg, at most two laps (lap-to-lap is the same as
-    # any later lap-to-lap), the inbound leg, and the centre line out.
-    h = step / 2.0
-    depth = (b[0] + away[0] * (rows - 1) * step, b[1] + away[1] * (rows - 1) * step)
+    # The whole path the drones slide along together: the pads' centre line
+    # in, the outbound leg, the laps (the train is shorter than a lap, so
+    # three cover every way two drones can be spread over them), the inbound
+    # leg, and the centre line out - sampled a whole number of times per slot.
+    stride = max(1, math.ceil(mission.slot_spacing_m / 1.0))
+    h = mission.slot_spacing_m / stride
+    depth = (b[0] + away[0] * (rows - 1) * pad, b[1] + away[1] * (rows - 1) * pad)
     pieces = [
         [depth, b],
         out_dense,
-        *([geometry.dense_xy] * min(laps, 2)),
+        *([geometry.dense_xy] * min(mission.flown_laps, 3)),
         in_dense,
         [b, depth],
     ]
@@ -640,11 +711,11 @@ def _build_mission(
     # The pads themselves must sit clear of the 8.
     ring = geometry.dense_xy[::10]
     pads_clear = all(
-        math.hypot(px - rx, py - ry) >= 2 * step for px, py in pads_xy for rx, ry in ring
+        math.hypot(px - rx, py - ry) >= 2 * pad for px, py in pads_xy for rx, ry in ring
     )
     if not pads_clear:
-        path = path + [path[-1]]                    # forces a conflict below
-    return mission, path, h
+        path = [path[0]] * (stride + 1) + path      # forces a conflict below
+    return mission, path, stride
 
 
 def plan_figure8_mission(
@@ -682,43 +753,45 @@ def plan_figure8_mission(
     if capacity:
         raise ValueError(capacity)
 
+    slot_choices = list(_slot_counts(geometry.loop_length_m, geometry.right_lobe_m, drone_count))
+
     options = []
     for mirror in (False, True):
         for reverse in (False, True):
-            mission, _path, _h = _build_mission(
-                left, crossing, right, base, drone_count, laps, mirror=mirror, reverse=reverse
+            mission, _path, _stride = _build_mission(
+                left, crossing, right, base, drone_count, laps, slot_choices[0],
+                mirror=mirror, reverse=reverse,
             )
             # Rounded so near-ties between mirror-image options don't hinge
             # on floating-point noise.
             legs_m = round(mission.outbound_m + mission.inbound_m, 1)
             options.append((_base_legs_cross_pattern(mission), legs_m, mirror, reverse))
     options.sort()
-    options = [(legs_m, mirror, reverse) for _crosses, legs_m, mirror, reverse in options]
+    options = [(mirror, reverse) for _crosses, _legs_m, mirror, reverse in options]
 
-    def _fits(n: int, mirror: bool, reverse: bool):
-        mission, path, h = _build_mission(
-            left, crossing, right, base, n, laps, mirror=mirror, reverse=reverse
+    def _fits(n: int, slots: int, mirror: bool, reverse: bool):
+        mission, path, stride = _build_mission(
+            left, crossing, right, base, n, laps, slots, mirror=mirror, reverse=reverse
         )
-        span = max((n - 1) * mission.geometry.step_m, h)
-        return mission, _closest_conflict(path, h, span, mission.geometry.step_m) is None
+        return mission, _closest_conflict(path, stride, n) is None
 
-    for _score, mirror, reverse in options:
-        mission, ok = _fits(drone_count, mirror, reverse)
-        if ok:
-            return mission
+    # The most even spread first (fewest slots), then the nicest way round.
+    for slots in slot_choices:
+        for mirror, reverse in options:
+            mission, ok = _fits(drone_count, slots, mirror, reverse)
+            if ok:
+                return mission
 
-    # Doesn't fit any way round: find the most drones that would, for the
-    # message (fit is monotonic in the train length, so bisect).
+    # Doesn't fit any way: find the most drones that would, for the message.
     best = 0
-    for _score, mirror, reverse in options:
-        lo, hi = MIN_FIGURE8_DRONES - 1, drone_count - 1
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if _fits(mid, mirror, reverse)[1]:
-                lo = mid
-            else:
-                hi = mid - 1
-        best = max(best, lo)
+    for n in range(drone_count - 1, MIN_FIGURE8_DRONES - 1, -1):
+        if any(
+            _fits(n, slots, mirror, reverse)[1]
+            for slots in _slot_counts(geometry.loop_length_m, geometry.right_lobe_m, n)
+            for mirror, reverse in options
+        ):
+            best = n
+            break
     fit_text = (
         f"This layout fits at most {best} drone{'s' if best != 1 else ''}."
         if best >= MIN_FIGURE8_DRONES
@@ -726,11 +799,11 @@ def plan_figure8_mission(
     )
     raise ValueError(
         f"This operation can't be done with {drone_count} drones on this layout.\n\n"
-        f"The train of {drone_count} drones is {(drone_count - 1) * geometry.step_m:.0f} m "
-        f"long, and somewhere on the way from the base to the 8 and back, the path "
-        f"passes close enough to a part of itself that other drones of the same "
-        f"train would still be on - they would come closer than "
-        f"{_MIN_SEPARATION_FRACTION * FIGURE8_SPACING_M:.0f} m.\n\n"
+        f"Spread evenly round the 8 the drones are about "
+        f"{geometry.loop_length_m / slot_choices[0]:.0f} m apart, and somewhere on the "
+        f"way from the base to the 8 and back the path passes close enough to a part "
+        f"of the 8 other drones are still flying that two of them would come closer "
+        f"than {FIGURE8_SPACING_M:.0f} m.\n\n"
         f"{fit_text} Uncheck drones, move the base further away (straight above "
         f"or below the middle of the 8 works best - the landing pads behind the "
         f"base need room too), or make the 8 bigger."
@@ -744,6 +817,32 @@ def figure8_drone_names(drone_count: int) -> list[str]:
     return [_LEADER] + [f"drone-f{k}" for k in range(1, drone_count)]
 
 
+def figure8_loop_alt_offsets(geometry: Figure8Geometry) -> tuple[float, ...]:
+    """Height offset of every point of one lap (`ring[1:]` then `ring[0]`,
+    as flown): 0 everywhere except around the second pass through the
+    crossing, which dips `FIGURE8_CROSSING_DIP_M` - see that constant. The
+    dip is kept inside its own lobes' first and last quarters, so a small 8
+    gets a shorter ramp rather than a dip that reaches the other pass."""
+    mid_arc = next(arc for name, _p, arc in geometry.key_points if name == "crossing-mid")
+    reach = min(
+        FIGURE8_DIP_FLAT_M + FIGURE8_DIP_RAMP_M,
+        0.25 * min(geometry.right_lobe_m, geometry.left_lobe_m),
+    )
+    flat = reach * FIGURE8_DIP_FLAT_M / (FIGURE8_DIP_FLAT_M + FIGURE8_DIP_RAMP_M)
+    n = len(geometry.ring)
+    offsets = []
+    for k in range(1, n + 1):
+        off = abs(k * geometry.step_m - mid_arc)
+        if off <= flat:
+            weight = 1.0
+        elif off < reach:
+            weight = 0.5 * (1.0 + math.cos(math.pi * (off - flat) / (reach - flat)))
+        else:
+            weight = 0.0
+        offsets.append(-FIGURE8_CROSSING_DIP_M * weight)
+    return tuple(offsets)
+
+
 def figure8_train_routes(mission: Figure8Mission) -> dict[str, TrainRoute]:
     """Each drone's route, keyed by `figure8_drone_names`.
 
@@ -755,9 +854,10 @@ def figure8_train_routes(mission: Figure8Mission) -> dict[str, TrainRoute]:
     n = mission.drone_count
     g = mission.geometry
     crossing = g.crossing
-    step = g.step_m
+    step = FIGURE8_SAMPLE_M
     b = _to_local(mission.base, crossing)
     loop = [*g.ring[1:], g.ring[0]]          # one lap, middle to middle
+    dips = figure8_loop_alt_offsets(g)
     away = None
     if mission.outbound:
         dist = math.hypot(*b)
@@ -783,10 +883,12 @@ def figure8_train_routes(mission: Figure8Mission) -> dict[str, TrainRoute]:
             start=mission.takeoff_pads[k],
             approach=approach,
             loop=loop,
-            laps=mission.laps,
+            laps=mission.flown_laps,
             depart=depart,
             shared_from_m=prefix_m,
-            slot_m=k * step,
+            slot_m=k * mission.slot_spacing_m,
+            cruise_mps=FIGURE8_CRUISE_MPS,
+            loop_alt_offsets=dips,
         )
     return routes
 
@@ -858,21 +960,22 @@ def _set_scalar_fluent(problem_text: str, fluent: str, value: float) -> str:
 
 def figure8_corridor(mission: Figure8Mission) -> list[str]:
     """The leader's location sequence the plan must fly (after the base):
-    out to the middle, `laps` laps of key waypoints, back to the base."""
+    out to the middle, every lap it flies (`flown_laps`) as key waypoints,
+    back to the base."""
     lap = [name for name, _point, _arc in mission.geometry.key_points]
-    return lap[:1] + lap[1:] * mission.laps + [BASE_LOCATION]
+    return lap[:1] + lap[1:] * mission.flown_laps + [BASE_LOCATION]
 
 
 def retarget_figure8_problem(problem_text: str, mission: Figure8Mission) -> str:
     """Move the base and every key waypoint of an (already expanded)
     figure-8 problem onto `mission`, recompute each leg's along-the-path
-    `distance` and `energy-required`, and write the train-geometry fluents
+    `distance` and `energy-required`, and write the spread-geometry fluents
     the capacity precondition in domain.pddl reads (`drone-spacing`,
-    `train-span`, `min-lobe-length`, `crossing-clearance`) plus
-    `laps-required`. Energy is spread so the whole mission costs
+    `crossing-gap`, `crossing-clearance`) plus `laps-required` (every lap
+    the leader flies). Energy is spread so the whole mission costs
     `_PDDL_MISSION_ENERGY` units, see that constant.
     """
-    geometry, laps, drone_count = mission.geometry, mission.laps, mission.drone_count
+    geometry, laps, drone_count = mission.geometry, mission.flown_laps, mission.drone_count
     first, last = geometry.key_points[0][0], geometry.key_points[-1][0]
     total_m = mission.outbound_m + laps * geometry.loop_length_m + mission.inbound_m
     rate = _PDDL_MISSION_ENERGY / total_m
@@ -888,16 +991,16 @@ def retarget_figure8_problem(problem_text: str, mission: Figure8Mission) -> str:
         result = _set_fact_value(result, "distance", a, b, leg_m)
         result = _set_fact_value(result, "energy-required", a, b, leg_m * rate)
 
-    result = _set_scalar_fluent(result, "drone-spacing", geometry.step_m)
-    result = _set_scalar_fluent(result, "train-span", (drone_count - 1) * geometry.step_m)
+    result = _set_scalar_fluent(result, "drone-spacing", mission.slot_spacing_m)
     result = _set_scalar_fluent(
-        result, "min-lobe-length", min(geometry.right_lobe_m, geometry.left_lobe_m)
+        result, "crossing-gap",
+        figure8_crossing_gap(geometry.loop_length_m, geometry.right_lobe_m, mission.slot_count),
     )
     result = _set_scalar_fluent(result, "crossing-clearance", FIGURE8_CROSSING_CLEARANCE_M)
     result = _set_scalar_fluent(result, "laps-required", laps)
     leg_count = laps * (len(geometry.key_points) - 1) + 2
     for k, name in enumerate(figure8_drone_names(drone_count)):
-        result = _set_unary_fact_value(result, "slot-arc-offset", name, -k * geometry.step_m)
+        result = _set_unary_fact_value(result, "slot-arc-offset", name, -k * mission.slot_spacing_m)
         result = _set_unary_fact_value(
             result, "cruise-leg-energy", name, _PDDL_MISSION_ENERGY / leg_count
         )

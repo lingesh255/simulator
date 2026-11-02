@@ -39,16 +39,31 @@ from services.api_client import OrchestrationClient
 from services.mavlink_flight_service import MavlinkFlightService
 from services.plan_service import (
     MIN_CUBE_DRONES,
+    PARABOLA_DRONES,
+    FORMULA4_DRONES,
     MIN_GRID_DRONES,
     PlanRunResult,
     PlanService,
     Figure8ShapeError,
     plan_figure8_mission,
+    planets_distance_error,
     planets_drone_count_error,
     star_drone_count_error,
+    star_show_distance_error,
     plan_kind,
 )
+from engine.battery_mission import (
+    CHARGING_STATION_COUNT,
+    CHARGE_MARGIN_PCT,
+    BatteryRouteError,
+    best_station_route,
+    direct_hop_check,
+    charge_targets,
+    max_hop_m,
+)
 from engine.figure8_problem import figure8_geometry
+from engine.circle_formation_problem import circle_distance_error
+from engine.formula4_problem import formula4_distance_error
 from engine.pddl_problem import LatLon as PddlLatLon
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
@@ -101,6 +116,10 @@ class MainWindow(QMainWindow):
         # fly from and back to, then the 8's left end, the middle point where
         # its lobes cross, and its right end (`_plan_figure8_points`, in
         # that order).
+        #
+        # A battery-aware plan collects a source and a destination; only if
+        # the drone can't fly that on one battery does it go on to collect
+        # `CHARGING_STATION_COUNT` charging stations (`_plan_stations`).
         self.plan_service = PlanService(self)
         self._planning_mode = False
         self._plan_mark_nfz = False
@@ -111,6 +130,7 @@ class MainWindow(QMainWindow):
         self._plan_no_fly_zone: list[LatLon] = []
         self._plan_forest_corners: list[LatLon] = []
         self._plan_figure8_points: list[LatLon] = []
+        self._plan_stations: list[LatLon] = []
 
         # Two interchangeable flight sources with the same surface: the local
         # kinematic preview, and independent drone threads commanded over UDP
@@ -305,6 +325,7 @@ class MainWindow(QMainWindow):
         self.map_viewer.point_picked.connect(self._on_point_picked)
 
         self.fault_injection.fault_requested.connect(self._on_fault_requested)
+        self.fault_injection.clear_requested.connect(self._on_clear_faults)
         self.fault_injection.status_message.connect(self.statusBar().showMessage)
 
         self.mission_planner.plan_requested.connect(self._on_plan_requested)
@@ -324,6 +345,9 @@ class MainWindow(QMainWindow):
             backend.drone_lost.connect(self._on_drone_lost)
             backend.gps_lost.connect(self._on_gps_lost)
             backend.gps_restored.connect(self._on_gps_restored)
+        self.thread_sim.charging_started.connect(self._on_charging_started)
+        self.thread_sim.charging_finished.connect(self._on_charging_finished)
+        self.thread_sim.task_event.connect(self._on_task_event)
         self.thread_sim.link_failed.connect(
             lambda msg: self.statusBar().showMessage(f"Drone node: {msg}", 15000)
         )
@@ -475,6 +499,24 @@ class MainWindow(QMainWindow):
             if not affected:
                 self.flight_sim.resume()
 
+    def _on_clear_faults(self, sysids) -> None:
+        """Clear injected faults - on `sysids`, or on every drone if None -
+        in the flight that is running, and in the backend if connected."""
+        restored = self.flight_sim.clear_faults(sysids) if self.flight_sim.is_active() else []
+        if self._connected:
+            targets = sysids if sysids is not None else [
+                d.config.sysid for d in self.flight_sim.flights
+            ]
+            for sysid in targets:
+                self.client.restore_isr_state(sysid)
+        which = "all drones" if sysids is None else "SYSID(s) " + ", ".join(map(str, sysids))
+        if restored:
+            message = f"Cleared faults on {which} - SYSID(s) {', '.join(map(str, sorted(restored)))} back to normal."
+        else:
+            message = f"Cleared faults on {which}."
+        self.flight_log.log_event(message)
+        self.statusBar().showMessage(message, 8000)
+
     def _on_gps_lost(self, sysid: int) -> None:
         """The drone reports GPS loss and is holding station pending orders."""
         flight = next((f for f in self.flight_sim.flights if f.config.sysid == sysid), None)
@@ -603,6 +645,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_flight_finished(self, total_s: float) -> None:
+        if self.thread_sim._task is not None:
+            self.flight_label.setText(f"Task-Allocation ended - {format_duration(total_s)}")
+            self.drone_management.set_running(False)
+            self._on_task_event(self.thread_sim._task.message)
+            return
         lost = [f.config.sysid for f in self.flight_sim.flights if f.is_lost]
         landed = [f.config.sysid for f in self.flight_sim.flights if not f.is_lost]
         self.flight_label.setText(f"Flight complete - {format_duration(total_s)}")
@@ -631,12 +678,14 @@ class MainWindow(QMainWindow):
         self._plan_no_fly_zone = []
         self._plan_forest_corners = []
         self._plan_figure8_points = []
+        self._plan_stations = []
         self.client.stop_swarm()
         self.client.disconnect_telemetry()
         self.map_viewer.clear_markers()
         self.map_viewer.clear_drones()
         self.map_viewer.clear_paths()
         self.map_viewer.clear_restricted_area()
+        self.map_viewer.clear_planned_route()
         self.fault_injection.update_active_sysids([])
         self.flight_log.log_event("Run stopped - swarm torn down, inputs unlocked.")
         self.statusBar().showMessage("Swarm stopped. Configuration inputs unlocked.")
@@ -699,10 +748,12 @@ class MainWindow(QMainWindow):
         self._plan_no_fly_zone = []
         self._plan_forest_corners = []
         self._plan_figure8_points = []
+        self._plan_stations = []
         self._plan_mark_nfz = self.mission_planner.mark_restricted_area()
         self._planning_mode = True
         self.map_viewer.clear_markers()
         self.map_viewer.clear_restricted_area()
+        self.map_viewer.clear_planned_route()
         self.map_viewer.mode_combo.setCurrentText("Set Start Point")
         if self._plan_kind == "area_coverage":
             self.statusBar().showMessage(
@@ -714,11 +765,15 @@ class MainWindow(QMainWindow):
             )
         elif self._plan_kind == "star_formation":
             self.statusBar().showMessage(
-                f"Plan '{plan_name}' armed - click the place to perform the show (the source)."
+                f"Plan '{plan_name}' armed - click the SOURCE the drones take off from and land back at."
             )
         elif self._plan_kind == "planets_formation":
             self.statusBar().showMessage(
-                f"Plan '{plan_name}' armed - click the source (the sun) for the drones to orbit."
+                f"Plan '{plan_name}' armed - click the SOURCE the drones take off from and land back at."
+            )
+        elif self._plan_kind == "battery_aware":
+            self.statusBar().showMessage(
+                f"Plan '{plan_name}' armed - click the SOURCE the drone takes off from."
             )
         else:
             self.statusBar().showMessage(f"Plan '{plan_name}' armed - click the Start point on the map.")
@@ -733,9 +788,21 @@ class MainWindow(QMainWindow):
         if self._plan_kind == "figure8_formation":
             self._handle_figure8_plan_click(point)
             return
+        if self._plan_kind == "battery_aware":
+            self._handle_battery_plan_click(point)
+            return
         if self._plan_kind in ("star_formation", "planets_formation"):
-            # A show stays in one place: the source is the only click.
-            self._plan_source = point
+            # The source (take-off pads), then the destination (the show).
+            if self._plan_source is None:
+                self._plan_source = point
+                self.map_viewer.mode_combo.setCurrentText("Set Destination Point")
+                where = "the sun to orbit" if self._plan_kind == "planets_formation" else "where the show is performed"
+                self.statusBar().showMessage(
+                    f"Plan '{self._pending_plan_name}': source set at ({point.lat:.5f}, "
+                    f"{point.lon:.5f}) - now click the DESTINATION, {where}."
+                )
+                return
+            self._plan_destination = point
             self._planning_mode = False
             self._run_planned_mission()
             return
@@ -839,6 +906,98 @@ class MainWindow(QMainWindow):
         self._plan_destination = point
         self._run_planned_mission()
 
+    def _handle_battery_plan_click(self, point: LatLon) -> None:
+        """Consume one click of an armed battery-aware plan: the source, the
+        destination, then `CHARGING_STATION_COUNT` charging stations, each
+        marked with a battery on the map - always, even when the drone could
+        fly straight there; the planner then decides whether any are used.
+        Planning starts once the last station is in."""
+        name = self._pending_plan_name
+        if self._plan_source is None:
+            self._plan_source = point
+            self.map_viewer.mode_combo.setCurrentText("Set Destination Point")
+            self.statusBar().showMessage(
+                f"Plan '{name}': source set at ({point.lat:.5f}, {point.lon:.5f}) - "
+                f"now click the DESTINATION."
+            )
+            return
+
+        if self._plan_destination is None:
+            checked = self.drone_management.checked_drones()
+            if not checked:
+                QMessageBox.information(
+                    self, "No active drones",
+                    "Check a drone in the Drone Management panel, then click the "
+                    "destination again - the battery check needs to know which drone flies.",
+                )
+                self.map_viewer.marker_model.remove_point("destination")
+                return
+            self._plan_destination = point
+            drone = checked[0]
+            # Always wait for the stations; whether they are needed is
+            # decided once they are in (the planner flies direct if it can).
+            enough, hop = direct_hop_check(drone, self._pddl(self._plan_source), self._pddl(point))
+            verdict = (
+                "its current charge reaches the destination, so it will fly there directly "
+                "and won't use the stations."
+                if enough
+                else "that is more than its current charge allows, so it will charge at "
+                "stations on the way."
+            )
+            self.map_viewer.mode_combo.setCurrentText("Set Charging Station")
+            QMessageBox.information(
+                self, "Battery-Aware: place the charging stations",
+                f"{drone.name} needs about {hop.energy_pct:.0f}% of its battery for the "
+                f"{hop.distance_m / 1000:.1f} km straight to the destination (plus "
+                f"{CHARGE_MARGIN_PCT:.0f}% to spare) - {verdict}\n\n"
+                f"On a full charge it flies about {max_hop_m(drone) / 1000:.1f} km per hop.\n\n"
+                f"Click {CHARGING_STATION_COUNT} charging stations on the map. At each station it "
+                f"uses, the drone lands and charges only what the next hop needs plus "
+                f"{CHARGE_MARGIN_PCT:.0f}%, then takes off again; once the destination is in "
+                f"reach it flies straight there, skipping the stations in between.",
+            )
+            self.statusBar().showMessage(
+                f"Plan '{name}': click charging station 1 of {CHARGING_STATION_COUNT}."
+            )
+            return
+
+        self._plan_stations.append(point)
+        number = len(self._plan_stations)
+        self.map_viewer.marker_model.set_point(f"charging_station:{number}", point.lat, point.lon)
+        if number < CHARGING_STATION_COUNT:
+            self.statusBar().showMessage(
+                f"Plan '{name}': charging station {number} of {CHARGING_STATION_COUNT} set - "
+                f"click the next one."
+            )
+            return
+
+        drone = self.drone_management.checked_drones()[:1]
+        try:
+            if not drone:
+                raise BatteryRouteError("No drone is checked in the Drone Management panel.")
+            best_station_route(
+                drone[0], self._pddl(self._plan_source), self._pddl(self._plan_destination),
+                [self._pddl(p) for p in self._plan_stations],
+            )
+        except BatteryRouteError as exc:
+            QMessageBox.warning(
+                self, "Battery-Aware: no route",
+                f"{exc}\n\nClick the {CHARGING_STATION_COUNT} charging stations again.",
+            )
+            for k in range(1, number + 1):
+                self.map_viewer.marker_model.remove_point(f"charging_station:{k}")
+            self._plan_stations = []
+            self.statusBar().showMessage(
+                f"Plan '{name}': click charging station 1 of {CHARGING_STATION_COUNT} again."
+            )
+            return
+        self._planning_mode = False
+        self._run_planned_mission()
+
+    @staticmethod
+    def _pddl(point: LatLon) -> PddlLatLon:
+        return PddlLatLon(lat=point.lat, lon=point.lon)
+
     def _figure8_points_pddl(self) -> list[PddlLatLon]:
         """base, left end, middle, right end - as the engine's LatLon."""
         return [PddlLatLon(lat=p.lat, lon=p.lon) for p in self._plan_figure8_points]
@@ -846,9 +1005,7 @@ class MainWindow(QMainWindow):
     def _run_planned_mission(self) -> None:
         if self._plan_source is None or self._pending_plan_name is None:
             return
-        if self._plan_kind in ("star_formation", "planets_formation"):
-            pass  # the source is all a show needs
-        elif self._plan_kind == "figure8_formation":
+        if self._plan_kind == "figure8_formation":
             if len(self._plan_figure8_points) < 4:
                 return
         elif self._plan_kind == "area_coverage":
@@ -886,6 +1043,15 @@ class MainWindow(QMainWindow):
                 "distinct SYSID.",
             )
             return
+        if self._plan_kind == "task_allocation":
+            if len(checked) != 4:
+                QMessageBox.information(self, "Task-Allocation needs four drones",
+                                        "Check exactly four drones: one initial drone and three standbys.")
+                return
+            if self.mission_planner.use_external_mavlink():
+                QMessageBox.information(self, "Task-Allocation uses drone threads",
+                                        "Uncheck 'Fly via real MAVLink' to run automatic task handoffs in the simulator.")
+                return
         if self._plan_kind == "area_coverage" and len(checked) < 2:
             QMessageBox.information(
                 self, "Area search needs at least 2 drones",
@@ -926,20 +1092,98 @@ class MainWindow(QMainWindow):
                 "25 -> 3x3x3).",
             )
             return
+        if self._plan_kind == "parabola_formation" and len(checked) < PARABOLA_DRONES:
+            QMessageBox.information(
+                self, "Parabola formation needs 3 drones",
+                "A parabola formation flies three drones side by side - one in the "
+                "middle at 50 m and one either side of it at 60 m - so it needs "
+                f"{PARABOLA_DRONES} checked drones. {len(checked)} are currently "
+                "checked.\n\nIf more are checked, the first three fly it and the "
+                "rest stay on the ground.",
+            )
+            return
+        if self._plan_kind == "formula4_formation":
+            if len(checked) < FORMULA4_DRONES:
+                QMessageBox.information(
+                    self, "Formula-4 needs 4 drones",
+                    "Formula-4 flies four drones in two lines of two - drones 1 and 2 in "
+                    "front, 3 and 4 behind - swapping places all the way, so it needs "
+                    f"{FORMULA4_DRONES} checked drones. {len(checked)} are currently "
+                    "checked.\n\nIf more are checked, the first four fly it (in the order "
+                    "they are checked: drone 1, 2, 3, 4) and the rest stay on the ground.",
+                )
+                return
+            problem = formula4_distance_error(
+                PddlLatLon(lat=self._plan_source.lat, lon=self._plan_source.lon),
+                PddlLatLon(lat=self._plan_destination.lat, lon=self._plan_destination.lon),
+            )
+            if problem:
+                QMessageBox.information(
+                    self, "Formula-4 destination too close",
+                    problem + "\n\nClick the source and the destination again.",
+                )
+                self._on_plan_requested(self._pending_plan_name)  # re-arm for fresh clicks
+                return
+        if self._plan_kind == "circle_formation":
+            if len(checked) < FORMULA4_DRONES:
+                QMessageBox.information(
+                    self, "Formation-Circle needs 4 drones",
+                    "Formation-Circle flies four drones on a circle - drone 1 at the bottom "
+                    "(40 m), 2 on the left and 4 on the right (50 m), 3 at the top (60 m) - "
+                    f"so it needs {FORMULA4_DRONES} checked drones. {len(checked)} are "
+                    "currently checked.\n\nIf more are checked, the first four fly it (in the "
+                    "order they are checked: drone 1, 2, 3, 4) and the rest stay on the ground.",
+                )
+                return
+            problem = circle_distance_error(
+                PddlLatLon(lat=self._plan_source.lat, lon=self._plan_source.lon),
+                PddlLatLon(lat=self._plan_destination.lat, lon=self._plan_destination.lon),
+            )
+            if problem:
+                QMessageBox.information(
+                    self, "Formation-Circle destination too close",
+                    problem + "\n\nClick the source and the destination again.",
+                )
+                self._on_plan_requested(self._pending_plan_name)  # re-arm for fresh clicks
+                return
         if self._plan_kind == "star_formation":
             problem = star_drone_count_error(len(checked))
             if problem:
                 QMessageBox.information(self, "Star show needs a different number of drones", problem)
+                return
+            problem = star_show_distance_error(
+                PddlLatLon(lat=self._plan_source.lat, lon=self._plan_source.lon),
+                PddlLatLon(lat=self._plan_destination.lat, lon=self._plan_destination.lon),
+                len(checked),
+            )
+            if problem:
+                QMessageBox.information(
+                    self, "Star show destination too close",
+                    problem + "\n\nClick the source and the destination again.",
+                )
+                self._on_plan_requested(self._pending_plan_name)  # re-arm for fresh clicks
                 return
         if self._plan_kind == "planets_formation":
             problem = planets_drone_count_error(len(checked))
             if problem:
                 QMessageBox.information(self, "Planets needs a different number of drones", problem)
                 return
+            problem = planets_distance_error(
+                PddlLatLon(lat=self._plan_source.lat, lon=self._plan_source.lon),
+                PddlLatLon(lat=self._plan_destination.lat, lon=self._plan_destination.lon),
+                len(checked),
+            )
+            if problem:
+                QMessageBox.information(
+                    self, "Planets destination too close",
+                    problem + "\n\nClick the source and the destination again.",
+                )
+                self._on_plan_requested(self._pending_plan_name)  # re-arm for fresh clicks
+                return
         if self._plan_kind == "figure8_formation":
-            # The clicks must make a flyable 8 and base, and the whole train
-            # must fit - inside the smaller lobe with room to spare at the
-            # crossing, and clear of itself on the trip out and back.
+            # The clicks must make a flyable 8 and base, and the drones must
+            # fit - spread evenly round the 8 without meeting at its
+            # crossing, and clear of each other on the trip out and back.
             base, left, crossing, right = self._figure8_points_pddl()
             try:
                 mission = plan_figure8_mission(
@@ -957,10 +1201,22 @@ class MainWindow(QMainWindow):
             self.map_viewer.set_restricted_area(mission.preview_path())
         self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
         self.statusBar().showMessage(f"Running ENHSP for plan '{self._pending_plan_name}'...")
-        if self._plan_kind in ("star_formation", "planets_formation"):
+        if self._plan_kind == "task_allocation":
+            self._task_planning_drones = list(checked)
+            self.plan_service.run_task_async(
+                self._pending_plan_name, self._plan_source, self._plan_destination, checked,
+            )
+        elif self._plan_kind == "battery_aware":
+            # One drone; any further checked drones stay on the ground.
+            self.plan_service.run_battery_async(
+                self._pending_plan_name, self._plan_source, self._plan_destination,
+                self._plan_stations, checked[0],
+            )
+        elif self._plan_kind in ("star_formation", "planets_formation"):
             self.plan_service.run_show_async(
                 self._pending_plan_name, self._plan_source,
                 drone_count=len(checked), laps=self.mission_planner.figure8_laps(),
+                destination=self._plan_destination,
             )
         elif self._plan_kind == "figure8_formation":
             base, left, crossing, right = self._plan_figure8_points
@@ -1004,14 +1260,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Plan ready, but no drones are checked to fly it.")
             return
 
+        if result.task_initial_drone is not None:
+            self._start_task_allocation(result, getattr(self, "_task_planning_drones", drones))
+            return
+        if self._plan_kind == "battery_aware":
+            self._start_battery_mission(result, drones[0])
+            return
+
         if result.per_drone_waypoints is not None:
             if self._plan_kind == "road_inspection":
                 # Show the road being inspected; one drone flies it (any
                 # further checked drones stay on the ground).
                 self.map_viewer.set_restricted_area(result.waypoints)
+            if self._plan_kind in ("formula4_formation", "circle_formation"):
+                # The formation's centre line, source to destination.
+                self.map_viewer.set_planned_route(result.waypoints)
             if self._plan_kind in (
-                "formation", "grid_formation", "cube_formation", "figure8_formation", "star_formation",
-                "planets_formation",
+                "formation", "grid_formation", "cube_formation", "parabola_formation",
+                "figure8_formation", "star_formation", "planets_formation", "formula4_formation",
+                "circle_formation",
             ):
                 noun = "slot"
             elif self._plan_kind == "road_inspection":
@@ -1068,6 +1335,122 @@ class MainWindow(QMainWindow):
         )
         self._pending_plan_name = None
         self._plan_source = None
+
+    def _on_task_event(self, message: str) -> None:
+        self.flight_log.log_event(message)
+        self.mission_planner.set_status(message)
+        self.statusBar().showMessage(message)
+        if message.startswith("Task-Allocation failed") and message != getattr(self, "_task_failure_shown", None):
+            # Easy to miss in the status bar, and it ends the mission. Once:
+            # the end of the flight repeats the last task message.
+            self._task_failure_shown = message
+            QMessageBox.warning(self, "Task-Allocation: no drone can take over", message)
+
+    def _start_task_allocation(self, result, drones):
+        # A replacement launches from the source, so it needs the battery for
+        # the whole route. Say up front if no drone could take over.
+        flights = plan_route_flights(drones, result.waypoints)
+        capable = [f for f in flights if f.feasible]
+        if len(capable) < 2:
+            distance_km = flights[0].distance_m / 1000.0
+            detail = "\n".join(
+                f"- {f.config.name} (SYSID {f.config.sysid}): {f.config.battery_capacity_mah:,.0f} mAh, "
+                f"range about {f.range_m / 1000:.1f} km - "
+                + ("can fly it" if f.feasible else "can NOT fly it")
+                for f in flights
+            )
+            QMessageBox.warning(
+                self, "Task-Allocation: no backup drone",
+                f"The route is {distance_km:.1f} km. A replacement takes off from the source, so "
+                f"it needs the battery for the whole route - and only "
+                f"{len(capable)} of the 4 drones has it:\n\n{detail}\n\n"
+                "The mission will fly, but if the first drone develops a fault, no other drone "
+                "can take the task over. Pick a shorter route, or give the standby drones more "
+                "battery (Drone Management > Edit), for a working handoff.",
+            )
+        threads_index = self.backend_combo.findData("threads")
+        if threads_index >= 0:
+            self.backend_combo.setCurrentIndex(threads_index)
+        self.map_viewer.clear_paths()
+        self.map_viewer.set_planned_route(result.waypoints)
+        if not self.thread_sim.start_task_allocation(drones, result.waypoints, result.task_initial_drone):
+            self.drone_management.set_running(False)
+            self._on_task_event("Task-Allocation could not start; check the drone profiles and replan.")
+            return
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([d.sysid for d in drones])
+        self._pending_plan_name = None
+        self._plan_source = None
+
+    def _start_battery_mission(self, result: PlanRunResult, drone) -> None:
+        """Fly a battery-aware plan: show the route, turn the stations it
+        uses green, and fly it hop by hop - landing, charging and taking off
+        again at each of those stations (see
+        `ThreadSwarmBackend.start_charging_mission`)."""
+        stops = result.location_names
+        stations = [n for n in stops if n.startswith("station")]
+        for station in stations:
+            number = station.removeprefix("station")
+            point = result.waypoints[stops.index(station)]
+            self.map_viewer.marker_model.remove_point(f"charging_station:{number}")
+            self.map_viewer.marker_model.set_point(f"charging_station_used:{number}", point.lat, point.lon)
+        self.map_viewer.set_planned_route(result.waypoints)
+
+        threads_index = self.backend_combo.findData("threads")
+        if threads_index >= 0 and self.backend_combo.currentIndex() != threads_index:
+            self.backend_combo.setCurrentIndex(threads_index)
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([drone.sysid])
+        self.map_viewer.clear_paths()
+        targets = charge_targets(drone, [self._pddl(p) for p in result.waypoints])
+        if not self.thread_sim.start_charging_mission(drone, result.waypoints, stops, targets):
+            self.drone_management.set_running(False)
+            self.statusBar().showMessage("Could not start the drone node for the planned mission - see the log.")
+            return
+
+        distance_km = sum(
+            haversine_m(a, b) for a, b in zip(result.waypoints, result.waypoints[1:])
+        ) / 1000.0
+        route_text = " -> ".join(
+            f"C{n.removeprefix('station')}" if n.startswith("station") else n for n in stops
+        )
+        charge_text = (
+            f"charging at {len(stations)} station(s)" if stations
+            else "direct - its current charge reaches the destination, no charging needed"
+        )
+        self.flight_log.log_event(
+            f"Battery-aware route for {drone.name}: {route_text} ({distance_km:.1f} km, {charge_text})."
+        )
+        for station, target, next_stop in zip(stations, targets, stops[2:]):
+            label = "the destination" if next_stop == "destination" else f"C{next_stop.removeprefix('station')}"
+            self.flight_log.log_event(
+                f"    at C{station.removeprefix('station')}: charge to {target:.0f}% "
+                f"(the hop to {label} needs {target - CHARGE_MARGIN_PCT:.0f}% + {CHARGE_MARGIN_PCT:.0f}%)"
+            )
+        self.mission_planner.set_status(
+            f"Flying plan '{result.plan_name}' with {drone.name}: {route_text}, "
+            f"{distance_km:.1f} km, {charge_text}."
+        )
+        self.statusBar().showMessage(
+            f"Flying {drone.name} on plan '{result.plan_name}' - {distance_km:.1f} km, {charge_text}."
+        )
+        self._pending_plan_name = None
+        self._plan_source = None
+
+    def _on_charging_started(self, sysid: int, station: str, battery_pct: float, target_pct: float) -> None:
+        label = f"C{station.removeprefix('station')}"
+        message = (
+            f"SYSID {sysid} landed at charging station {label} ({battery_pct:.0f}% battery) - "
+            f"charging to {target_pct:.0f}%."
+        )
+        self.flight_log.log_event(message)
+        self.statusBar().showMessage(message)
+
+    def _on_charging_finished(self, sysid: int, station: str, battery_pct: float, target_pct: float) -> None:
+        label = f"C{station.removeprefix('station')}"
+        message = f"SYSID {sysid} charged to {battery_pct:.0f}% at {label} - taking off for the next hop."
+        self.flight_log.log_event(message)
+        self.statusBar().showMessage(message)
 
     def _start_external_mavlink_mission(self, result: PlanRunResult, drones: list) -> None:
         """Fly the solved route as one real MAVLink mission against an
@@ -1257,11 +1640,15 @@ class MainWindow(QMainWindow):
         # A figure-8 needs every drone (checked above), so its train routes
         # line up with the assignments one to one.
         train_routes = list(result.train_routes.values()) if result.train_routes else None
-        # A drone show plays at its own (slower) speed - see the planner
-        # panel's "Show speed".
+        # A drone show or the figure-8 plays at its own (slower) speed - see
+        # the planner panel's "Show speed".
         time_scale = (
             self.mission_planner.show_time_scale()
-            if self._plan_kind in ("star_formation", "planets_formation") else None
+            if self._plan_kind in (
+                "star_formation", "planets_formation", "figure8_formation", "formula4_formation",
+                "circle_formation",
+            )
+            else None
         )
         if not self.thread_sim.start_mission_paths(
             cleared_assignments, cleared_offsets, train_routes=train_routes, time_scale=time_scale
@@ -1274,6 +1661,23 @@ class MainWindow(QMainWindow):
             f", {result.laps} lap(s)"
             if self._plan_kind in ("figure8_formation", "star_formation", "planets_formation") else ""
         )
+        if self._plan_kind in ("formula4_formation", "circle_formation"):
+            # One trail colour per drone, so the swaps / the spiral show up on the map.
+            self.map_viewer.set_path_colors({
+                d.sysid: colour
+                for (d, _r), colour in zip(cleared_assignments, ("#e74c3c", "#2980b9", "#27ae60", "#f39c12"))
+            })
+        if self._plan_kind == "formula4_formation":
+            swaps = sum(1 for s in result.steps if s.args and s.args[0] == "drone1"
+                        and s.action in ("slow-and-dip", "speed-up-and-climb"))
+            laps_text = f", {swaps} swap(s) per pair, no drone-to-drone communication"
+        elif self._plan_kind == "circle_formation":
+            quarters = sum(1 for s in result.steps if s.args and s.args[0] == "drone1"
+                           and s.action == "turn-quarter")
+            laps_text = (
+                f", {quarters // 4} full turn(s) of the circle ({quarters} position changes), "
+                f"no drone-to-drone communication"
+            )
         self.mission_planner.set_status(
             f"Flying plan '{result.plan_name}' - {len(cleared_assignments)} drone(s), "
             f"{len(routes)} {route_noun}(s){laps_text}, {total_distance_km:.1f} km combined."
@@ -1292,6 +1696,8 @@ class MainWindow(QMainWindow):
         title = "Mission planning failed"
         if self._plan_kind == "road_inspection":
             title = "Inspect: no road route"
+        elif self._plan_kind == "battery_aware":
+            title = "Battery-Aware: no route"
         QMessageBox.warning(self, title, message)
         self.statusBar().showMessage("Mission planning failed - see the dialog.", 8000)
 
@@ -1304,7 +1710,7 @@ class MainWindow(QMainWindow):
             return
         self.map_viewer.update_drones(batch.drones)
         self.flight_log.log_batch(self._glide_matched_telemetry(batch.drones))
-        self.fault_injection.update_active_sysids([d.sysid for d in batch.drones])
+        self.fault_injection.update_drones(batch.drones)
 
     def _glide_matched_telemetry(self, drones: list) -> list:
         """The Flight Log reads the same glide-smoothed lat/lon/altitude the

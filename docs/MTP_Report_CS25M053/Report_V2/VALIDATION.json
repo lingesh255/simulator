@@ -1,0 +1,15 @@
+{
+  "pages": 52,
+  "title": true,
+  "cover_date": true,
+  "no_blank_pages": true,
+  "no_appendix": true,
+  "no_inline_citations": true,
+  "communication_diagrams": 10,
+  "sample_outputs": 10,
+  "no_overfull_boxes": true,
+  "no_undefined_references": true,
+  "final_conclusion": true,
+  "source_sha256": "d6e1d13ab67470729e9aa5af21141e8586e72a1b4388d376bac8a8a8f52f43bb",
+  "pdf_sha256": "2a0867864ec6a9f8d54c4174a198c8128a2059260af0d768a4b478f0e7a5bf3a"
+}

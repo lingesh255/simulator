@@ -44,6 +44,9 @@ class MapViewer(QWidget):
         self.marker_model = PointMarkerModel(self)
         self.path_model = PathModel(self)
         self.restricted_area_model = RestrictedAreaModel(self)
+        # An open planned route (a battery-aware plan's hops), drawn as a line.
+        # Same one-list-of-points shape as the restricted area, so same model.
+        self.planned_route_model = RestrictedAreaModel(self)
 
         self.quick_widget = QQuickWidget()
         self.quick_widget.setResizeMode(QQuickWidget.SizeRootObjectToView)
@@ -61,6 +64,7 @@ class MapViewer(QWidget):
         context.setContextProperty("markerModel", self.marker_model)
         context.setContextProperty("pathModel", self.path_model)
         context.setContextProperty("restrictedAreaModel", self.restricted_area_model)
+        context.setContextProperty("plannedRouteModel", self.planned_route_model)
         context.setContextProperty("tileCacheDir", str(TILE_CACHE_DIR))
         context.setContextProperty("offlineMode", False)
         self.quick_widget.setSource(QUrl.fromLocalFile(str(QML_PATH)))
@@ -72,7 +76,10 @@ class MapViewer(QWidget):
         # ---- Toolbar: interaction mode ----
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(
-            ["View", "Set Start Point", "Set Destination Point", "Set Restricted Area", "Set Forest Area"]
+            [
+                "View", "Set Start Point", "Set Destination Point", "Set Restricted Area",
+                "Set Forest Area", "Set Charging Station",
+            ]
         )
 
         self.offline_check = QCheckBox("Offline mode (use cached tiles only)")
@@ -193,6 +200,10 @@ class MapViewer(QWidget):
             # Same corner-by-corner overlay as "Set Restricted Area" above,
             # reused for the area-coverage mission's search-area polygon.
             self.point_picked.emit("forest_corner", lat, lon)
+        elif mode == "Set Charging Station":
+            # No pin here either: `MainWindow` numbers the stations and
+            # places each one's battery marker itself.
+            self.point_picked.emit("charging_station", lat, lon)
 
     def current_mode(self) -> str:
         return self.mode_combo.currentText()
@@ -287,3 +298,11 @@ class MapViewer(QWidget):
 
     def clear_restricted_area(self) -> None:
         self.restricted_area_model.clear()
+
+    def set_planned_route(self, points: list) -> None:
+        """An open route to draw as a line - objects with `.lat`/`.lon`, in
+        flying order."""
+        self.planned_route_model.set_polygon([(p.lat, p.lon) for p in points])
+
+    def clear_planned_route(self) -> None:
+        self.planned_route_model.clear()

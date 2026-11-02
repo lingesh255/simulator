@@ -1,0 +1,704 @@
+PAGE 1
+DEPARTMENT OF ELECTRICAL ENGINEERING
+INDIAN INSTITUTE OF TECHNOLOGY MADRAS
+CHENNAI – 600036
+My Thesis Title
+A Thesis
+Submitted by
+MYFIRSTNAME MYLASTNAME
+For the award of the degree
+Of
+DOCTOR OF PHILOSOPHY
+July 2022
+
+PAGE 2
+
+
+PAGE 3
+DEPARTMENT OF ELECTRICAL ENGINEERING
+INDIAN INSTITUTE OF TECHNOLOGY MADRAS
+CHENNAI – 600036
+My Thesis Title
+A Thesis
+Submitted by
+MYFIRSTNAME MYLASTNAME
+For the award of the degree
+Of
+DOCTOR OF PHILOSOPHY
+July 2022
+© 2022 Indian Institute of Technology Madras
+
+PAGE 4
+
+
+PAGE 5
+A quotable quote that is quoted by the quoter
+– Quote Author
+
+PAGE 6
+
+
+PAGE 7
+To whoever, whatever, wherever or whenever, or all of those, or
+none at all
+
+PAGE 8
+
+
+PAGE 9
+THESIS CERTIFICATE
+This is to undertake that the Thesis titledMY THESIS TITLE, submitted by me to the
+Indian Institute of Technology Madras, for the award ofDoctor of Philosophy, is a bona
+fide record of the research work done by me under the supervision ofDr. Firstname
+Lastname. The contents of this Thesis, in full or in parts, have not been submitted to
+any other Institute or University for the award of any degree or diploma.
+In order to effectively convey the idea presented in this Thesis, the following work of
+other authors or sources was reprinted in the Thesis with their permission:
+1. Figures 4.2(a, b, d) and (g) are distributed under the GNU GPL v2 or higher and
+are free to use. Figures 4.2(e, f) are distributed under the Creative Commons
+Attribution-Share Alike 4.0 International license and are free to use
+2. Figure 4.2(c) is copyright Aurelio A. Heckert, and licensed under the Free Art
+License. Figure 4.2(h) is freely distributed under the Artistic License v2 or higher
+Chennai 600036
+Date: July 2022
+Myfirstname Mylastname
+Dr. Whoever
+Research advisor
+Professor
+Department of Whatever
+IIT Madras
+Dr. Whoever
+Research co-advisor
+Professor
+Department of Whatever
+IIT Madras
+© 2022 Indian Institute of Technology Madras
+
+PAGE 10
+
+
+PAGE 11
+LIST OF PUBLICATIONS
+I. REFEREED JOURNALS BASED ON THESIS
+whatever
+II. REFEREED JOURNALS (OTHERS)
+whatever
+III. PRESENTATIONS IN CONFERENCES
+whatever
+IV. PUBLICATIONS IN CONFERENCE PROCEEDINGS
+whatever
+
+PAGE 12
+
+
+PAGE 13
+ACKNOWLEDGEMENTS
+Here is where one would thank others for their assistance with the thesis, in whatever
+shape or form. While, this section is optional, almost all theses contain it.
+i
+
+PAGE 14
+
+
+PAGE 15
+ABSTRACT
+KEYWORDS LATEX; template; dissertation; thesis; synopsis; here; is; a; long; list;
+of; keywords; one; can; have; as; many; as; desired
+This is a minimal template to get one started. The abstract typically contains a brief
+gist of the thesis. Common guideslines to effective abstract writing are available on the
+internet.
+iii
+
+PAGE 16
+
+
+PAGE 17
+CONTENTS
+Page
+ACKNOWLEDGEMENTS i
+ABSTRACT iii
+LIST OF TABLES vii
+LIST OF FIGURES ix
+GLOSSARY xi
+ABBREVIATIONS xiii
+NOTATION xv
+CHAPTER 1 INTRODUCTION CHAPTER NAME 1
+1.1 The first section . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 1
+1.1.1 A subsection . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 1
+1.2 This is an example of a very long section header, highly discouraged,
+but it works nonetheless . . . . . . . . . . . . . . . . . . . . . . . . . 1
+CHAPTER 2 ITEMIZED LISTS AND QUOTES 3
+2.1 Unnumbered lists . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 3
+2.2 Numbered lists . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 4
+2.3 More complex lists made easy . . . . . . . . . . . . . . . . . . . . . . 6
+2.4 Quotes . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+2.5 Footnotes . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 7
+CHAPTER 3 MATHEMATICS 9
+3.1 Equations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+3.2 Conveniences . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 10
+CHAPTER 4 FIGURES AND TABLES 11
+4.1 Figures . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 11
+4.2 Tables . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 12
+4.3 Bibliography References . . . . . . . . . . . . . . . . . . . . . . . . . 14
+APPENDIX A GENERAL NOTES 15
+A.1 Source files . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+A.2 Some useful packages . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+v
+
+PAGE 18
+REFERENCES 19
+CURRICULUM VITAE 21
+DOCTORAL COMMITTEE 23
+vi
+
+PAGE 19
+LIST OF TABLES
+Table Caption Page
+4.1 Shown below is a simple elegant table with a very long caption. Tables
+are quite helpful in organizing information in a presentable manner. . . 13
+4.2 A complex table is shown here. Careful use of the column specifiers
+along with thoughtful (re)organization of the material can yield great
+results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+4.3 A complex table is shown here. Sometimes, one might need to have cell
+entries which span more than a single row; this too is possible as shown
+below . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+A.1 A list of commonly required (some of which are pre-loaded) packages
+along with links to their documentation . . . . . . . . . . . . . . . . . 17
+vii
+
+PAGE 20
+
+
+PAGE 21
+LIST OF FIGURES
+Figure Caption Page
+4.1 This is a photo of Tux. He is a very friendly penguin. We will meet his
+friends shortly. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 11
+4.2 Tux with his various friends. Notice that captions of figures are placed
+below the figure and are properly line spaced as per the guidelines . . . 12
+ix
+
+PAGE 22
+
+
+PAGE 23
+GLOSSARY
+LATEX LATEXisapopularmacropackagefordocument
+preparation.
+Computer Science and ProgrammingAn art form that is commonly associated with
+bringing silicon to life.
+Engineering A popular scientific discipline.
+Mathematics A very versatile language.
+Physics Trying to understand the world by describing
+it using mathematics.
+xi
+
+PAGE 24
+
+
+PAGE 25
+ABBREVIATIONS
+DC Doctoral Committee.
+GTC General Test Committee.
+IITM IIT Madras.
+MS Master of Science.
+Ph.D Doctor of Philosophy.
+xiii
+
+PAGE 26
+
+
+PAGE 27
+NOTATION
+𝜖0 the dielectric constant of free space
+𝜋 ratio of the circumference of a circle to its diameter
+𝜏 ratio of the circumference of a circle to its radius
+𝑐 the speed of light in vacuum
+xv
+
+PAGE 28
+
+
+PAGE 29
+CHAPTER 1
+INTRODUCTION CHAPTER NAME
+This is a generic introduction chapter. Some people might call it an overview. You can
+give it any name of your choice really. However, it is the first chapter of this thesis, so it
+deserves a decent name.
+1.1 THE FIRST SECTION
+This, as you can see is the first section inside this chapter. A chapter rarely, if ever, starts
+with a section. Instead, some material setting the context for the material in this section
+should precede it. Quite often, one wants to treat material in further detail. Subsections
+might be used for this purpose.
+1.1.1 A subsection
+Here we are in a subsection. The third level of the document’s sectioning structure. This
+is the deepest sectioning level allowed. Levels deeper than this are not recommended.
+Veryoftenonecanriddocumentsofdeep, nestedlevelsbysomethoughtfulrestructuring
+of the material. A good exercise, indeed, and one that makes for a better dissertation.
+1.2 THIS IS AN EXAMPLE OF A VERY LONG SECTION HEADER, HIGHLY
+DISCOURAGED, BUT IT WORKS NONETHELESS
+Here are some references to terms in the glossary: LATEX Mathematics Physics
+
+PAGE 30
+
+
+PAGE 31
+CHAPTER 2
+ITEMIZED LISTS AND QUOTES
+Itemized lists work as one would expect. They are properly line-spaced. Refer to the
+tutorial for more details. In general, it is better to start a new paragraph (i.e. place a
+blank line in the source file) at the start of a new enumerate block. This ensures that the
+line-spacing options are activated correctly.
+Linespacingofitemsinthelistandthespacingofthelistwithrespecttothesurrounding
+textual matter is set as per the institute guidelines.
+2.1 UNNUMBERED LISTS
+These are the standard “bulleted” lists that one is familiar with.
+• this
+• is
+• a bulletted
+• list
+this is the next paragraph
+⋄ this
+⋄ is
+⋄ a dashed
+⋄ list
+and this is the next paragraph
+– this
+■ is
+
+PAGE 32
+• a mixed
+– list
+and this is the next paragraph
+★ this
+★ is
+• a mixed
+★ list
+and this is the next paragraph
+□ this
+□ is
+□ square
+□ list
+and this is the next paragraph
+■ this
+■ is
+■ square
+■ list
+2.2 NUMBERED LISTS
+These are the standard numbered lists that one might be familiar with.
+1. this
+2. is a
+3. numbered
+4. list
+4
+
+PAGE 33
+this is the next paragraph
+i. this
+ii. is a
+iii. roman-numbered
+iv. list
+this is the next paragraph
+I] this
+II] is a
+III] capitalized roman-numbered
+IV] list
+this is the next paragraph
+a) this
+b) is an
+c) alphabetical
+d) list
+this is the next paragraph
+A} this
+B} is the
+C} last
+D} This is what that author said and it is rather important. That is the reason I am
+quoting the entire passage here for reference and completeness
+a) This is what that author said and it is rather important. That is the reason I
+am quoting the entire passage here for reference and completeness
+b) This is what that author said and it is rather important. That is the reason I
+am quoting the entire passage here for reference and completeness
+Note that one can nest lists as well as shown above
+5
+
+PAGE 34
+2.3 MORE COMPLEX LISTS MADE EASY
+Step i] reflect over the research done
+Step ii] review ones notes, writings, lab journal and research articles
+Step iii] stop overthinking and/or procrastinating
+Step iv] start writing
+Step v] realize that there is much to do
+i} fear not
+★ persevere
+ii} continue writing
+Step vi] success!
+2.4 QUOTES
+Very useful for quoting text from other works. See the tutorial for more details and
+references.
+An inline-quote, one that is along with the main material is placed like this “this is a
+quote”. Sometimeswewanttomentiontheauthoraswell“thisiswhatthatauthorwrote”
+(Author of the quote)
+Sometimes, it is better to quote larger passages of text in the display mode like this
+This is what that author said and it is rather important. That is the reason I
+am quoting the entire passage here for reference and completeness
+this is the next paragraph. By specifiying the optional argumnet, the author name can be
+set as well:
+[Authorname] This is what that author said and it is rather important. That is
+thereasonIamquotingtheentirepassagehereforreferenceandcompleteness
+6
+
+PAGE 35
+2.5 FOOTNOTES
+One might find the need to include some relevant contextual information in the material
+butfinditunneccessarilyintrusivetodosointherunningtextmatteritself. Insuchcases,
+or whenever else the author feels the need to do so, a footnote may be deployed thus1
+1see, this is the footnote I was talking about. It is spaced appropriately. Best to use these sparingly since
+they detract from the general flow of the document. Some thoughtful restructuring of the material can
+help reduce the need for footnotes
+7
+
+PAGE 36
+
+
+PAGE 37
+CHAPTER 3
+MATHEMATICS
+TEX is unmatched when it comes to the precise rendering of complex mathematical
+material. Several handy tools and packages are available to the author from various
+packages offering mathematic facilities. Some of these are bundled-in by default. Refer
+to the relevant chapter of the tutorial for more details.
+3.1 EQUATIONS
+What follows below is an equation
+𝑒𝑖𝜋+ 1 = 0 (3.1)
+Notice that it is appropriately numbered. Notice that in the case of mathematics,
+approprite spacing of the textual matter surrounding the equation (i.e., those portions of
+thematerialaboveandbelowtheequation)areappropriatelyspacedonlywhenthereisno
+paragraphbreakbeforeandafterenvironmentblock. Therefore,theusermustensurethat
+there are no blank line(s) before or after the mathematics block so that excess unwanted
+space is avoided. Shown below is a piece of display math, which are unnumbered
+by default. Therefore if equation numbering is desired, the equation environment is
+recommended
+lim
+𝑥→0
+sin𝑥
+𝑥 = 1.
+Thisisthenextparagraph. Veryoften,oneneedstowriteseveralequationsinasequence
+of steps aligned properly, one below the other. This is also easily achieved using the
+alignenvironment:
+P
+
+lim sup
+𝑛→∞
+𝐸𝑛
+
+= P[{𝐸𝑛 i.o}𝑐] (3.2)
+
+PAGE 38
+= P
+"Ø
+𝑛∈N
+Ù
+𝑚≥𝑛
+𝐸𝑐𝑚
+#
+(3.3)
+= lim
+𝑛→∞
+P
+"Ù
+𝑚≥𝑛
+𝐸𝑐𝑚
+#
+(3.4)
+= lim
+𝑛→∞
+Ö
+𝑚≥𝑛
+P
+
+𝐸𝑐𝑛 (3.5)
+= lim
+𝑛→∞
+Ö
+𝑚≥𝑛
+(1− P[𝐸𝑛])
+≤ lim
+𝑛→∞
+Ö
+𝑚≥𝑛
+exp(−P[𝐸𝑛]) (3.6)
+= 0. (3.7)
+If equation numbers for certain steps are not required they may be avoided by using the
+\nonumberdirective as has been done above.
+Notice that the equations are line-spaced correctly as well. The surrounding text too is
+appropriately spaced from thealign block. Here too, as with the equation environment,
+here too it is recommended to avoid blank lines (paragraph breaks) before and after the
+alignenvironment so that unsightly white space before and after the block is avoided.
+3.2 CONVENIENCES
+Various other essential and convenient mathematical facilities are bundled with the
+package. Forinstance,automaticallysizeddelimiters,commontheoremandtheorem-like
+environments, configured proof blocks and commonly used operators are all provided.
+Refer to the tutorial for more information regarding these.
+Theorem 3.1. This is an insightful theorem.
+Proof. Here is the proof. ■
+10
+
+PAGE 39
+CHAPTER 4
+FIGURES AND TABLES
+Figures and tables are referred to as floats in the TEX world. These are elements which
+cannot be broken across pages. For more details on these, refer to the relevant chapter of
+the tutorial.
+4.1 FIGURES
+A simple figure is shown below:
+Figure 4.1:This is a photo of Tux. He is a very friendly penguin. We will meet his
+friends shortly.
+As with almost all other elements in LATEX figures too can be cross-referenced using the
+labels. Makesuretoprovidetheseforallfiguresandchooseadescriptivetagwhiledoing
+so. That way, later on if one needs to refer to the figure, there is no need for hunting
+around to find where the image is. Instead, Overleaf will automatically suggest a list of
+tags to choose from while invoking the\refcommand.
+Since floats are complex, one does not have very fine-grained control over the location of
+itsplacementrelativetosurroundingtext. Whilepreparingadocument,theauthorshould
+not be too concerned about the placement unless it is severely out of place. Instead,
+
+PAGE 40
+(a) Tux
+ (b) Adiumy
+ (c) GNU Head
+ (d) Emule
+(e) Konqi
+ (f) Katie
+ (g) Wiber
+ (h) Camelia
+Figure 4.2:Tux with his various friends. Notice that captions of figures are placed below
+the figure and are properly line spaced as per the guidelines
+once the document is near-complete, fine tuning can be done to precise measurements if
+desired/possible. Otherwise, some fine-tuning might go to waste as significant changes
+to the document (and hence the layout of the material) occurs.
+The recommended way to place multiple figures is by use of thesubcaption package.
+Make sure to include this. An example is shown in figure 4.2.
+4.2 TABLES
+Please refer to the tutorial for a slightly detailed note about tables. A simple table is
+shown below. Table captions are placed above the table. They are line-spaced as per the
+guidelines. It is not recommended to break paragraphs after a table unless absolutely
+necessary. Note that \captionabove (not \caption), is used to place captions in
+tables. Only then will the spacing around the captions of tables be appropriate. Make
+12
+
+PAGE 41
+Table 4.1:Shown below is a simple elegant table with a very long caption. Tables are
+quite helpful in organizing information in a presentable manner.
+Table Head
+stuff stuff
+stuff stuff
+stuff stuff
+stuff stuff
+stuff stuff
+Table 4.2:A complex table is shown here. Careful use of the column specifiers along
+with thoughtful (re)organization of the material can yield great results
+Value Profit
+Aspect Before 2019 After 2019 Before 2020 After 2020
+Whatever 30 40 20 2
+Aspect 33 45 10 5
+Entries 37 51 90 600
+Here 33 67 97 52
+note of this fact.
+Far more complex table layouts are possible usingmulticolumn and/or specifying
+different column types for thetabularblock. Refer to the tutorial for more details. An
+example is shown below:
+Further, the multirow functionality offered by themultirow package is sometimes
+useful. The same example as above is repeated below with a slight change using the
+multirowfunctionality
+Bear in mind that as in the case of figures, the tables too cannot always be precisely
+positioned as desired. Fine-tuning of the positioning by the use of position specifiers is
+best left to the final stages of the document preparation.
+Finally, vertical rules in tables are not only unsightly, but also largely unnecessary (for
+13
+
+PAGE 42
+Table 4.3:A complex table is shown here. Sometimes, one might need to have cell
+entrieswhichspanmorethanasinglerow; thistooispossibleasshownbelow
+Aspect
+Value Profit
+Before 2019 After 2019 Before 2020 After 2020
+Whatever 30 40 20 2
+Aspect 33 45 10 5
+Entries 37 51 90 600
+Here 33 67 97 52
+most cases). If one still wants properly positioned vertical rules in tables, refer to the
+tutorial file for more information.
+4.3 BIBLIOGRAPHY REFERENCES
+BibTEX is the only supported mechanism to manage bibliography and citations. For
+those unfamiliar with BibTEX, several useful tutorials are available on the internet.
+Innutshell, onerequiresa references.bibfilecontainingalltherelevantdetailsofthe
+material to be referenced in the BibTEX format. Make sure to thereferences.bibfile
+is free of any errors to ensure that the bibliography is typeset correctly. Many popular
+reference management tools support BibTEX export of libraries.
+With that in place one simply uses the\citecommand along with the tag of the entry
+to be referenced. For instance, this is a very nice paper Stroock and Varadhan (1971).
+While we are on the topic, let me recommend another classic: Nash (1951). Or perhaps,
+some other favorites might interest you if you work in related fields: see Chernoff (1972),
+Wald (2004), Zhang (2014) or Shannon (1948) for a nice selection. It is also worth
+mentioning that the work of Polyanskiyet al. (2010) is well regarded.
+14
+
+PAGE 43
+APPENDIX A
+GENERAL NOTES
+For any package, always consult the official package manual and/or reference for specific
+instructions on how to load them and the range of options available. If you run into
+strange issues, feel free to ask for send me an email or ask on the PhD or MS mailing
+lists.
+Note: As is the case for many other programming languages, there are lot of LATEX
+code snippets floating around at various forums on the internet. While using these code
+snippets may (or may not) alleviate issues, it is highly plausible that such code can have
+undesirable side effects, just from being placed in a document. Further, a single code
+snippet can, in general, have different effects depending on where it is placed in the
+document. Therefore, the user is urged to inspect an official manual and/or reference
+before inserting arbitrary code into the document. The code of iitmdissertation largely
+conforms to the best practices and strictly abides by the documentation of the packages
+that it loads.
+A.1 SOURCE FILES
+The user must avoid editing the source files as far as possible. Commands do not always
+dowhatoneexpectsofthemunlessofcoursetheyareinvokedintherightcontext(and/or
+situation). iitmdissertationhasbeenextensivelytestedinmanyscenarios. However,
+it is very much possible that bugs exist. Most errors in compilation arise from incorrect
+use of packages and/or their facilities. Take care to ensure that you follow best practices
+while using external packages. If you encounter an insurmountable issue despite your
+best efforts, you are most welcome to contact the author for help.
+
+PAGE 44
+Ensure that these files are not tampered with at any cost. The accompanying template
+will not compile (and produce a PDF) if even one of these is missing. These are
+as follows: iitm.bst, iitmdissertation.cls, iitmdissertation.sty and the
+folder zz-imp.
+A.2 SOME USEFUL PACKAGES
+Quite a few packages are loaded by iitmdissertation which are very commonplace in a
+standarddocument. Intheeventthatcertaincustomizationofoneormoreofthefacilities
+offeredbythesepackagesisrequired, theuserisurgedtolookattherespectivepackage’s
+documentation.
+Wehopethishelpsuserstoproducenicelyformattedthesesandsimplifieshis/herwriting
+experience. Happy writing!
+16
+
+PAGE 45
+Table A.1:A list of commonly required (some of which are pre-loaded) packages along
+with links to their documentation
+Package(s) Note(s)
+enumitem handles all itemized lists and descriptions [López (2019)]
+booktabs & array handle all facilities related to tables [Els (2020); Team and
+Mittelbach (2021)]
+Caution: Although, there are many table-related packages for
+LATEX, use of booktabs and array is the recommended way to
+handle tabulation
+xcolor handlesallcolorrelatedfacilities. Thispackageisloadedwith
+the usenames,svgnames option for a total of 170 color options.
+Consult page 43 of the xcolor manual for these color names
+[Team and Kern (2021)]
+Caution: Tryingtoloadxcolorwithotheroptionsmightcause
+issues (i.e, option clashes in LATEX parlance). If you really
+must have new color(s) you can define it using the definecolor
+command.
+subcaption This is the recommended package for handling sub-figures
+and sub-captions. This is not loaded by default but is highly
+recommendediftheneedformultiplefigureswithsub-captions
+arises [Sommerfeldt (2020)]
+multirow This is the recommended package for handling tabular-cells
+spanning multiple rows. This is not loaded by default, since it
+is not essential.[van Oostrum (2020)]
+glossaries This is the default package used to handle glossaries and the
+abbreviations in the prematter.iitmdissertation provides
+defaults for a simple glossary customized to match the official
+guidelines of the institute as can be seen in the template.
+[Talbot (2021)]
+nomencl This is the default package used to handle the notation chapter
+in the prematter.iitmdissertation provides defaults for
+a simple notations chapter conforming to the guidelines.
+[Veytsman et al. (2021)]
+17
+
+PAGE 46
+
+
+PAGE 47
+REFERENCES
+1. Chernoff, H. , Sequential Analysis and Optimal Design . Society for
+Industrial and Applied Mathematics, 1972. ISBN 9780898710069. URL
+http://epubs.siam.org/doi/book/10.1137/1.9781611970593.
+2. Els, D. (2020). booktabs – publication quality tables in L ATEX. URL
+https://ctan.org/pkg/booktabs.
+3. López,J.B. (2019). enumitem–controllayoutofitemize,enumerate,description. URL
+https://ctan.org/pkg/enumitem.
+4. Nash,J. (1951). Non-cooperativegames. Annals of Mathematics,54(2),286–295. ISSN
+0003-486X. URL https://www.jstor.org/stable/1969529.
+5. Polyanskiy, Y., H. V. Poor, andS. Verdu(2010). Channel coding rate in the finite
+blocklengthregime. IEEE Transactions on Information Theory,56(5),2307–2359. ISSN
+1557-9654.
+6. Shannon, C. E.(1948). A mathematical theory of communication.The Bell System
+Technical Journal,27(3), 379–423. ISSN 0005-8580.
+7. Sommerfeldt, A.(2020). subcaption – subcaption – support for sub-captions. URL
+https://ctan.org/pkg/subcaption.
+8. Stroock, D. W. and S. R. S. Varadhan (1971). Diffusion processes
+with boundary conditions. Communications on Pure and Applied
+Mathematics, 24(2), 147–225. ISSN 00103640, 10970312. URL
+https://onlinelibrary.wiley.com/doi/10.1002/cpa.3160240206.
+9. Talbot, N. (2021). glossaries – create glossaries and lists of acronyms. URL
+https://ctan.org/pkg/glossaries.
+10. Team, T. L.and D. U. Kern(2021). Driver-independent color extensions for LATEX and
+pdfLATEX. URL https://ctan.org/pkg/xcolor.
+11. Team, T. L.and F. Mittelbach(2021). array – extending the array and tabular
+environments. URLhttps://ctan.org/pkg/array.
+12. van Oostrum, P.(2020). multirow – create tabular cells spanning multiple rows. URL
+https://ctan.org/pkg/multirow.
+13. Veytsman, B., B. Shandl, L. Netherton, andC. Radhakrishnan(2021). nomencl –
+produce lists of symbols as in nomenclatur. URLhttps://ctan.org/pkg/nomencl.
+19
+
+PAGE 48
+14. Wald, A., Sequential Analysis. Courier Corporation, 2004. ISBN 9780486439129.
+15. Zhang, Y.(2014). Bounded gaps between primes.Annals of Mathematics, 179(3),
+1121–1174. ISSN 0003-486X. URLhttps://www.jstor.org/stable/24522787.
+20
+
+PAGE 49
+CURRICULUM VITAE
+NAME Myfirstname Mylastname
+DATE OF BIRTH 01 January 2022
+EDUCATION QUALIFICATIONS
+1970 The first degree
+Institution Wherever
+Specialization Whatever
+2038 The previous degree
+Institution Wherever
+Specialization Whatever
+Doctor of Philosophy
+Institution Wherever
+Specialization Whatever
+Registration Date Whenever
+21
+
+PAGE 50
+
+
+PAGE 51
+DOCTORAL COMMITTEE
+Chairperson Dr. Name
+Whatever
+Wherever
+Guide(s) Dr. Name
+Whatever
+Wherever
+Dr. Name
+Whatever
+Wherever
+Member(s) Dr. Name
+Whatever
+Wherever
+Dr. Name
+Whatever
+Wherever
+Dr. Name
+Whatever
+Wherever
+23

@@ -1,6 +1,6 @@
 """Turn an already-solved PDDL travel plan into a real MAVLink mission and fly it.
 
-    plans/<name>/runs/<timestamp>/problem.pddl + plan.txt   (written by the
+    Swarm-Planning/Results/ENHSP/<name>/runs/<timestamp>/problem.pddl + plan.txt   (written by the
         GUI's Mission Planner / services.plan_service when you click
         "Plan Mission" - already retargeted to your picked source/
         destination, and already routed around any restricted area you drew)
@@ -32,7 +32,7 @@ Usage:
     python scripts/pddl_to_mavlink.py --plan travell
 
     # Fly one specific run directory:
-    python scripts/pddl_to_mavlink.py --run-dir plans/travell/runs/2026-08-28_105320
+    python scripts/pddl_to_mavlink.py --run-dir Swarm-Planning/Results/ENHSP/travell/runs/2026-08-28_105320
 
     # Against real SITL/hardware instead of the local firmware model:
     python scripts/pddl_to_mavlink.py --plan travell --connect udp:127.0.0.1:14550
@@ -65,7 +65,8 @@ from engine.pddl_planner import (  # noqa: E402
 from engine.pddl_problem import LatLon as PddlLatLon  # noqa: E402
 from engine.pddl_problem import read_locations, retarget_problem  # noqa: E402
 
-PLANS_DIR = REPO_ROOT / "plans"
+PLANS_DIR = REPO_ROOT / "Swarm-Planning" / "Plans"
+RESULTS_DIR = REPO_ROOT / "Swarm-Planning" / "Results" / "ENHSP"
 
 
 # ---- Step 1a (default): load a run the GUI already solved -----------------
@@ -75,12 +76,12 @@ _CLI_SOLVE_DIR_NAME = "cli"  # where solve_plan() below writes fresh --source/--
 
 
 def find_latest_run(plan_name: str) -> Path:
-    """The most recently written `plans/<name>/runs/<timestamp>/` directory -
+    """The most recently written `Swarm-Planning/Results/ENHSP/<name>/runs/<timestamp>/` directory -
     i.e. whatever you last clicked "Plan Mission" for in the app. Excludes
     this script's own `runs/cli/` scratch dir (see `solve_plan`), which the
     GUI never writes to and would otherwise shadow a genuine run whenever
     `--source`/`--dest` was used more recently than the last GUI plan."""
-    runs_dir = PLANS_DIR / plan_name / "runs"
+    runs_dir = RESULTS_DIR / plan_name / "runs"
     candidates = (
         [
             d for d in runs_dir.iterdir()
@@ -147,7 +148,7 @@ def solve_plan(
         ),
     )
 
-    run_dir = plan_dir / "runs" / _CLI_SOLVE_DIR_NAME
+    run_dir = RESULTS_DIR / plan_name / "runs" / _CLI_SOLVE_DIR_NAME
     run_dir.mkdir(parents=True, exist_ok=True)
     problem_out = run_dir / "problem.pddl"
     problem_out.write_text(concrete_text, encoding="utf-8")
@@ -285,10 +286,10 @@ def _parse_polygon(text: str) -> list[tuple[float, float]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--plan", default="travell", help="plan folder under plans/ (default: travell)")
+    parser.add_argument("--plan", default="travell", help="plan folder under Swarm-Planning/Plans/ (default: travell)")
     parser.add_argument(
         "--run-dir", type=Path, default=None,
-        help="load an already-solved run (plans/<name>/runs/<timestamp>/) instead of "
+        help="load an already-solved run (Swarm-Planning/Results/ENHSP/<name>/runs/<timestamp>/) instead of "
              "re-solving - default: the most recent run for --plan",
     )
     parser.add_argument(

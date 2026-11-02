@@ -1,0 +1,949 @@
+PDDL PLANS - OVERVIEW AND STATUS
+=================================
+(generated 2026-09-16, 3dgridformation added 2026-09-22 - reflects plans/
+as of those dates; run counts will keep growing as the app is used,
+re-check plans/<name>/runs/ for the latest numbers)
+
+Each folder under plans/ is one mission template: a domain.pddl (the
+actions/predicates ENHSP reasons over) + a problem file (the template
+instance, retargeted at run time onto whatever source/destination/area
+the user clicks on the map). The GUI's "Named Plan" combo box picks one
+of these folders by name and calls services/plan_service.py, which
+retargets the template, expands it to however many drones are checked,
+and hands it to ENHSP (engine/pddl_planner.py) to solve.
+
+Plan *kind* is decided by the domain name inside domain.pddl (see
+_DOMAIN_KIND in services/plan_service.py), not by folder name:
+
+    swarm-drone-mission             -> point_to_point
+    forest-drone-search             -> area_coverage
+    v-formation-drone-mission       -> formation
+    grid-formation-drone-mission    -> grid_formation
+    cube-grid-formation-drone-mission -> cube_formation
+    figure8-formation-drone-mission -> figure8_formation
+    star-formation-drone-mission    -> star_formation
+    road-inspection-drone-mission   -> road_inspection
+    planets-formation-drone-mission -> planets_formation
+    parabola-formation-drone-mission -> parabola_formation
+    battery-aware-drone-mission     -> battery_aware
+    formula4-drone-mission          -> formula4_formation
+    circle-formation-drone-mission  -> circle_formation
+
+
+--------------------------------------------------------------------
+1. plans/travell/   (UI label: "Travell")
+--------------------------------------------------------------------
+Domain:     swarm-drone-mission        Kind: point_to_point
+Files:      domain.pddl, problem.pddl
+What it does:
+    One shared route from a picked source to a picked destination
+    (optionally routed around a marked no-fly/restricted area). The
+    template's single reference drone ("drone1") is cloned to however
+    many drones are checked in the GUI (expand_point_to_point_drones),
+    so the whole checked swarm flies the same route together.
+Status (69 runs on record... see below):
+    83 runs logged. 76 solved, 7 came back unsolvable/no-plan (mostly
+    early testing runs from 2026-09-02, when a route+restricted-area
+    combination left no safe path - not a bug, just a genuinely
+    infeasible click). No open issues.
+
+
+--------------------------------------------------------------------
+2. plans/Search/   (UI label: "Search Forest")
+--------------------------------------------------------------------
+Domain:     forest-drone-search        Kind: area_coverage
+Files:      domain.pddl, SearchProblem.pddl (a differently-named
+            "*problem.pddl" file is accepted - see _find_problem_file)
+What it does:
+    One route per drone (not one shared route) covering a marked
+    forest/search-area polygon from a picked base point
+    (engine/search_problem.py: retarget_search_problem +
+    expand_search_drones). Needs >= 2 drones (MIN_AREA_COVERAGE_DRONES)
+    for two lanes with mutual separation.
+Status:
+    69 runs logged, all 69 solved. The most exercised and most
+    reliable plan of the four - no failures on record.
+
+
+--------------------------------------------------------------------
+3. plans/vformation/   (UI label: "V-Formation")
+--------------------------------------------------------------------
+Domain:     v-formation-drone-mission  Kind: formation
+Files:      domain.pddl, problem.pddl
+What it does:
+    Picked like travell (source + destination + optional restricted
+    area), but ENHSP only plans the apex/leader's own corridor
+    (retarget_formation_problem); the two wing routes are derived
+    parallel to it after the fact (formation_wing_routes), each wing
+    20 m out / 17.32 m back per rank (FORMATION_BACK_M/FORMATION_SIDE_M
+    in plan_service.py - kept in sync with the slot-along-offset /
+    slot-cross-offset numbers baked into problem.pddl). Extra checked
+    drones add further ranks to each wing.
+Status:
+    65 runs logged (as of the fix below). 62 solved, 2 unsolvable
+    (infeasible source/destination/no-fly combos), 1 truncated run
+    (2026-09-15_181254 - log stops right after grounding, looks like
+    the app was closed mid-plan rather than a planner failure). No
+    open code issues.
+
+    CHANGED 2026-09-16: previously each drone's readiness only checked
+    its own single (communication-ok ?d) flag (a link to the ground
+    controller), with no notion of which drones actually sit next to
+    each other in the V. Added a real left/right neighbor model,
+    mirroring what plans/gridformation/ already does:
+      - new pairwise fact (wing-neighbor ?d1 ?d2) - descriptive only,
+        not read by any action (same as grid-formation's
+        grid-neighbor) - recording the actual chain leader<->rank1
+        <->rank2<->... out along each wing.
+      - new per-drone flag (neighbor-comm-ok ?d), checked alongside
+        communication-ok in establish-v-formation, formation-cruise
+        and close-up-wings (domain.pddl), plus a new
+        detect-neighbor-link-loss fault-detection action - all
+        mirroring grid-formation's neighbor-comm-ok usage exactly.
+      - problem.pddl now sets both facts for the template's 3 drones;
+        engine/pddl_problem.py's expand_formation_drones rebuilds the
+        full wing-neighbor chain for any larger odd drone count (the
+        template's own rank-1-only pair would otherwise get wrongly
+        cloned straight onto every further rank instead of chaining
+        rank-to-rank - see that function's step 4).
+    Verified with ENHSP directly: 3, 5 and 7-drone V's (including
+    through the real retarget_formation_problem -> expand_formation_drones
+    pipeline) all still solve cleanly after the change.
+
+
+--------------------------------------------------------------------
+4. plans/gridformation/   (UI label: "Grid-Formation")
+--------------------------------------------------------------------
+Domain:     grid-formation-drone-mission   Kind: grid_formation
+Files:      domain.pddl, problem.pddl
+What it does:
+    Picked the same way as V-formation. ENHSP again plans only the
+    leader's corridor (retarget_grid_problem); every other drone's
+    route is derived parallel to it (formation_member_route), one per
+    grid cell, 10 m apart in every direction (GRID_SPACING_M). A
+    perfect-square drone count forms a square grid; otherwise the
+    most-square rectangle that tiles it exactly (grid_dimensions).
+    Each drone only has to coordinate with its up-to-4 immediate
+    neighbours (front/back/left/right), not the whole swarm. Needs
+    >= 4 drones (MIN_GRID_DRONES) to read as a grid rather than a line.
+Status:
+    19 runs logged. 15 solved, 4 unsolvable - all 4 failures fall on
+    2026-09-16 between 10:06-10:07, immediately before a fix; every
+    run from 10:12 onward the same day solved cleanly (up to at least
+    an 8-drone / 2x4 grid, plan length 41).
+
+    ROOT CAUSE (fixed 2026-09-16): problem.pddl wrote the two
+    hover-altitude facts across 3 lines each:
+        (=
+            (hover-altitude drone-member)
+            2
+        )
+    instead of one line like every other per-drone fluent in the file
+    (e.g. "(= (slot-along-offset drone-member) 0)"). The grid-expansion
+    code (expand_grid_drones -> _clone_named_lines in
+    engine/pddl_problem.py) clones facts line-by-line when growing the
+    template to N drones, so for every extra grid member it only
+    picked up the middle line, producing a malformed, valueless fact
+    like "(hover-altitude drone-r0c2)" with no assigned number. That
+    left hover-altitude undefined for every drone except the original
+    two, which ENHSP's AIBR preprocessing then flagged as an
+    unsolvable problem for any grid bigger than 1x2.
+
+    FIX: rewrote both facts as single lines in problem.pddl, matching
+    the convention plans/vformation/problem.pddl already used
+    correctly. Verified directly against ENHSP: the old template
+    reproduced "Unsolvable Problem" even at 4 drones; the fixed
+    template returns a valid plan for the same scenario, and the
+    in-app runs from 10:12 onward confirm it end-to-end.
+
+    KNOWN LIMITATION (not fixed, just observed): ENHSP's grounding
+    step is memory-hungry for large grids - a 16-drone (4x4) grid blew
+    past a 6 GB heap during grounding in local testing. This is
+    independent of the bug above; if a large swarm ever comes back
+    "Unsolvable"/OOMs again, check drone count and grounding time
+    first before assuming the PDDL itself is wrong again.
+
+
+--------------------------------------------------------------------
+5. plans/3dgridformation/   (UI label: "3D-Grid Formation")
+--------------------------------------------------------------------
+Domain:     cube-grid-formation-drone-mission   Kind: cube_formation
+Files:      domain.pddl, problem.pddl
+Added:      2026-09-22
+What it does:
+    The grid formation extended into the vertical - a solid block of
+    drones flying one shared corridor. Picked exactly like the 2-D grid
+    (source + destination + optional restricted area), and again ENHSP
+    plans only the leader's corridor (retarget_cube_problem); every
+    other drone's track is derived parallel to it
+    (formation_member_route), one call per filled cell, 10 m apart in
+    every direction (CUBE_SPACING_M horizontally,
+    CUBE_LAYER_SPACING_M vertically).
+
+    Shape: unlike grid_dimensions, which insists the count tile its
+    rectangle exactly, cube_dimensions picks a square footprint and
+    stacks as many layers as it takes, letting the top layer be
+    partially filled. Exact tiling degenerates badly in 3-D (25 would
+    come out 1x5x5, a flat plane; any prime a line), so:
+        8 -> 2x2x2 full    9 -> 3x2x2 (12 cells, 9 filled)
+       16 -> 2x3x3 (18/16) 25 -> 3x3x3 (27/25)
+       27 -> 3x3x3 full   64 -> 4x4x4 full
+    Needs >= 8 drones (MIN_CUBE_DRONES) to read as a cube rather than
+    a flat grid.
+
+    Communication: each drone coordinates with up to 24 neighbours -
+    every cell of the 3x3x3 block around it EXCEPT itself and the two
+    cells directly above and below (8 in its own layer, 8 above, 8
+    below). As with the V and 2-D grid, `cube-neighbor` is descriptive
+    only; the actions check the per-drone `neighbor-comm-ok`, which
+    keeps every check O(drones) rather than O(drones^2) - this matters
+    more here, since a cube has up to ~12x as many adjacencies as
+    drones (a full 4x4x4 declares 420 undirected links).
+
+    THE VERTICAL AXIS IS THE ONE STRUCTURAL DIFFERENCE from every
+    other plan. Its layers are separated by height, not laterally, so
+    two drones in the same row/column of different layers fly the SAME
+    lateral track. Three things follow:
+      - each drone has its own (target-altitude ?d), one per layer,
+        written by expand_cube_drones as base + layer * 10 m;
+      - PlanRunResult gained `per_drone_altitude_offset_m`, and
+        services/thread_backend.py's start_mission_paths gained an
+        `altitude_offsets_m` argument that is added on top of the
+        terrain profile. Without it plan_terrain_profile would give
+        every drone one shared cruise altitude and the layers would
+        occupy the same points in space;
+      - the swarm climbs LAYER BY LAYER, bottom first: `open-next-layer`
+        only releases the layer above once every drone below it is at
+        cruise altitude, so no two layers ever climb through each other.
+
+    Collision avoidance is structural (three independent mechanisms -
+    fixed-spacing geometry, layer-by-layer ascent, and the
+    `cube-closed` rigidity interlock) rather than the per-hop
+    `check-drone-separation` the forest-search domain uses. Verified:
+    minimum 3-D separation is one full 10 m spacing at every waypoint,
+    for 8/16/25 drones, on direct and detoured routes alike.
+
+Status:
+    New. Verified directly against ENHSP through the real
+    expand -> retarget -> solve pipeline:
+        8 drones (2x2x2)   0.4s, plan length  42
+        9 drones (3x2x2)   0.5s, plan length  47
+       12 drones (2x3x3)   0.6s, plan length  58
+       16 drones (2x3x3)   0.7s, plan length  74
+       25 drones (3x3x3)   1.2s, plan length 111
+       27 drones (3x3x3)   1.8s, plan length 119
+       36 drones (3x4x4)   3.4s, plan length 155
+       64 drones (4x4x4)  50.0s, plan length 268
+    Launch ordering audited on the 25-drone plan: zero drones took off
+    before their layer opened, zero climbed before taking off, and no
+    layer opened before the one below had finished climbing.
+
+    DESIGN NOTE (worth knowing before editing the domain): the layer
+    gate is deliberately PROPOSITIONAL - `layer` objects chained by
+    (layer-below ?lo ?hi), with `layer-launched`/`cleared-to-launch`
+    flags. It was first written as a numeric counter, with takeoff
+    gated on (<= (slot-layer ?d) (layers-cleared)). That version
+    grounded just as fast but was intractable past two layers: ENHSP's
+    heuristics estimate almost no progress toward a condition that
+    compares two fluents to each other, so a 25-drone/3-layer block did
+    not solve inside 90s. The propositional version solves the same
+    problem in 1.2s. `slot-layer` is kept as descriptive bookkeeping
+    but no action reads it.
+
+    Also note `-gro naive` is passed to ENHSP here for the same reason
+    plans/gridformation/ needs it (the default grounder blows up on a
+    formation-style domain past a dozen-odd drones), and that
+    establish-cube-formation's layer check must NOT use `?l` as its
+    quantified variable - that name is already bound to the action's
+    location parameter, and the shadowing makes every problem report
+    as unsolvable.
+
+
+--------------------------------------------------------------------
+6. plans/figure8formation/   (UI label: "Figure-8 Formation")
+--------------------------------------------------------------------
+Domain:     figure8-formation-drone-mission   Kind: figure8_formation
+Files:      domain.pddl, problem.pddl
+            (geometry + expansion: engine/figure8_problem.py)
+Added:      2026-10-11
+What it does:
+    The swarm flies a figure-8 in the air as a TRAIN - one drone behind
+    another along the curve, 10 m apart (FIGURE8_SPACING_M), each drone
+    talking only to the drone directly in front of and behind it
+    (`train-neighbor` chain + per-drone `neighbor-comm-ok`, the same
+    descriptive-pair / per-drone-flag pattern as the V and grids).
+
+    Picked differently from every other plan: THREE clicks, no
+    destination and no restricted area -
+        1. the LEFT end of the 8          (green pin)
+        2. the MIDDLE point where the two lobes cross   (amber pin)
+        3. the RIGHT end of the 8         (red pin)
+    figure8_geometry builds each lobe as half a lemniscate of Gerono
+    from the crossing to its clicked end, so the lobes cross at right
+    angles in the middle, are as wide as they are long, and may differ
+    in size if the middle isn't clicked half-way. The resulting 8 is
+    drawn on the map as an amber overlay.
+
+    ENHSP plans the leader's lap of 9 key waypoints (source = crossing ->
+    right-upper -> right-end -> right-lower -> crossing-mid -> left-upper
+    -> left-end -> left-lower -> destination = crossing), with followers
+    catching up after every leg (follow-leader). That corridor is a
+    sanity check; the drones fly figure8_routes: the 8 resampled at
+    equal ~10 m steps into a ring, each drone starting one step behind
+    the drone in front, flying FIGURE8_LAPS (1) lap and landing on its
+    own start slot. Since every drone is always one waypoint behind its
+    front neighbour, the spacing holds structurally as they advance.
+
+    CAPACITY (the "can't be done with this many drones" pop-up): the
+    only place the train can meet itself is the crossing - the head
+    comes back to it after one lobe. So the train (N-1) * 10 m, plus
+    14.1 m of crossing clearance (keeps drones on the two crossing
+    branches >= 10 m apart), must fit inside the SMALLER lobe. Checked
+    three times, all with the same inequality:
+      - MainWindow, before planning: QMessageBox explaining the limit and
+        the max drone count this 8 holds (figure8_capacity_error);
+      - _Worker._run_figure8, same message if it's ever bypassed;
+      - domain.pddl's establish-figure8-formation precondition
+        (train-span + crossing-clearance <= min-lobe-length), so ENHSP
+        itself refuses an over-full 8.
+    Also needs >= 2 drones (MIN_FIGURE8_DRONES), and each end >= 20 m
+    from the crossing (MIN_FIGURE8_LOBE_M).
+
+Status:
+    New. Verified directly against ENHSP through the real
+    expand -> retarget -> solve pipeline, on an asymmetric 8 (lobes
+    337 m / 281 m, computed capacity 27):
+         2 drones   0.4s, plan length  26
+         5 drones   0.4s, plan length  38
+        12 drones   0.7s, plan length  66
+        25 drones   2.7s, plan length 118
+        27 drones   3.3s, plan length 126   (exactly at capacity)
+        28 drones   no plan, as intended   (Python check agrees)
+    With a full 27-drone train, the minimum distance between any two
+    drones at any waypoint step is 9.85 m (crossing included).
+
+    CHANGED 2026-10-11 - laps, and smooth coordinated flight:
+      - LAPS: the Mission Planner shows a "Figure-8 laps" box (1-50) while
+        this plan is picked. The PDDL counts laps (laps-required /
+        laps-completed, start-next-lap action); the drones get ONE lap
+        and repeat it on board via a MAVLink DO_JUMP.
+      - SMOOTHNESS: drones used to get one NAVIGATE (one fresh 2-item
+        mission upload) per ~10 m waypoint and hold at each until the next
+        upload finished - stop-and-go, out of step between drones. Now
+        each drone's whole route is uploaded as one mission
+        (CommandInterpreter.build_route_mission), the simulated autopilot
+        flies through waypoints carrying leftover distance on instead of
+        stopping, the upload conversation finishes within one tick, and
+        each drone thread integrates the REAL time since its last tick so
+        a late thread doesn't fall behind.
+      - COORDINATION: ThreadSwarmBackend._keep_train_spacing trims each
+        drone's speed (MAVLink DO_CHANGE_SPEED) from its gap to the drone
+        in front (catch up / back off) and behind (wait for a straggler),
+        measured along the route and time-aligned across drone threads.
+        The train cruises at 80% of its slowest drone's top speed.
+    Verified headless through the real drone-thread + simulated-firmware
+    pipeline, drones with mixed top speeds 10-20 m/s:
+        6 drones, 2 laps:  neighbour gap median 10.0 m, 90% within
+                           9.2-11.1 m, no stalls, all landed on own slot
+       12 drones, 3 laps:  median 10.0 m, 90% within 9.1-11.6 m, closest
+                           any two drones got 7.5 m
+    ENHSP: 10 drones x 20 laps solves in 0.8s; 27 drones x 5 laps in 4.2s.
+
+
+    CHANGED 2026-10-11 (later) - a BASE: the mission is now
+        base -> middle of the 8 -> laps -> middle -> base.
+      - FOUR clicks: the base (green pin), then the 8's left end, middle
+        (amber) and right end.
+      - The drones wait on a straight line of 10 m slots at the base,
+        pointing away from the 8 (leader on the base point). They fly out
+        along a Dubins path (arcs + straights, turn radius >= 25 m) that
+        joins the 8 tangentially at the middle, fly the laps, leave the
+        middle tangentially on another Dubins path back to the base, and
+        park on along the slot line - the leader on the farthest slot,
+        each drone one slot short of the one in front - so nobody lands
+        under another drone's path. Every drone flies the leader's exact
+        path, one spacing behind, so every route is the same length.
+      - Of the four ways round the 8 (either lobe first, either way
+        round), the one with the shortest base legs is used.
+      - One base leg generally crosses one loop of the 8 (unavoidable
+        when entering and leaving tangentially and turning back to the
+        base); that loop is always empty at that moment.
+        plan_figure8_mission proves it for the actual layout: any two
+        points of the whole path close enough along it to be occupied at
+        the same time must stay >= 70% of the spacing apart. Fails give
+        the "can't be done with N drones" pop-up with the most drones
+        that DO fit (e.g. a base only 35 m from the middle of a 200 m 8
+        fits 16).
+      - PDDL: new base / lap-start / lap-end / transit-route facts,
+        fly-to-pattern, finish-laps and return-to-base actions; the 8's
+        locations are renamed by flying order (crossing-in, lobe1-a ...
+        crossing-out).
+      - NAVIGATE carries approach / loop / laps / depart; the autopilot
+        mission is takeoff, approach, loop, DO_JUMP (laps-1), depart, land.
+    Verified headless through the real drone-thread + firmware pipeline:
+        6 drones, 2 laps, base 150 m below: all landed on their expected
+          slot (0.0 m off), neighbour gap median 9.9 m, closest 9.6 m
+       12 drones, 3 laps, base off to one side: all on their slots,
+          median 10.0 m, 90% within 9.1-12.0 m, closest 7.4 m
+    ENHSP (real worker): 2x1 0.4s, 10x5 0.8s, 27x3 4.2s, 10x20 0.9s.
+
+
+    CHANGED 2026-10-11 (latest) - coordination rebuilt, landing pads:
+      - PROBLEM (seen in the app with 16 drones): drones bunched, overtook
+        and overlapped. Cause: the ground station corrected each drone
+        against its neighbours' live positions; speed commands landed 2-3
+        polls late (6-12 s of flight at the 20x time scale) and a train
+        of drones each over-correcting to the one in front oscillates -
+        commanded speeds alternated 0.6 / 15 / 0.6 / 15 m/s down the line.
+      - FIX: formation keeping now runs ON BOARD (engine/train_keeping.py,
+        DroneThread.keep_train_place). The GCS only broadcasts a shared,
+        time-stamped PACE along the path (TRAIN_PACE command); every tick
+        each drone measures its own exact progress on its own route and
+        sets its own autopilot speed to hold its place behind the pace.
+        Neighbours, via the GCS: the drone in front's position caps a
+        drone's speed (never a hard brake - stale news + hard brake is
+        how the one behind runs into it); a drone that falls behind slows
+        the pace so the train waits for it. The pace ramps gently and
+        only starts once every drone has climbed; drones start at a
+        creep so nobody darts off its pad early. Train drones tick at
+        25 ms (TRAIN_TICK_S) instead of 100 ms (~6 m per tick, not ~25 m).
+      - LANDING: instead of a 10 m x N single file running away from the
+        base, the drones take off from and land on a compact block of
+        10 m pads just behind the base (odd column count, so the centre
+        line runs through a pad column). Landing: farthest row first,
+        each row outside-in, centre last; takeoff the reverse - no drone
+        ever flies over a pad that is occupied.
+    Verified headless, replaying the app run 2026-10-11_152518 exactly
+    (16 drones, 2 laps, base 108 m above the middle), through the real
+    planner -> drone-thread -> firmware pipeline:
+        before: neighbour gap median 23.7 m, min 0.0 m (collisions)
+        after:  median 10.0 m, 90% within 9.2-10.8 m, gaps < 8 m in
+                0.7% of samples, every drone landed on its own pad
+    12 drones, mixed top speeds 10-20 m/s, 3 laps: closest 6.6 m,
+    90% within 9.4-10.5 m.
+
+
+--------------------------------------------------------------------
+7. plans/starformation/   (UI label: "Star Drone Show")
+--------------------------------------------------------------------
+Domain:     star-formation-drone-mission   Kind: star_formation
+Files:      domain.pddl, problem.pddl
+            (geometry + timed tracks: engine/star_problem.py)
+Added:      2026-10-11 (as a source -> destination star formation);
+            CHANGED the same day into a stationary drone show.
+What it does:
+    CHANGED 2026-10-29: two clicks - the SOURCE (take-off pads) and the
+    DESTINATION (where the show is performed); no restricted area. The
+    show is repeated for the "Laps" count:
+        take off       from pads in rings round the source
+        fly out        ONE BY ONE along a corridor source -> destination,
+                       one 30 m gap behind the other; each drone takes its
+                       own place on the circle round the destination (front
+                       pads leave first, the circle fills from its far side)
+        form circle    once every drone is in place (held 6 s)
+        each lap:
+            form star      (held 4 s)
+            form circle    (held 6 s)
+            spin circle    the circle turns once round
+            form star      (held 4 s)
+            spin star      the whole star turns once round its centre
+            form circle    (held 6 s)
+        fly back       ONE BY ONE, the fly-out played backwards (near side
+                       of the circle first), landing on the pad each drone
+                       took off from
+    Star size by drone count: 6-7 drones a 3-pointed star, 8-9 a
+    4-pointed one, 10+ a 5-pointed star; tips and inner corners filled
+    first, extra drones spread along the edges. 6-40 drones
+    (MIN_STAR_DRONES / MAX_STAR_DRONES - the GUI pops up below/above),
+    1-50 laps.
+
+    Shapes: every drone keeps the same ORDER round the centre in the
+    circle and the star (circle places evenly spaced, in the star's
+    order), so the shape changes never cross paths. The show is sized up
+    from its theoretical minimum until every two drones are >= 10 m
+    apart in the circle and the star, and >= 9 m throughout the moves
+    pads <-> circle <-> star (10 drones: 30 m tip radius, 16: 44 m,
+    25: 70 m). A spin turns the shape rigidly - every drone at the same
+    angular speed - so the gaps never change; the tips fly at 60% of
+    full speed.
+
+    PDDL: ENHSP sequences fly-to-formation per drone in its turn
+    (out-turn / out-after chain, built from the geometry), form-circle,
+    then per lap form-star, form-circle-in-lap, spin-circle,
+    form-star-again, spin-star, close-lap (laps-completed /
+    laps-required), end-show, return-to-source per drone in its turn
+    (back-turn / back-after), land per drone, complete-show. The worker
+    checks the plan has exactly that sequence and drone order.
+    The destination must be at least star_show_min_distance_m away (pad
+    block + circle radius + corridor; 10 drones ~90 m, 40 ~166 m) - the
+    GUI says so and re-arms the clicks.
+    ENHSP (default hadd): 6 drones 0.9 s, 10 x 2 laps 0.9 s, 16 x 3 1.1 s,
+    25 x 2 1.5 s, 40 x 5 2.3 s. (complete-show / land ask for
+    mission-completed / returned rather than landed / at source - facts
+    already true before takeoff made hadd see every takeoff and flight
+    out as a step backwards, and search blew up past ~10 drones.)
+    Timetable check (positions sampled every 0.25 s, 6-40 drones, six
+    directions): closest any two drones get 9.1 m (a circle<->star
+    morph, as before); every drone ends on its own pad.
+    Timed tracks: a drone held by its timetable that is already in place
+    now hovers (WAIT_MPS) instead of creeping on at TRAIN_MIN_MPS -
+    otherwise drones waiting their turn over their pads drifted metres.
+
+    Flight: every drone flies a TIMETABLE against one shared clock
+    (engine/train_keeping.py, schedule mode): keyframes "at clock time t,
+    be s metres along my route", identical phase boundaries for every
+    drone. One lap is uploaded once and repeated on board (DO_JUMP), so
+    the mission upload is the same size for 1 lap or 50. The ground
+    station runs the clock at the swarm's cruise speed, holds it until
+    everyone has climbed, and slows it if any drone falls behind.
+
+    Two fixes made for this plan, shared with the figure-8:
+      - RouteTracker (progress along a route) now never reads more than
+        2 m behind the furthest progress seen and breaks ties by nearest
+        last progress - a show lap flies out to the star and back along
+        the same line, and the old nearest-segment projection read the
+        way back as the way out (progress running backwards).
+      - In timetable mode a drone never plans to pass where the timetable
+        wants it one tick ahead, so it ARRIVES at a held shape instead of
+        flying metres past it at move speed.
+
+Status:
+    Verified end to end headless (real planner -> timed tracks -> drone
+    threads -> simulated firmware), worst drone off its slot while each
+    shape is held:
+       10 drones, 2 laps: 0.7-3.2 m; spins hold their radius to 0.2 m;
+                  closest any two drones got 9.3 m; every drone landed
+                  on its own pad (0.0 m off)
+       16 drones, 2 laps, mixed top speeds 10-20 m/s: 0.6-5.1 m; spins
+                  0.2 m; closest 8.6 m; all on their own pads
+    ENHSP: 6 drones x 1 lap 0.3s, 16 x 3 0.4s, 40 x 5 0.6s, 16 x 20 0.3s.
+
+    CHANGED (later the same day) - SHOW SPEED: the simulator runs at 20x
+    real time, so a 2-lap show was over in ~12 s and drones crossed the
+    map at ~240 m/s. The Mission Planner now has a "Show speed" box for
+    this plan - Real time (1x), 2x (default), 5x, 20x - passed as
+    start_mission_paths(time_scale=...) for this mission only (stop()
+    restores the default). Formation drones tick so one tick is <= 0.5 s
+    of simulated time (TRAIN_TICK_SIM_S). 10 drones, 1 lap:
+        2x:  75 s of real time, fastest drone 15 m/s on screen, shapes
+             held within 2.0 m, closest 9.4 m, all on their own pads
+        1x: 148 s of real time, drones at their real 8 m/s, shapes
+             within 2.1 m, closest 9.5 m, all on their own pads
+
+
+--------------------------------------------------------------------
+8. plans/Inspect/   (UI label: "Inspect")
+--------------------------------------------------------------------
+Domain:     road-inspection-drone-mission   Kind: road_inspection
+Files:      domain.pddl, problem.pddl
+            (road route + PDDL editing: engine/road_inspection.py)
+Added:      2026-10-11
+What it does:
+    Click a source and a destination ON A ROAD. One drone (the first
+    checked; any others stay on the ground) takes off at the source end
+    of the road, follows the road's exact path - every curve - to the
+    destination, flies the same road back and lands at the source.
+
+    The road's path comes from an OSRM routing server (driving profile,
+    OpenStreetMap roads): the public demo https://router.project-osrm.org
+    unless the DRONE_SIM_OSRM_URL environment variable points elsewhere
+    (e.g. a self-hosted OSRM for offline use). The two clicked points are
+    sent to it. Needs an internet connection to that server.
+
+    No route -> the plan fails BEFORE anything flies, with a pop-up
+    ("Inspect: no road route") saying why:
+      - the roads the two points are on don't connect (OSRM NoRoute)
+      - a click is more than 30 m from any road (OSRM snaps clicks to
+        the nearest road however far away, so this is checked here)
+      - source and destination under 20 m apart along the road
+      - the routing service can't be reached / answers with an error
+
+    PDDL: the road is split into up to 12 segments (road1, road2, ...
+    between source and destination, each with its along-the-road length);
+    ENHSP plans inspect-segment for each in order, finish-inspection at
+    the destination, return-along-road back segment by segment, and
+    land-at-source. The worker checks exactly that order.
+
+    Flight: the whole out-and-back road path is uploaded as ONE mission
+    (the same smooth whole-route mechanism as the figure-8), so the drone
+    flies through every road vertex without stopping. The "Mark a
+    restricted area" option is greyed out (and ignored) for this plan.
+
+Status:
+    New. Verified on real roads through the real planner and drone
+    pipeline:
+       1.4 km road near 17.20N 78.31E (27 points): never more than 0.0 m
+          off the road line, back and landed 0.0 m from the source, no
+          stalls; ENHSP 0.3 s
+       3.8 km city road in Hyderabad (141 points): never more than 0.0 m
+          off the road, landed 0.0 m from the source, no stalls
+    GUI: clicks on roads -> plan + flight; a source 393 m off the road ->
+    "Inspect: no road route" pop-up, nothing flies.
+
+
+--------------------------------------------------------------------
+9. plans/planets/   (UI label: "Planets")
+--------------------------------------------------------------------
+Domain:     planets-formation-drone-mission   Kind: planets_formation
+Files:      domain.pddl, problem.pddl
+            (orbits + timed tracks: engine/planets_problem.py)
+Added:      2026-10-12
+What it does:
+    CHANGED 2026-10-29: two clicks - the SOURCE (take-off pads) and the
+    DESTINATION (the sun); no restricted area. 2-8 drones, one per
+    planet, innermost first (drone-mercury, ... drone-neptune):
+        take off       from pads in a line at the source, 10 m apart,
+                       running straight back from the destination
+        fly out        ONE BY ONE, single file along the line source ->
+                       sun, 30 m apart, innermost (front pad) first; each
+                       stops where its own orbit crosses the line (its
+                       start point) - so it only passes empty start points
+        enter orbits   all lined up on that line (held 4 s)
+        laps           drone k orbits at 50 m + 10 m x k - 50, 60, ...
+                       120 m (CHANGED 2026-10-29 from 50 m apart:
+                       drones on neighbouring orbits 10 m apart).
+                       Neighbouring orbits turn OPPOSITE ways: innermost
+                       anticlockwise, next clockwise, ...
+                       RELATIVE MOTION: every drone turns at the SAME
+                       angular speed, so the anticlockwise drones stay in
+                       one straight line out from the sun and the
+                       clockwise ones in another - two rigid spokes. Speed
+                       is in proportion to the radius: the outermost at
+                       60% of full speed, the innermost slowest (8 drones:
+                       2.5 ... 6.0 m per clock s). A lap = one turn of
+                       every drone; every lap ends with both spokes lined
+                       up again on the start line
+        fly back       (held 4 s) ONE BY ONE, the fly-out played
+                       backwards: outermost first, landing on the pad each
+                       drone took off from
+    The destination must be at least planets_min_distance_m away
+    (outermost orbit + 50 m; 8 drones 170 m) - the GUI says so and
+    re-arms the clicks.
+    SMOOTH FLIGHT (2026-10-29): every move (fly out, the laps, fly back)
+    speeds up from a standstill and slows back to one smoothly (half a
+    cosine over RAMP_S = 5 clock s, _eased_keys) instead of jumping to
+    full speed and stopping dead; all the laps are one eased move, so the
+    spokes stay straight while they speed up and slow down. Orbits are
+    flown as 4 m legs (was 10 deg / 20 m), with a 5 cm margin on the
+    orbit spacing for the legs' sag, so neighbours never get under 10 m.
+    train_keeping: the one-tick "don't overshoot" speed cap now only
+    applies while the timetable is slowing or about to stop - at steady
+    speed it pulled a drone slightly ahead back far harder than one
+    behind was pushed, and the speed see-sawed. Offline control-loop
+    check (real train_speed, 0.5 s ticks running randomly late, outermost
+    of 8 drones): 99th-percentile acceleration 9.95 -> 3.80 m/s2, worst
+    18.4 -> 8.3 m/s2, worst lag behind the timetable 4.65 -> 2.32 m.
+    (Until 2026-10-29: one click, the show round the source, every drone
+    at about the same speed - inner drones made several turns per lap.)
+
+    PDDL: ENHSP sequences fly-to-orbit per drone in its turn
+    (out-turn / out-after chain), enter-orbits (only once every drone is
+    on its orbit, and only if no two orbit-neighbor drones turn the same
+    way), one fly-lap per lap (laps-completed / laps-required), end-show,
+    return-to-source per drone in its turn (back-turn / back-after), land
+    per drone, complete-planets. orbit-speed records each drone's speed.
+    The worker checks exactly that sequence and drone order.
+
+    Flight: the same timetable mechanism as the star show
+    (engine/train_keeping.py, schedule mode); one lap uploaded once and
+    repeated on board. The "Show speed" box applies to this plan too.
+
+Status:
+    Timetable check (positions sampled every 0.1-0.25 s, 2/3/5/8
+    drones, three directions): the two spokes stay exactly in line
+    (0.0 deg), closest any two drones get 10.0 m (never under 9.99 m),
+    every drone ends on its own pad.
+    ENHSP: 2-8 drones x 1-2 laps 0.5-0.7 s, order as planned.
+    NOT yet flown through the drone threads since the change: a headless
+    run from the agent sandbox got no UDP heartbeats (the sandbox blocks
+    local UDP - a plain 2-drone mission failed the same way).
+
+
+--------------------------------------------------------------------
+10. plans/parabolaformation/   (UI label: "Parabola Formation")
+--------------------------------------------------------------------
+Domain:     parabola-formation-drone-mission   Kind: parabola_formation
+Files:      domain.pddl, problem.pddl
+Added:      2026-10-20
+What it does:
+    Three drones fly source -> destination side by side on ONE line
+    across the route, 10 m apart: the middle drone (drone-vertex) at
+    50 m and the two arm drones (drone-left, drone-right) at 60 m, so
+    seen from behind they make an upward-opening parabola ("U").
+    Picked like the V (source + destination + optional restricted area).
+    Exactly 3 drones (PARABOLA_DRONES); extra checked drones stay down.
+
+    Communication: every drone talks to BOTH others (3 pairs, 6 directed
+    `parabola-neighbor` facts). ENHSP must `establish-comm-link` each
+    directed link (both drones up at cruise altitude, radios ok, and
+    `link-distance` <= `comm-range`, 100 m) and `confirm-swarm-comm` per
+    drone before any drone may take its slot; `hold-parabola-shape`
+    (after every `formation-cruise` leg) requires every link still up,
+    and `detect-neighbor-link-loss` drops a failed drone's links.
+
+    Shape check in establish-parabola-formation: each arm's
+    target-altitude minus the vertex's must equal `arm-rise` (10 m) - so
+    a flat line, an inverted U or lopsided arms give no plan - and every
+    vertex-arm gap must be >= `min-separation` (10 m; actual 14.14 m).
+
+    Flight (services/plan_service.py _run_parabola_formation): ENHSP
+    plans the vertex corridor; it is split into <= 200 m legs
+    (PARABOLA_LEG_M) and the arms derived parallel at +-10 m
+    (formation_member_route, along 0). The arms' +10 m rides
+    per_drone_altitude_offset_m (like the cube's layers). All three fly
+    one shared timetable (TrainRoute schedule mode): due at each
+    waypoint at the same clock time, the clock held until all three have
+    climbed - otherwise the vertex (10 m less to climb) runs ~25 m ahead.
+    The leg split matters: a route with no intermediate points is not
+    flown as a formation by the drone threads (drone_thread.py, the
+    approach/loop/depart check) and each drone just flies flat out.
+
+Status:
+    New. ENHSP: 25-step plan (27 with a detour), ~0.1 s. Negative
+    checks (arm at 55 m, flat 50 m line, comm-range 15 m) -> no plan.
+    Headless through the real planner -> drone threads -> firmware:
+        straight 1.0 km: altitudes 50.0 / 60.0 / 60.0 m, vertex-arm
+            14.1-15.0 m, arm-arm 20.0-20.4 m, abreast within ~2 m
+        with a restricted-area detour: vertex-arm 13.6-15.5 m,
+            arm-arm 18.5-20.6 m through the bend
+
+
+--------------------------------------------------------------------
+11. plans/BatteryAware/   (UI label: "Battery-Aware Mission")
+--------------------------------------------------------------------
+Domain:     battery-aware-drone-mission   Kind: battery_aware
+Files:      domain.pddl, problem.pddl
+            (battery model + PDDL editing: engine/battery_mission.py)
+Added:      2026-10-30
+What it does:
+    ONE drone (the first checked; any others stay on the ground) flies
+    from a clicked SOURCE to a clicked DESTINATION.
+      - After the destination click the drone's battery is checked
+        (direct_hop_check). Enough battery -> planned and flown straight
+        away, no charging.
+      - Not enough -> a pop-up says how far it needs to go and how far one
+        charge takes it, and the map switches to "Set Charging Station":
+        the operator clicks 5 charging stations, each drawn as a numbered
+        battery (C1..C5, yellow). If no chain of hops through them is
+        flyable, a pop-up says why and the 5 stations are clicked again.
+    ENHSP (-planner opt-hrmax, :metric minimize total-distance) picks the
+    shortest route through the stations the battery allows. The stations
+    used turn green and the route is drawn as a purple line.
+
+    Battery model: every hop is takeoff -> climb -> cruise -> descent, at
+    the autopilot's constant 20 A draw, +10% margin (HOP_MARGIN). The
+    drone must land with >= 25% left (RESERVE_PCT) - above the 20%
+    low-battery prompt, so a planned hop never stops to ask for an
+    emergency landing.
+
+    PDDL: pre-flight-check, take-off, fly-hop (only if battery - hop-energy
+    >= reserve), then land-at-station + charge-battery (battery back to
+    full) + take-off at each station, or land-at-destination +
+    complete-mission. Landing at a station sets needs-charge, and take-off
+    is blocked until charge-battery clears it, so the drone always lands,
+    charges and only then takes off again. The worker checks the plan
+    starts at the source, ends at the destination, lands/charges/takes off
+    at every station it visits, and is exactly as short as an independent
+    Dijkstra check (best_station_route).
+
+    Flight: ThreadSwarmBackend.start_charging_mission flies each hop as its
+    own mission ending in a landing. Once the drone is down within 30 m of
+    the station, the GCS sends the new CHARGE command; the simulated
+    autopilot charges the battery on the ground (full charge in
+    FULL_CHARGE_S = 1200 simulated s, ~1 min on screen at 20x). At 100% it
+    sends the next hop's NAVIGATE (arm, take off, fly). The Flight Log shows
+    every landing/charge/take-off.
+
+    CHANGED 2026-10-30 (later the same day), at the user's request:
+      - The 5 charging stations are ALWAYS asked for after the destination,
+        even when the drone could fly straight there; only then is the
+        route decided - direct if the current charge reaches the
+        destination (no station used).
+      - No more charging to full: at a station the drone charges to what
+        the NEXT hop needs + 10% (CHARGE_MARGIN_PCT; charge_targets), so
+        every hop lands with ~10% left. PDDL: charge-battery ?d ?l ?to sets
+        battery = hop-energy(l, to) + charge-margin and allows only that hop
+        (charged-for). The old 25% reserve and the x1.1 hop margin are gone;
+        the estimate adds TRANSITION_OVERHEAD_S = 10 s per hop instead.
+      - From the first station the destination is in reach from, the drone
+        charges just enough for the destination and flies straight there,
+        skipping stations in between (the metric is metres + 1 per landing).
+      - A planned charging hop lands below the 20% low-battery prompt, so
+        the prompt is skipped for it unless the battery hits critical (5%).
+    Verified: 0.8 km with 5 stations -> waited for them, flew direct.
+    2.4 km, 1000 mAh drone, 4 stations along the way -> source -> C1 ->
+    destination only; at C1 landed 39%, charged to 94% (84% + 10%), landed
+    at the destination with 11.4%, no prompt. 80 km D10-like drone ->
+    C1 -> C2 -> destination (was C1 -> C2 -> C4 -> destination), charging
+    to 69% and 97%; ENHSP agrees with the Dijkstra check.
+
+Status:
+    New. Verified:
+      - ENHSP alone, 80 km mission, D1 profile (15 m/s, 15200 mAh, ~27 km
+        per hop), 5 stations: 0.7 s, source -> C1 -> C2 -> C4 -> destination,
+        the same route as the Dijkstra check (80.9 km).
+      - Headless through the real MainWindow -> planner -> drone thread ->
+        simulated firmware, a 1000 mAh drone (~1.2 km per hop):
+          0.8 km: direct, no stations asked for, 5-step plan, landed.
+          3.0 km: asked for stations; source -> C1 -> C2 -> destination,
+                  landed at C1 with 36%, charged to 100%, took off; same at
+                  C2 (34%); landed 0.0 m from the destination. The battery
+                  never went under 33%, so no low-battery prompt.
+          5 stations all out of reach -> "Battery-Aware: no route" pop-up,
+                  stations cleared and re-asked.
+
+
+--------------------------------------------------------------------
+12. plans/Formula-4/   (UI label: "Formula-4 (Dynamic Swap)")
+--------------------------------------------------------------------
+Domain:     formula4-drone-mission   Kind: formula4_formation
+Files:      domain.pddl, problem.pddl
+            (the formula, tracks and PDDL editing: engine/formula4_problem.py)
+Added:      2026-10-30
+What it does:
+    Two clicks, SOURCE and DESTINATION; exactly 4 drones (the first four
+    checked: drone 1, 2, 3, 4). Drones 1 and 2 fly in the FRONT line, 3 and 4
+    in the BACK line, 20 m behind; 1 and 3 share the LEFT lane, 2 and 4 the
+    RIGHT lane, 20 m apart. All the way to the destination 1 and 3 keep
+    swapping places, and so do 2 and 4: the front drone slows down and dips
+    to 50 m, the back drone speeds up, climbs to 60 m and passes over it;
+    then the other way round. At the destination they land on their own
+    slots. NO drone-to-drone communication: every drone flies its own
+    closed-form formula of one shared clock.
+
+    The formula (x along the route, y across it - left +, z height,
+    tau the clock; f = +1 front / -1 back, l = +1 left / -1 right):
+        x = V tau + f (D/2) cos(w tau)
+        y = l (W/2 + f (B/2) sin(w tau))
+        z = Z0 - f A sin(w tau)
+    V 6 m per clock s, D = W = 20 m, B = 6 m, Z0 = 55 m, A = 5 m; w set so
+    the route holds an EVEN number N of swaps (w T = N pi) with the passing
+    drone at most 1.5 V and the slow one at least 0.5 V. Pairwise distance
+    from the formula: same lane >= min(D, sqrt(B^2 + 4A^2)) = 11.66 m, same
+    line >= W - B = 14 m, diagonal = W = 20 m. domain.pddl explains the
+    formula and the proof in its comments.
+
+    PDDL: check-formula (proves the separation from the numbers - nonlinear
+    numeric preconditions on static fluents, which ENHSP grounds fine) ->
+    per drone: take-off, slow-and-dip / speed-up-and-climb alternately (N),
+    arrive, land. Every action except check-formula takes ONE drone and
+    touches only its facts. The worker checks each drone's sequence exactly.
+
+    Flight: the formula sampled at 10 points per swap -> each drone's
+    timed track (TrainRoute schedule + loop_alt_offsets, base lifted to
+    Z0); the drones' only shared input is the GCS's clock. Show speed box
+    applies (default 2x). Route 126 m .. ~8 km (one UDP NAVIGATE per drone).
+
+Status:
+    New. Flown tracks (straight lines between points): closest pair 11.62 m
+    for 0.13-8 km. ENHSP 0.5-0.7 s up to 8 km (126 swaps, 517 steps).
+    Negative checks -> no plan: swing 3 m and no side-step, line gap 8 m,
+    swap rate too fast for the slow drone.
+    Headless through the real MainWindow -> planner -> 4 drone threads ->
+    firmware, positions sampled every 20 ms:
+        500 m, 2x: 6 swaps per lane, every pass 60 m over 50 m, closest any
+                   two drones 11.6 m, altitudes 50.0-60.0, all landed 0.0 m
+                   from their own destination slots
+        1 km, top speeds 10/15/20/12 m/s: 14 swaps per lane, closest 11.6 m,
+                   all landed 0.0 m from their slots
+
+
+--------------------------------------------------------------------
+13. plans/Formation-Circle/   (UI label: "Formation-Circle (Spiral)")
+--------------------------------------------------------------------
+Domain:     circle-formation-drone-mission   Kind: circle_formation
+Files:      domain.pddl, problem.pddl
+            (the formula, tracks and PDDL editing: engine/circle_formation_problem.py)
+Added:      2026-10-30
+What it does:
+    Two clicks, SOURCE and DESTINATION; exactly 4 drones (the first four
+    checked). A vertical circle across the route, radius R = 10 m, centre
+    Z0 = 50 m: drone 1 at the bottom (40 m), 2 on the left (50 m), 3 at the
+    top (60 m), 4 on the right (50 m). The circle flies to the destination
+    and keeps TURNING - each quarter turn every drone moves on one place,
+    bottom -> left -> top -> right -> bottom - so each drone flies a spiral
+    (helix) round the route. NO drone-to-drone communication: every drone
+    flies its own closed-form formula of one shared clock.
+
+    The formula (x along, y across - left +, z height; a = angle from the
+    bottom, a_i0 = 0, pi/2, pi, 3pi/2 for drones 1-4):
+        a = a_i0 + w (tau - Tj),  x = V tau,  y = R sin a,  z = Z0 - R cos a
+    V 6 m per clock s; whole turns, about one per 80 m (TURN_M). The circle
+    turns rigidly, so neighbours are always R sqrt2 = 14.14 m apart and
+    opposite drones 2R = 20 m.
+    Take-off / landing: bottom and top share a ground point, so the pads
+    are a diamond - each pad E cos(a_i0) along the route from its circle
+    place (E = 10 m): the diamond closes into the circle over the first
+    40 m (x = V tau + E cos(a_i0)(1 - b(tau/Tj))) and opens out over the
+    last 40 m; >= 14.14 m between any two drones throughout. Whole turns
+    mean every drone lands on the pad matching its starting place.
+    domain.pddl explains the formula and the proof in its comments.
+
+    PDDL: check-formula (neighbour / opposite / pad gaps, spiral speed
+    V^2 + (Rw)^2 <= max-speed^2, circle clears lowest-altitude) -> per
+    drone: take-off, join-circle, turn-quarter ?from ?to (4 per turn, round
+    next-place), leave-circle, land. Every action except check-formula
+    takes ONE drone. The worker checks each drone's sequence exactly.
+
+    Flight: 16 track points per turn; each drone takes off to its own
+    height (per-drone altitude offset 40/50/60/50 m) and flies timed
+    tracks against the shared clock, like Formula-4. Show speed applies.
+    Route 160 m .. ~6 km.
+
+Status:
+    New. Flown tracks: closest pair 13.87 m (0.17-6 km). ENHSP 0.4-0.5 s up
+    to 6 km (292 quarter turns, 1185 steps). Negative checks -> no plan:
+    radius 6 m, pad offset 4 m, turning too fast, circle centre 35 m.
+    Headless through the real MainWindow -> planner -> 4 drone threads ->
+    firmware, sampled every 20 ms:
+        500 m, 2x (3 runs): 20 position changes per drone in order, closest
+                  13.1-13.2 m, altitudes 39.8-60.6, four drones level
+                  along the route within ~0.3 m, all landed 0.0 m from
+                  their own pads
+        1 km, top speeds 10/15/20/12: 44 changes each, closest 13.5 m,
+                  all landed 0.0 m from their pads
+    OPEN: the very first 500 m run stalled - drone 1 fell ~160 m behind
+    while the clock ran on, and the run was cut off at 300 s. Not seen in
+    the 4 runs since, nor flying the same tracks straight through the
+    backend. If it shows up again, check whether drone 1's snapshots stop
+    reaching the GCS (then the straggler check never sees it lagging).
+
+
+--------------------------------------------------------------------
+FIX 2026-10-30: "WinError 10040" starting Formation-Circle / Formula-4
+--------------------------------------------------------------------
+    A formation drone gets its whole timed track in ONE NAVIGATE command.
+    For longer routes that JSON was bigger than a UDP datagram can carry
+    (~64 KB), so the send failed and the plan never started. The planners'
+    size check only counted the track points, not the timetable sent with
+    them, so it let those routes through.
+    FIX: engine/protocol.py fragment() splits any command over 60 KB into
+    numbered FRAGMENT datagrams; engine/drone_link.py reassembles them
+    (FragmentAssembler, 8 MB receive buffer) before translating. Track
+    values are rounded (lat/lon 7 decimals ~1 cm, heights/metres 2, times 3),
+    which halves the message size. A send failure now stops the mission
+    with a "Drone node: ..." status message instead of a traceback. The
+    planners' size check is now a 9000-point cap (one tick's worth of
+    autopilot mission upload): Formation-Circle up to ~45 km, Formula-4
+    up to ~50 km.
+    Verified: fragment/reassemble round trip exact (in any order); flown
+    through the real MainWindow at 20x - Formation-Circle 3 km (144 position
+    changes) and 10 km (492), Formula-4 6 km (94 swaps per lane), every
+    drone landed 0.0 m from its own pad; closest pair 11.5-11.8 m.
+
+
+--------------------------------------------------------------------
+Quick reference: solved / unsolvable / other, all runs on disk today
+--------------------------------------------------------------------
+    Search          69 total - 69 solved,  0 unsolvable, 0 other
+    travell         83 total - 76 solved,  7 unsolvable, 0 other
+    vformation      65 total - 62 solved,  2 unsolvable, 1 other (truncated)
+    gridformation   19 total - 15 solved,  4 unsolvable, 0 other (pre-fix only)
+    3dgridformation  new     - see the verification table above
+    figure8formation new     - see the verification table above
+    starformation    new     - see the verification notes above
+    Inspect          new     - see the verification notes above
+    parabolaformation new    - see the verification notes above
+    BatteryAware     new     - see the verification notes above
+    Formula-4        new     - see the verification notes above
+    Formation-Circle new     - see the verification notes above
