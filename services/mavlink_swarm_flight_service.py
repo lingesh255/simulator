@@ -36,6 +36,11 @@ from contracts.gui_orchestration import (
     SwarmTelemetryBatch,
 )
 from engine.mavlink_mission import FlightAborted, upload_and_fly
+from engine.peer_bus import DOWN, local_mesh
+
+# How high (metres above the launch point) a formation drone must be before
+# the drone behind it may take off.
+AIRBORNE_CLEARANCE_M = 5.0
 
 
 @dataclass
@@ -58,45 +63,13 @@ class _VehicleState:
     done: bool = False
 
 
-class _StartGate:
-    """All-ready release gate for a formation's real-route departure.
-
-    Every drone's upload/arm handshake takes a different length of time, so
-    letting each one switch to AUTO as soon as its own handshake finishes
-    sends them off seconds apart (tens of metres at cruise speed) and the
-    formation arrives already skewed. Each drone calls `arrive` once it is
-    armed and ready and then `wait`; they are all released together when the
-    last one arrives. A drone that can never arrive (it failed, or was
-    aborted) must still be counted via `arrive`, or the rest wait for it
-    until the timeout. `arrive` is idempotent per index.
-    """
-
-    def __init__(self, total: int) -> None:
-        self._lock = threading.Lock()
-        self._pending = set(range(total))
-        self._released = threading.Event()
-        if not self._pending:
-            self._released.set()
-
-    def arrive(self, index: int) -> None:
-        with self._lock:
-            self._pending.discard(index)
-            if not self._pending:
-                self._released.set()
-
-    def wait(self, should_abort, timeout_s: float = 60.0, pump=None) -> None:
-        """Block until released. `pump`, if given, is called every 0.1 s while
-        waiting - the caller's chance to keep servicing its vehicle link."""
-        deadline = time.monotonic() + timeout_s
-        while not self._released.wait(0.1):
-            if pump is not None:
-                pump()
-            if should_abort():
-                raise FlightAborted("aborted while waiting for the formation to be released")
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"timed out after {timeout_s:.0f}s waiting for every drone in the formation to be ready"
-                )
+def _peer_ids(assignments: list) -> list[str]:
+    """One unique peer-bus name per assignment: the drone's own name, unless
+    two drones share one (then the sysid is appended to tell them apart)."""
+    names = [name for _sysid, name, _pts in assignments]
+    if len(set(names)) == len(names):
+        return names
+    return [f"{name}#{sysid}" for sysid, name, _pts in assignments]
 
 
 class _SwarmWorker(QObject):
@@ -143,15 +116,15 @@ class _SwarmWorker(QObject):
         `launch_stagger_s` > 0 makes this a V-formation run: every drone
         lifts off from the one shared `launch_point` `(lat, lon)` - the
         source the operator picked, which is also where each vehicle is
-        parked - and climbs out to its own slot (`pts[0]`), strictly one
-        drone at a time. A drone does not leave the pad until the drone
-        ahead of it has actually reached its slot, plus `launch_stagger_s`
-        seconds of settling time; sequencing on the arrival rather than on a
-        fixed clock is what keeps two vehicles off the same launch point.
-        This mirrors `ThreadSwarmBackend.start_formation_mission`'s in-app
-        behaviour (see `services.plan_service.FORMATION_LAUNCH_STAGGER_S`)
-        on this real-MAVLink path. `launch_point` defaults to the first
-        assignment's own first point when not given.
+        parked - and climbs out to its own slot (`pts[0]`). Every drone's
+        thread runs concurrently - all connect, upload and arm at once - and
+        only the takeoffs are sequenced, by the drones messaging each other:
+        a drone does not leave the pad until the drone ahead of it has
+        announced it is `AIRBORNE_CLEARANCE_M` up (while still climbing to
+        its own altitude), plus `launch_stagger_s` seconds of settling time;
+        sequencing on that message rather than on a fixed clock is what keeps
+        two vehicles off the same launch point. `launch_point` defaults to
+        the first assignment's own first point when not given.
 
         0 (the default, and what an area-coverage mission always passes)
         launches every drone together, straight onto its own route, exactly
@@ -184,82 +157,56 @@ class _SwarmWorker(QObject):
 
         errors: dict[int, str] = {}
 
-        # Formation assembly gate: once a drone has climbed out from the pad
-        # and is holding in its own slot (see the `MAV_CMD_NAV_LOITER_UNLIM`
-        # upload below), it adds itself here and then polls until every other
-        # drone in this run has too - only `launch_stagger_s > 0` (a
-        # V-formation) ever populates this; an area-coverage run (0) never
-        # touches it, so every drone there goes straight to its real route
-        # exactly as before this existed.
-        assembly_total = len(assignments)
-        climbed: set[int] = set()
-        climbed_lock = threading.Lock()
-        # One event per formation drone, set the moment it reports settled in
-        # its slot. Drone i waits on drone i-1's before it even connects, so
-        # the drones leave the shared pad strictly one at a time; index 0's
-        # is pre-set because the apex goes first with nothing to wait for.
-        in_slot_events = [threading.Event() for _ in assignments]
-        if in_slot_events:
-            in_slot_events[0].set()
-        # Release gate for the real-route departure (see `_StartGate`): every
-        # drone is armed with its route uploaded before any of them is
-        # switched to AUTO, so the formation leaves together.
-        start_gate = _StartGate(assembly_total if is_formation else 0)
-
-        def wait_for_formation(sysid: int, name: str, master, timeout_s: float = 120.0) -> None:
-            with climbed_lock:
-                climbed.add(sysid)
-                ready = len(climbed) >= assembly_total
-            if ready:
-                return
-            self.progress.emit(f"{name}: holding - waiting for the rest of the formation to climb ...")
-            waited = 0.0
-            while True:
-                with climbed_lock:
-                    if len(climbed) >= assembly_total:
-                        return
-                if self._abort:
-                    raise FlightAborted(f"{name}: aborted while holding for the formation")
-                if waited >= timeout_s:
-                    raise TimeoutError(
-                        f"{name}: timed out after {timeout_s:.0f}s waiting for the rest of the "
-                        f"formation to reach cruise altitude"
-                    )
-                # Holding drones still stream telemetry. Nobody reads their
-                # socket otherwise, so the backlog overflows the kernel's UDP
-                # buffer (thousands of dropped datagrams over a long hold -
-                # the next mission upload's reply can be among them) and the
-                # map shows the drone frozen at wherever it last reported.
-                self._drain(master, sysid)
-                time.sleep(0.2)
-                waited += 0.2
+        # A formation's sequencing is peer-to-peer: each drone has its own
+        # `PeerBus` endpoint (see engine.peer_bus) and the drones tell each
+        # other what they have done instead of sharing a flag between threads.
+        #   AIRBORNE announced as soon as a drone's own telemetry shows it
+        #            `AIRBORNE_CLEARANCE_M` up - while it is still climbing.
+        #            All the drones connect, upload and arm at the same time;
+        #            drone i then waits (in `before_auto`, i.e. armed, just
+        #            before AUTO starts its takeoff) to hear it from drone
+        #            i-1, so the drones leave the shared pad one after
+        #            another but overlap in the air; the apex has no one ahead.
+        #   IN_SLOT  announced once a drone has climbed out and is holding in
+        #            its own slot (the `MAV_CMD_NAV_LOITER_UNLIM` upload
+        #            below). Every drone waits to hear it from all the others
+        #            before heading for its real route.
+        #   READY    announced once a drone is armed with its real route
+        #            uploaded. Every drone's upload/arm handshake takes a
+        #            different time, so letting each switch to AUTO as soon as
+        #            its own finishes sends them off seconds apart (tens of
+        #            metres at cruise speed); instead each waits to hear READY
+        #            from all the others and they enter AUTO together.
+        #   DOWN     announced when a drone's flight ends or fails, so the
+        #            rest never wait on it for the timeout.
+        # Only `launch_stagger_s > 0` (a V-formation) creates the buses; an
+        # area-coverage run (0) never touches them, so every drone there goes
+        # straight to its real route exactly as before.
+        peer_ids = _peer_ids(assignments)
+        buses = (
+            local_mesh(
+                peer_ids,
+                on_heard=lambda me, sender, topic, _data: self.progress.emit(
+                    f"{me}: heard '{topic}' from {sender}"
+                ),
+            )
+            if is_formation else {}
+        )
 
         def fly(
             sysid: int, name: str, pts: list, conn: str, altitude_m: float, index: int,
             speed_mps: float | None,
         ) -> None:
             master = None
+            bus = buses.get(peer_ids[index])  # None outside a formation
             # Only passed when given, so upload_and_fly's own default applies otherwise.
             speed_kwargs = {} if speed_mps is None else {"cruise_speed_mps": float(speed_mps)}
             try:
                 from pymavlink import mavutil
 
-                if is_formation and index > 0:
-                    # Hold on the pad until the drone ahead has climbed out
-                    # to its slot, then give it `launch_stagger_s` to settle.
-                    self.progress.emit(
-                        f"{name}: on the launch point - waiting for the drone ahead to reach its slot ..."
-                    )
-                    while not in_slot_events[index - 1].wait(0.2):
-                        if self._abort:
-                            raise FlightAborted(f"{name}: aborted while waiting on the launch point")
-                    waited = 0.0
-                    while waited < launch_stagger_s:
-                        if self._abort:
-                            raise FlightAborted(f"{name}: aborted while waiting on the launch point")
-                        time.sleep(0.2)
-                        waited += 0.2
-
+                # Every drone connects, uploads and arms right away,
+                # concurrently; only the moment of takeoff is sequenced (see
+                # `hold_for_takeoff` below).
                 self.progress.emit(f"{name}: connecting to {conn} ...")
                 master = mavutil.mavlink_connection(conn)
                 with self._lock:
@@ -271,40 +218,97 @@ class _SwarmWorker(QObject):
                     # (`pts[0]` - for the apex that is the pad, so it is a
                     # straight climb) and hold there on a real
                     # MAV_CMD_NAV_LOITER_UNLIM item, not just "fly to a
-                    # nearby waypoint". Reaching the slot releases the next
-                    # drone from the pad; the whole formation then waits for
-                    # every slot to be filled before any of them heads toward
-                    # its real first waypoint. Without that gate, whichever
-                    # drone settles first just carries on alone and the V
-                    # strings out along the route instead of departing intact
-                    # - see services.thread_backend's equivalent gate for the
-                    # in-app (non-MAVLink) execution path.
+                    # nearby waypoint". The next drone is released from the pad
+                    # as soon as this one is clear of it (AIRBORNE, below),
+                    # not when it reaches the slot; the whole formation then
+                    # waits for every slot to be filled before any of them
+                    # heads toward its real first waypoint. Without that gate,
+                    # whichever drone settles first just carries on alone and
+                    # the V strings out along the route instead of departing
+                    # intact - see services.thread_backend's equivalent gate
+                    # for the in-app (non-MAVLink) execution path.
                     slot = tuple(slots[index]) if slots else pts[0]
+                    airborne_sent = False
+
+                    def on_climb_message(msg, s: int = sysid, n: str = name) -> None:
+                        nonlocal airborne_sent
+                        self._on_message(s, msg)
+                        if (
+                            not airborne_sent
+                            and msg.get_type() == "GLOBAL_POSITION_INT"
+                            and msg.relative_alt / 1000.0 >= AIRBORNE_CLEARANCE_M
+                        ):
+                            # The drone's own telemetry says it is up and
+                            # clear: tell the drone behind it, armed and
+                            # waiting, that it may go - while this one is
+                            # still climbing, not once it is in its slot.
+                            airborne_sent = True
+                            self.progress.emit(
+                                f"{n}: airborne ({AIRBORNE_CLEARANCE_M:g}m, clear of the launch point) "
+                                f"- telling the other drones."
+                            )
+                            bus.announce("AIRBORNE")
+
+                    def hold_for_takeoff() -> None:
+                        """Armed and uploaded, just before AUTO starts the takeoff.
+                        Waits to hear the drone ahead is airborne, then lets
+                        `launch_stagger_s` pass. A drone ahead that dropped out
+                        (DOWN) releases this one too, so it never waits on a
+                        takeoff that cannot happen."""
+                        ahead = peer_ids[index - 1]
+                        self.progress.emit(f"{name}: armed on the launch point - waiting for {ahead} to lift off ...")
+                        bus.wait_for_peers(
+                            "AIRBORNE", [ahead], timeout_s=900.0,
+                            should_abort=lambda: self._abort,
+                            pump=lambda: self._drain(master, sysid),
+                        )
+                        waited = 0.0
+                        while waited < launch_stagger_s:
+                            if self._abort:
+                                raise FlightAborted(f"{name}: aborted while waiting on the launch point")
+                            self._drain(master, sysid)
+                            time.sleep(0.2)
+                            waited += 0.2
+                        self.progress.emit(f"{name}: {ahead} is clear of the launch point - taking off.")
+
                     upload_and_fly(
                         master, [pad, slot], altitude_m,
                         heartbeat_timeout_s=30.0,
                         on_progress=lambda m, n=name: self.progress.emit(f"{n}: {m}"),
                         should_abort=lambda: self._abort,
-                        on_message=lambda msg, s=sysid: self._on_message(s, msg),
+                        on_message=on_climb_message,
                         final_command=mav2.MAV_CMD_NAV_LOITER_UNLIM,
+                        before_auto=hold_for_takeoff if index > 0 else None,
                         **speed_kwargs,
                     )
                     self.progress.emit(f"{name}: in slot at {altitude_m:g}m - launch point clear.")
-                    in_slot_events[index].set()
-                    if index + 1 < len(assignments):
-                        # The hand-off itself is `in_slot_events[index]`, which
-                        # the next drone's thread is blocked on (see above).
-                        self.progress.emit(
-                            f"{name}: signalling {assignments[index + 1][1]} to take off "
-                            f"(after a {launch_stagger_s:g}s settle)."
-                        )
-                    wait_for_formation(sysid, name, master)
+                    bus.announce("IN_SLOT", lat=slot[0], lon=slot[1], alt=altitude_m)
+                    if len(bus.heard("IN_SLOT")) < len(peer_ids):
+                        self.progress.emit(f"{name}: holding - waiting for the rest of the formation to climb ...")
+                    # A drone that dropped out meanwhile fails the assembly at
+                    # once (down_ok=False). Holding drones still stream
+                    # telemetry and nobody reads their socket otherwise, so the
+                    # backlog overflows the kernel's UDP buffer (thousands of
+                    # dropped datagrams over a long hold - the next mission
+                    # upload's reply can be among them) and the map shows the
+                    # drone frozen at wherever it last reported; `pump` drains it.
+                    bus.wait_for_peers(
+                        "IN_SLOT", peer_ids, timeout_s=120.0, down_ok=False,
+                        should_abort=lambda: self._abort,
+                        pump=lambda: self._drain(master, sysid),
+                    )
                     self.progress.emit(f"{name}: formation assembled - proceeding to the real route.")
 
-                def hold_for_release(i: int = index, n: str = name, s: int = sysid) -> None:
+                def hold_for_release(n: str = name, s: int = sysid) -> None:
                     self.progress.emit(f"{n}: armed and ready - waiting to depart with the formation.")
-                    start_gate.arrive(i)
-                    start_gate.wait(lambda: self._abort, pump=lambda: self._drain(master, s))
+                    bus.announce("READY")
+                    # A drone that dropped out must not hold the rest here
+                    # (down_ok), same as before.
+                    bus.wait_for_peers(
+                        "READY", peer_ids, timeout_s=60.0,
+                        should_abort=lambda: self._abort,
+                        pump=lambda: self._drain(master, s),
+                    )
 
                 upload_and_fly(
                     master, pts, altitude_m,
@@ -328,9 +332,8 @@ class _SwarmWorker(QObject):
                         pass
                 # Never strand the drone behind this one on the pad waiting
                 # for a slot arrival that can no longer happen.
-                if is_formation:
-                    in_slot_events[index].set()
-                    start_gate.arrive(index)  # a drone that dropped out must not hold the rest on the gate
+                if bus is not None:
+                    bus.announce(DOWN)
                 with self._lock:
                     st = self._states.get(sysid)
                     if st is not None:
@@ -340,18 +343,22 @@ class _SwarmWorker(QObject):
 
         # Every thread starts now; a formation's own turn-taking is enforced
         # inside `fly`, which holds each drone on the pad until the one ahead
-        # of it reports in slot (see `in_slot_events`) rather than on a blind
-        # sleep here that could not tell whether the pad was actually clear.
+        # of it announces IN_SLOT (see the peer buses above) rather than on a
+        # blind sleep here that could not tell whether the pad was actually clear.
         threads = [
             threading.Thread(target=fly, args=(sysid, name, pts, conn, alt, i, spd), daemon=True)
             for i, ((sysid, name, pts), conn, alt, spd) in enumerate(
                 zip(assignments, connection_strings, altitudes, speeds or [None] * len(assignments))
             )
         ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            for bus in buses.values():
+                bus.close()
 
         if errors and not self._abort:
             self.failed.emit("; ".join(errors[s] for s in sorted(errors)))
