@@ -27,7 +27,7 @@ clock - is what keeps two drones off the shared launch point at once. Once
 every slot is filled the whole V is released toward the route together.
 
 That one-at-a-time climb-out is `--validate`'s. `--connect` flies the drones
-concurrently instead: all three connect and arm at once, and each wing lifts
+concurrently instead: all three connect at once, and each wing arms and lifts
 off as soon as the drone ahead *messages* that it is clear of the launch point
 (`engine.peer_bus`) - while that drone is still climbing, not after it has
 reached its slot.
@@ -557,18 +557,20 @@ def fly_on_connections(
     network I/O for the whole flight). Every vehicle is expected to be parked
     on the same launch point - the source the plan was solved for.
 
-    The threads run concurrently - every drone connects, uploads its mission
-    and arms at the same time - and the drones sequence only their takeoffs by
-    messaging each other (`engine.peer_bus`, one UDP endpoint per drone, no
-    shared flag between the threads). A drone announces `AIRBORNE` as soon as
-    its own telemetry shows it `TAKEOFF_CLEARANCE_M` up; the drone behind it,
-    armed and waiting in `upload_and_fly`'s `before_auto` hook, then waits
-    `launch_stagger_s` and switches to AUTO. So a wing lifts off while the drone
-    ahead is still climbing to its altitude, yet never while that drone is
-    still low over the shared launch point. A drone that drops out announces
-    `DOWN`, which releases the drone behind it too. (A real autopilot's
-    auto-disarm timer, ArduPilot's `DISARM_DELAY`, defaults to 10 s: keep the
-    wait between arming and takeoff under it.)
+    The threads run concurrently - every drone connects at the same time - and
+    the drones sequence their takeoffs by messaging each other
+    (`engine.peer_bus`, one UDP endpoint per drone, no shared flag between the
+    threads). A drone announces `AIRBORNE` as soon as its own telemetry shows
+    it `TAKEOFF_CLEARANCE_M` up; the drone behind it, connected but not yet
+    armed, then waits `launch_stagger_s` and only then uploads, arms and
+    takes off. So a wing lifts off while the drone ahead is still climbing to
+    its altitude, yet never while that drone is still low over the shared
+    launch point. A drone that drops out announces `DOWN`, which releases the
+    drone behind it too. A wing is never left armed while it waits: a real
+    autopilot disarms itself after `DISARM_DELAY` (10 s by default in
+    ArduPilot) on the ground, and would then sit on the pad in AUTO - seen
+    with three Renode-emulated ArduCopters, where the third drone waited
+    about 15 s of firmware time and never took off.
 
     Each drone's first mission is the climb-out - TAKEOFF from the launch
     point plus a real `MAV_CMD_NAV_LOITER_UNLIM` item at its own slot in the
@@ -638,30 +640,44 @@ def fly_on_connections(
     def fly(name: str, conn: str, index: int) -> None:
         bus = buses[name]
 
-        def hold_for_takeoff() -> None:
-            """Runs once this drone is connected, uploaded and armed, right
-            before it is switched to AUTO (which is what starts the takeoff).
-            The apex has no one ahead and never waits; a wing waits here for the
-            drone ahead's `AIRBORNE`, which that drone sends as soon as it is
-            clear of the pad - so the wing is lifting off while the drone
-            ahead is still climbing to its own altitude. A drone ahead that
-            dropped out (DOWN) releases it too."""
+        def hold_for_takeoff(master) -> None:
+            """Runs once this drone is connected, before its mission is
+            uploaded or it is armed (an autopilot left armed on the ground
+            disarms itself - see fly_on_connections' docstring). The apex has no
+            one ahead and never waits; a wing waits here for the drone
+            ahead's `AIRBORNE`, which that drone sends as soon as it is clear
+            of the pad - so the wing is lifting off while the drone ahead is
+            still climbing to its own altitude. A drone ahead that dropped out
+            (DOWN) releases it too. Meanwhile the vehicle's telemetry is read
+            and handed to the stats printer, so the link never backs up."""
+            on_message = make_on_message(name)
+
+            def drain() -> None:
+                for _ in range(200):
+                    message = master.recv_match(blocking=False)
+                    if message is None:
+                        return
+                    on_message(message)
+
             ahead = names[index - 1]
-            print(f"{name}: armed on the launch point - waiting for {ahead} to lift off ...")
-            bus.wait_for_peers("AIRBORNE", [ahead], timeout_s=timeout_s, should_abort=stop.is_set)
+            print(f"{name}: on the launch point - waiting for {ahead} to lift off ...")
+            bus.wait_for_peers("AIRBORNE", [ahead], timeout_s=timeout_s, should_abort=stop.is_set, pump=drain)
             waited = 0.0
             while waited < launch_stagger_s:
                 if stop.is_set():
                     raise FlightAborted(f"{name}: aborted while waiting on the launch point")
+                drain()
                 time.sleep(0.2)
                 waited += 0.2
-            print(f"{name}: {ahead} is clear of the launch point - taking off.")
+            print(f"{name}: {ahead} is clear of the launch point - arming and taking off.")
 
         try:
-            # Every drone connects, uploads and arms right away, concurrently;
-            # only the moment of takeoff is sequenced, by the message above.
+            # Every drone connects right away, concurrently; a wing's upload,
+            # arming and takeoff wait for the message above.
             print(f"{name}: connecting to {conn} ...")
             master = mavutil.mavlink_connection(conn)
+            if index > 0:
+                hold_for_takeoff(master)
             slot = tuple(slots[name]) if slots else routes[name][0]
             # Take off from the shared launch point and go take up the slot.
             upload_and_fly(
@@ -671,7 +687,6 @@ def fly_on_connections(
                 on_message=make_on_message(name),
                 should_abort=stop.is_set,
                 final_command=mav2.MAV_CMD_NAV_LOITER_UNLIM,
-                before_auto=hold_for_takeoff if index > 0 else None,
             )
             print(
                 f"{name}: in slot ({slot[0]:.6f},{slot[1]:.6f}) at {altitudes[name]:g}m "
@@ -714,8 +729,8 @@ def fly_on_connections(
                     )
 
     print(
-        f"All {len(names)} vehicles connect and arm together on ({pad[0]:.6f},{pad[1]:.6f}); {names[0]} "
-        f"lifts off first and each wing {launch_stagger_s:g}s after the drone ahead of it is "
+        f"All {len(names)} vehicles connect together on ({pad[0]:.6f},{pad[1]:.6f}); {names[0]} "
+        f"lifts off first and each wing arms and lifts off {launch_stagger_s:g}s after the drone ahead of it is "
         f"{TAKEOFF_CLEARANCE_M:g}m up - while that drone is still climbing."
     )
     workers: list[threading.Thread] = []

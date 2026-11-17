@@ -117,14 +117,14 @@ class _SwarmWorker(QObject):
         lifts off from the one shared `launch_point` `(lat, lon)` - the
         source the operator picked, which is also where each vehicle is
         parked - and climbs out to its own slot (`pts[0]`). Every drone's
-        thread runs concurrently - all connect, upload and arm at once - and
-        only the takeoffs are sequenced, by the drones messaging each other:
-        a drone does not leave the pad until the drone ahead of it has
-        announced it is `AIRBORNE_CLEARANCE_M` up (while still climbing to
-        its own altitude), plus `launch_stagger_s` seconds of settling time;
-        sequencing on that message rather than on a fixed clock is what keeps
-        two vehicles off the same launch point. `launch_point` defaults to
-        the first assignment's own first point when not given.
+        thread runs concurrently - all connect at once - and the takeoffs are
+        sequenced by the drones messaging each other: a drone is not even
+        armed until the drone ahead of it has announced it is
+        `AIRBORNE_CLEARANCE_M` up (while still climbing to its own altitude),
+        plus `launch_stagger_s` seconds of settling time; sequencing on that
+        message rather than on a fixed clock is what keeps two vehicles off
+        the same launch point. `launch_point` defaults to the first
+        assignment's own first point when not given.
 
         0 (the default, and what an area-coverage mission always passes)
         launches every drone together, straight onto its own route, exactly
@@ -162,11 +162,14 @@ class _SwarmWorker(QObject):
         # other what they have done instead of sharing a flag between threads.
         #   AIRBORNE announced as soon as a drone's own telemetry shows it
         #            `AIRBORNE_CLEARANCE_M` up - while it is still climbing.
-        #            All the drones connect, upload and arm at the same time;
-        #            drone i then waits (in `before_auto`, i.e. armed, just
-        #            before AUTO starts its takeoff) to hear it from drone
-        #            i-1, so the drones leave the shared pad one after
-        #            another but overlap in the air; the apex has no one ahead.
+        #            All the drones connect at the same time; drone i then
+        #            waits, connected but not yet armed, to hear it from drone
+        #            i-1 before it uploads, arms and takes off, so the drones
+        #            leave the shared pad one after another but overlap in
+        #            the air; the apex has no one ahead. (Not armed while it
+        #            waits: an autopilot left armed on the ground disarms
+        #            itself - ArduPilot's DISARM_DELAY, 10 s by default - and
+        #            would then sit on the pad in AUTO, never taking off.)
         #   IN_SLOT  announced once a drone has climbed out and is holding in
         #            its own slot (the `MAV_CMD_NAV_LOITER_UNLIM` upload
         #            below). Every drone waits to hear it from all the others
@@ -204,8 +207,8 @@ class _SwarmWorker(QObject):
             try:
                 from pymavlink import mavutil
 
-                # Every drone connects, uploads and arms right away,
-                # concurrently; only the moment of takeoff is sequenced (see
+                # Every drone connects right away, concurrently; a formation
+                # wing's upload, arming and takeoff wait for its turn (see
                 # `hold_for_takeoff` below).
                 self.progress.emit(f"{name}: connecting to {conn} ...")
                 master = mavutil.mavlink_connection(conn)
@@ -239,7 +242,7 @@ class _SwarmWorker(QObject):
                             and msg.relative_alt / 1000.0 >= AIRBORNE_CLEARANCE_M
                         ):
                             # The drone's own telemetry says it is up and
-                            # clear: tell the drone behind it, armed and
+                            # clear: tell the drone behind it, connected and
                             # waiting, that it may go - while this one is
                             # still climbing, not once it is in its slot.
                             airborne_sent = True
@@ -250,13 +253,13 @@ class _SwarmWorker(QObject):
                             bus.announce("AIRBORNE")
 
                     def hold_for_takeoff() -> None:
-                        """Armed and uploaded, just before AUTO starts the takeoff.
-                        Waits to hear the drone ahead is airborne, then lets
-                        `launch_stagger_s` pass. A drone ahead that dropped out
-                        (DOWN) releases this one too, so it never waits on a
-                        takeoff that cannot happen."""
+                        """Connected, but not yet uploaded or armed (see the
+                        DISARM_DELAY note above). Waits to hear the drone ahead
+                        is airborne, then lets `launch_stagger_s` pass. A drone
+                        ahead that dropped out (DOWN) releases this one too, so
+                        it never waits on a takeoff that cannot happen."""
                         ahead = peer_ids[index - 1]
-                        self.progress.emit(f"{name}: armed on the launch point - waiting for {ahead} to lift off ...")
+                        self.progress.emit(f"{name}: on the launch point - waiting for {ahead} to lift off ...")
                         bus.wait_for_peers(
                             "AIRBORNE", [ahead], timeout_s=900.0,
                             should_abort=lambda: self._abort,
@@ -269,8 +272,10 @@ class _SwarmWorker(QObject):
                             self._drain(master, sysid)
                             time.sleep(0.2)
                             waited += 0.2
-                        self.progress.emit(f"{name}: {ahead} is clear of the launch point - taking off.")
+                        self.progress.emit(f"{name}: {ahead} is clear of the launch point - arming and taking off.")
 
+                    if index > 0:
+                        hold_for_takeoff()
                     upload_and_fly(
                         master, [pad, slot], altitude_m,
                         heartbeat_timeout_s=30.0,
@@ -278,7 +283,6 @@ class _SwarmWorker(QObject):
                         should_abort=lambda: self._abort,
                         on_message=on_climb_message,
                         final_command=mav2.MAV_CMD_NAV_LOITER_UNLIM,
-                        before_auto=hold_for_takeoff if index > 0 else None,
                         **speed_kwargs,
                     )
                     self.progress.emit(f"{name}: in slot at {altitude_m:g}m - launch point clear.")
@@ -343,7 +347,7 @@ class _SwarmWorker(QObject):
 
         # Every thread starts now; a formation's own turn-taking is enforced
         # inside `fly`, which holds each drone on the pad until the one ahead
-        # of it announces IN_SLOT (see the peer buses above) rather than on a
+        # of it announces AIRBORNE (see the peer buses above) rather than on a
         # blind sleep here that could not tell whether the pad was actually clear.
         threads = [
             threading.Thread(target=fly, args=(sysid, name, pts, conn, alt, i, spd), daemon=True)
