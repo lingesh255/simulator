@@ -45,6 +45,9 @@ def summarize(prefix, scenario, exit_code, left):
         parts.append(f"finished={stamp(result):.0f}s")
     elif boot_failed:
         parts.append("BOOT FAILED: " + boot_failed.split("): ", 1)[-1][:230])
+    elif swarm := first(r"\] SUMMARY: finished=\d+ failed=", lines):
+        # mock_* scenarios: the swarm's own end-of-run line, not a drone's first "Mission complete"
+        parts.append(swarm.split("SUMMARY: ", 1)[1][:230])
     else:
         single = first(r"Mission complete|flight .* (ended|finished)", lines) or first(r"RESULT|PASS|FAIL", lines)
         parts.append((single or "no fleet result line")[:160])

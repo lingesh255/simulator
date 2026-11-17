@@ -20,6 +20,8 @@
     fleet_stopboot3  3 drones, Stop pressed 60 s into the fleet boot
     fleet_renodekill3  3 drones, every Renode process killed mid-flight (in the
                      shared mode that is the one Renode)
+    mock_search2 / mock_vform3   2-drone Search / 3-drone V-formation on mock
+                     vehicles (MavlinkSwarmFlightService, no Renode)
 
 FLEET_EMULATION=shared in the environment flies any of them with "Fleet
 emulation" set to "Shared Renode (low memory)" (not saved to the settings
@@ -408,6 +410,37 @@ def build(scenario, d, w, log, fly, after, LOG, pts):
             ).stdout.strip().replace("\n", " || ")[:600] or "(nothing)")))
         d.then("fleet finished", lambda: st["finished"], lambda: None, timeout_s=1800)
         d.then("settle 10s", after(10), summary)
+    elif scenario in ("mock_search2", "mock_vform3"):
+        # The multi-drone real-MAVLink path without Renode: one mock vehicle
+        # (scripts/mock_sitl.py) per drone, flown by MavlinkSwarmFlightService.
+        ms = {"finished": 0, "failed": [], "max_alt": {}, "last_alt": {}}
+        w.mavlink_swarm.finished.connect(lambda: (ms.__setitem__("finished", ms["finished"] + 1),
+                                                  log("SWARM FINISHED signal")))
+        w.mavlink_swarm.failed.connect(lambda m: (ms["failed"].append(m), log(f"SWARM FAILED signal: {m}")))
+        w.mavlink_swarm.progress.connect(lambda m: log(f"swarm.progress: {m}"))
+
+        def on_swarm_batch(batch):
+            for x in batch.drones:
+                ms["max_alt"][x.sysid] = max(ms["max_alt"].get(x.sysid, 0.0), x.altitude_m)
+                ms["last_alt"][x.sysid] = round(x.altitude_m, 1)
+        w.mavlink_swarm.batch_ready.connect(on_swarm_batch)
+
+        def mocks_running():
+            return subprocess.run(["pgrep", "-af", "[m]ock_sitl.py"], capture_output=True, text=True).stdout.strip()
+
+        common("Search" if scenario == "mock_search2" else "vformation")
+        d.then("mock vehicle + base port", lambda: True, lambda: (
+            mp.mock_vehicle_check.setChecked(True), mp.mavlink_connection_edit.setText("udp:127.0.0.1:14550")))
+        if scenario == "mock_search2":
+            plan_search()
+        else:
+            plan_travell(short_north)
+        d.then("swarm finished", lambda: ms["finished"] or ms["failed"], lambda: None, timeout_s=900)
+        d.then("settle 5s", after(5), lambda: log(
+            f"SUMMARY: finished={ms['finished']} failed={ms['failed']} sysids={sorted(ms['max_alt'])} "
+            f"max_alt={ {k: round(v, 1) for k, v in sorted(ms['max_alt'].items())} } "
+            f"last_alt={dict(sorted(ms['last_alt'].items()))} mock vehicles still running: "
+            f"{mocks_running() or '(none)'}"))
     elif scenario in ("fleet_vform3", "fleet_grid4"):
         if scenario == "fleet_grid4":
             from contracts.gui_orchestration import DroneConfig

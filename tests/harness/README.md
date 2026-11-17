@@ -38,6 +38,8 @@ the window at the end. Needs a display.
 |---|---|
 | `baseline` | D1, Launch Renode by hand, then travell Canberra -> 330 m north (the Phase 0 reference flight) |
 | `step4_mock` | D1 against the built-in mock vehicle (`scripts/mock_sitl.py`) |
+| `mock_search2` | D1-D2, Search lanes, one mock vehicle per drone (`MavlinkSwarmFlightService`, no Renode) |
+| `mock_vform3` | D1-D3, V-formation on mock vehicles: the peer-bus takeoff sequence, then the formation's route (no Renode) |
 | `fleet_travell`, `fleet_travell3` | 2 / 3 drones, travell, routes offset 18 m east per drone |
 | `fleet_search`, `fleet_search3` | 2 / 3 drones, Search lanes over a ~45 m square |
 | `fleet_stop`, `fleet_stop3` | 2 / 3 drones, Stop pressed once all are above 15 m |
